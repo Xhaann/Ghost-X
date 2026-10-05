@@ -1,17 +1,28 @@
 export type SocketState =
   "disconnected" | "connecting" | "connected" | "reconnecting";
 
+export type SocketOptions = {
+  minDelay?: number;
+  maxDelay?: number;
+};
+
 type Listener = (state: SocketState) => void;
 
 export class Socket {
   readonly #url: string;
+  readonly #minDelay: number;
+  readonly #maxDelay: number;
   readonly #listeners = new Set<Listener>();
   #socket: WebSocket | null = null;
+  #timer: ReturnType<typeof setTimeout> | null = null;
+  #attempt = 0;
   #state: SocketState = "disconnected";
   #active = false;
 
-  constructor(url: string) {
+  constructor(url: string, options: SocketOptions = {}) {
     this.#url = url;
+    this.#minDelay = options.minDelay ?? 1000;
+    this.#maxDelay = options.maxDelay ?? 30000;
   }
 
   get state(): SocketState {
@@ -35,8 +46,18 @@ export class Socket {
 
   close(): void {
     this.#active = false;
+    this.#attempt = 0;
+    this.#cancelRetry();
     this.#release();
     this.#setState("disconnected");
+  }
+
+  retry(): void {
+    if (!this.#active || this.#timer === null) {
+      return;
+    }
+    this.#cancelRetry();
+    this.#connect();
   }
 
   #connect(): void {
@@ -49,16 +70,36 @@ export class Socket {
     }
 
     this.#socket = socket;
-    socket.onopen = () => this.#setState("connected");
-    socket.onclose = () => {
-      if (this.#socket !== socket) {
-        return;
-      }
-      this.#socket = null;
-      this.#active = false;
-      this.#setState("disconnected");
+    socket.onopen = () => {
+      this.#attempt = 0;
+      this.#setState("connected");
     };
-    this.#setState("connecting");
+    socket.onclose = () => {
+      this.#socket = null;
+      this.#scheduleRetry();
+    };
+    this.#setState(this.#attempt === 0 ? "connecting" : "reconnecting");
+  }
+
+  #scheduleRetry(): void {
+    const ceiling = Math.min(
+      this.#maxDelay,
+      this.#minDelay * 2 ** this.#attempt,
+    );
+    const delay = ceiling / 2 + Math.random() * (ceiling / 2);
+    this.#attempt += 1;
+    this.#setState("reconnecting");
+    this.#timer = setTimeout(() => {
+      this.#timer = null;
+      this.#connect();
+    }, delay);
+  }
+
+  #cancelRetry(): void {
+    if (this.#timer !== null) {
+      clearTimeout(this.#timer);
+      this.#timer = null;
+    }
   }
 
   #release(): void {
@@ -67,9 +108,13 @@ export class Socket {
       return;
     }
     this.#socket = null;
-    socket.onopen = null;
     socket.onclose = null;
-    socket.close(1000);
+    if (socket.readyState === WebSocket.CONNECTING) {
+      socket.onopen = () => socket.close(1000);
+    } else {
+      socket.onopen = null;
+      socket.close(1000);
+    }
   }
 
   #setState(state: SocketState): void {

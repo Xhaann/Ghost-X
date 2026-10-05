@@ -11,9 +11,19 @@ export function useSocket(url: string | undefined): SocketState {
 
     const socket = new Socket(url);
     const unsubscribe = socket.subscribe(setState);
+    const retry = () => {
+      if (document.visibilityState === "visible") {
+        socket.retry();
+      }
+    };
+
+    window.addEventListener("online", retry);
+    document.addEventListener("visibilitychange", retry);
     socket.open();
 
     return () => {
+      window.removeEventListener("online", retry);
+      document.removeEventListener("visibilitychange", retry);
       unsubscribe();
       socket.close();
       setState("disconnected");
