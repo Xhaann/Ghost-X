@@ -16,14 +16,24 @@ export function useSocket(url: string | undefined): SocketState {
         socket.retry();
       }
     };
+    const suspend = () => socket.close();
+    const resume = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        socket.open();
+      }
+    };
 
     window.addEventListener("online", retry);
     document.addEventListener("visibilitychange", retry);
+    window.addEventListener("pagehide", suspend);
+    window.addEventListener("pageshow", resume);
     socket.open();
 
     return () => {
       window.removeEventListener("online", retry);
       document.removeEventListener("visibilitychange", retry);
+      window.removeEventListener("pagehide", suspend);
+      window.removeEventListener("pageshow", resume);
       unsubscribe();
       socket.close();
       setState("disconnected");

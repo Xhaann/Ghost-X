@@ -389,3 +389,26 @@ test("ignores retry when not reconnecting", () => {
   assert.equal(socket.state, "disconnected");
   assert.equal(created.length, 0);
 });
+
+test("reopens after an intentional close", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const socket = new Socket(`ws://127.0.0.1:${port}/ws`);
+  const states = track(socket);
+
+  socket.open();
+  await waitFor(socket, "connected");
+  socket.close();
+  socket.open();
+  await waitFor(socket, "connected");
+
+  assert.deepEqual(states, [
+    "connecting",
+    "connected",
+    "disconnected",
+    "connecting",
+    "connected",
+  ]);
+  await sleep(100);
+  assert.equal(openSockets().length, 1);
+});
