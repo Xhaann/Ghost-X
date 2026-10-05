@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Xhaann/ghost-x/server/config"
+	"github.com/Xhaann/ghost-x/server/protocol"
 	"github.com/Xhaann/ghost-x/server/socket"
 )
 
@@ -18,7 +19,15 @@ type Server struct {
 }
 
 func New(cfg config.Config) *Server {
-	hub := socket.NewHub(socket.DefaultOptions())
+	router := protocol.NewRouter(map[string]protocol.Handler{
+		"ping": protocol.Ping(time.Now),
+	})
+
+	opts := socket.DefaultOptions()
+	opts.OnMessage = func(c *socket.Client, data []byte) {
+		_ = c.Send(router.Handle(data))
+	}
+	hub := socket.NewHub(opts)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
