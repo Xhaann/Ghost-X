@@ -10,6 +10,7 @@ const (
 	CodeInvalidMessage  Code = "invalid_message"
 	CodeUnsupportedType Code = "unsupported_type"
 	CodeInvalidPayload  Code = "invalid_payload"
+	CodeAuthRequired    Code = "authentication_required"
 	CodeAuthFailed      Code = "authentication_failed"
 	CodeInternalError   Code = "internal_error"
 )

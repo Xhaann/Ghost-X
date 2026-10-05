@@ -317,3 +317,39 @@ func challengeOrFail(conn *websocket.Conn) []byte {
 	}
 	return nonce
 }
+
+func TestProtectedOperationBoundToConnection(t *testing.T) {
+	_, url := startServer(t)
+	k := newKey(t)
+	other := newKey(t)
+	first, second, third := dialApp(t, url), dialApp(t, url), dialApp(t, url)
+
+	expectError(t, roundTrip(t, first, `{"type":"whoami","id":"w1","payload":{}}`), "authentication_required")
+
+	authenticateConn(t, first, k)
+	authenticateConn(t, second, other)
+
+	for conn, want := range map[*websocket.Conn]string{first: k.identity, second: other.identity} {
+		msg := roundTrip(t, conn, `{"type":"whoami","id":"w1","payload":{}}`)
+		if msg.Type != "whoami" || string(msg.Payload) != `{"identity":"`+want+`"}` {
+			t.Fatalf("whoami = %+v %s, want %s", msg, msg.Payload, want)
+		}
+	}
+	expectError(t, roundTrip(t, third, `{"type":"whoami","id":"w1","payload":{}}`), "authentication_required")
+}
+
+func TestProtectedOperationRequiresReauthenticationAfterReconnect(t *testing.T) {
+	srv, url := startServer(t)
+	k := newKey(t)
+	first := dialApp(t, url)
+	authenticateConn(t, first, k)
+	first.Close()
+	waitUntil(t, "session removal", func() bool { return srv.sessions.Len() == 0 })
+
+	second := dialApp(t, url)
+	expectError(t, roundTrip(t, second, `{"type":"whoami","id":"w1","payload":{}}`), "authentication_required")
+	authenticateConn(t, second, k)
+	if msg := roundTrip(t, second, `{"type":"whoami","id":"w2","payload":{}}`); msg.Type != "whoami" {
+		t.Fatalf("whoami after re-authentication = %+v", msg)
+	}
+}

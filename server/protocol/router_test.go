@@ -51,6 +51,8 @@ func newTestRouter() *Router {
 		"ping":         Ping(time.Now),
 		"challenge":    Challenge(),
 		"authenticate": Authenticate(),
+	}, map[string]ProtectedHandler{
+		"whoami": WhoAmI(),
 	})
 }
 
@@ -119,7 +121,7 @@ func TestRouterHidesInternalErrors(t *testing.T) {
 	internal := errors.New("open /var/lib/ghost-x/state: permission denied")
 	router := NewRouter(map[string]Handler{
 		"fail": func(*Conn, []byte) (Reply, error) { return Reply{}, internal },
-	})
+	}, nil)
 
 	data := router.Conn(testSession()).Handle([]byte(`{"type":"fail","id":"r1"}`))
 
@@ -134,7 +136,7 @@ func TestRouterHidesInternalErrors(t *testing.T) {
 func TestRouterUnencodableReply(t *testing.T) {
 	router := NewRouter(map[string]Handler{
 		"bad": func(*Conn, []byte) (Reply, error) { return Reply{Type: "bad", Payload: make(chan int)}, nil },
-	})
+	}, nil)
 
 	resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(`{"type":"bad","id":"r1"}`)))
 
@@ -148,7 +150,7 @@ func TestRouterUnencodableReply(t *testing.T) {
 
 func TestRouterIgnoresLaterHandlerChanges(t *testing.T) {
 	handlers := map[string]Handler{"ping": Ping(time.Now)}
-	router := NewRouter(handlers)
+	router := NewRouter(handlers, nil)
 	delete(handlers, "ping")
 
 	resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":1}}`)))
@@ -188,6 +190,7 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"ping","id":"a","payload":{"sentAt":1}` + strings.Repeat(" ", 100),
 		"{\"type\":\"ping\",\"id\":\"a\"}\x00",
 		`{"type":"challenge","id":"a","payload":{}}`,
+		`{"type":"whoami","id":"a","payload":{}}`,
 		`{"type":"authenticate","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 	} {
 		f.Add([]byte(seed))

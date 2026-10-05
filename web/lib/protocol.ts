@@ -5,13 +5,15 @@ export type ErrorCode =
   | "invalid_message"
   | "unsupported_type"
   | "invalid_payload"
+  | "authentication_required"
   | "authentication_failed"
   | "internal_error";
 
 export type ClientMessage =
   | { type: "ping"; payload: { sentAt: number } }
   | { type: "challenge"; payload: Record<string, never> }
-  | { type: "authenticate"; payload: { identity: string; signature: string } };
+  | { type: "authenticate"; payload: { identity: string; signature: string } }
+  | { type: "whoami"; payload: Record<string, never> };
 
 export type ServerMessage =
   | {
@@ -21,6 +23,7 @@ export type ServerMessage =
     }
   | { type: "challenge"; id: string; payload: { nonce: string } }
   | { type: "authenticated"; id: string; payload: { identity: string } }
+  | { type: "whoami"; id: string; payload: { identity: string } }
   | { type: "error"; id?: string; payload: { code: ErrorCode } };
 
 export const nonceSize = 32;
@@ -29,6 +32,7 @@ const errorCodes: readonly string[] = [
   "invalid_message",
   "unsupported_type",
   "invalid_payload",
+  "authentication_required",
   "authentication_failed",
   "internal_error",
 ];
@@ -113,7 +117,7 @@ export function parse(data: unknown): ServerMessage | null {
     return null;
   }
 
-  if (type === "authenticated") {
+  if (type === "authenticated" || type === "whoami") {
     if (
       hasOnly(value, ["type", "id", "payload"]) &&
       isValidId(id) &&

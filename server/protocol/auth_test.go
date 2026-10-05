@@ -35,7 +35,7 @@ func authRouter() *Router {
 	return NewRouter(map[string]Handler{
 		"challenge":    Challenge(),
 		"authenticate": Authenticate(),
-	})
+	}, nil)
 }
 
 func requestChallenge(t *testing.T, conn *Conn) []byte {

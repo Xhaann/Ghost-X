@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/Xhaann/ghost-x/server/auth"
+	"github.com/Xhaann/ghost-x/server/identity"
 )
 
 type challengePayload struct {
@@ -53,6 +54,15 @@ func Authenticate() Handler {
 			return Reply{}, authError(authErr)
 		}
 		return Reply{Type: "authenticated", Payload: identityPayload{Identity: id.String()}}, nil
+	}
+}
+
+func WhoAmI() ProtectedHandler {
+	return func(c *Conn, id identity.Identity, payload []byte) (Reply, error) {
+		if _, err := decodeObject(payload); err != nil {
+			return Reply{}, &Error{Code: CodeInvalidPayload}
+		}
+		return Reply{Type: "whoami", Payload: identityPayload{Identity: id.String()}}, nil
 	}
 }
 

@@ -328,13 +328,62 @@ test("never places private key material in sent frames", async () => {
   await settle(auth, "authenticated");
 
   assert.equal(sent.length, 2);
-  const authenticate = JSON.parse(sent[1]);
+  const [challenge, authenticate] = sent.map((frame) => JSON.parse(frame));
+  assert.deepEqual(Object.keys(challenge).sort(), ["id", "payload", "type"]);
+  assert.deepEqual(challenge.payload, {});
+  assert.deepEqual(Object.keys(authenticate).sort(), ["id", "payload", "type"]);
   assert.deepEqual(Object.keys(authenticate.payload).sort(), [
     "identity",
     "signature",
   ]);
   assert.equal(authenticate.payload.identity, key.identity);
-  for (const frame of sent) {
-    assert.doesNotMatch(frame, /private|pkcs8|jwk|"d":/i);
-  }
+  assert.match(authenticate.payload.signature, /^[A-Za-z0-9_-]{86}$/);
+});
+
+test("protected requests require authentication", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const c = await connected(port);
+  const key = await IdentityKey.generate();
+
+  const before = await c.request({ type: "whoami", payload: {} });
+  assert.deepEqual(before?.type === "error" && before.payload, {
+    code: "authentication_required",
+  });
+
+  const { auth } = authenticator(c, key);
+  auth.start();
+  await settle(auth, "authenticated");
+
+  const after = await c.request({ type: "whoami", payload: {} });
+  assert.ok(after?.type === "whoami");
+  assert.equal(after.payload.identity, key.identity);
+});
+
+test("protected requests need fresh authentication after reconnect", async () => {
+  const port = await freePort();
+  const server = await startServer(port);
+  const c = await connected(port);
+  const key = await IdentityKey.generate();
+  const { auth } = authenticator(c, key);
+
+  auth.start();
+  await settle(auth, "authenticated");
+  auth.stop();
+  await stopServer(server);
+  await waitFor(c, "reconnecting");
+  await startServer(port);
+  await waitFor(c, "connected");
+
+  const unauthenticated = await c.request({ type: "whoami", payload: {} });
+  assert.deepEqual(
+    unauthenticated?.type === "error" && unauthenticated.payload,
+    { code: "authentication_required" },
+  );
+
+  auth.start();
+  await settle(auth, "authenticated");
+  const reply = await c.request({ type: "whoami", payload: {} });
+  assert.ok(reply?.type === "whoami");
+  assert.equal(reply.payload.identity, key.identity);
 });

@@ -120,6 +120,28 @@ test("rejects malformed challenge and authenticated messages", () => {
   }
 });
 
+test("parses whoami and authentication_required", () => {
+  const identity = "B".repeat(42) + "A";
+  assert.deepEqual(
+    parse(JSON.stringify({ type: "whoami", id: "w1", payload: { identity } })),
+    { type: "whoami", id: "w1", payload: { identity } },
+  );
+  assert.deepEqual(
+    parse(
+      '{"type":"error","id":"w1","payload":{"code":"authentication_required"}}',
+    ),
+    { type: "error", id: "w1", payload: { code: "authentication_required" } },
+  );
+  for (const message of [
+    { type: "whoami", payload: { identity } },
+    { type: "whoami", id: "w1", payload: {} },
+    { type: "whoami", id: "w1", payload: { identity: "short" } },
+    { type: "whoami", id: "w1", payload: { identity, extra: 1 } },
+  ]) {
+    assert.equal(parse(JSON.stringify(message)), null);
+  }
+});
+
 test("rejects unsupported message types", () => {
   for (const type of ["ping", "unknown", "PONG", "", 1, null]) {
     assert.equal(parse(pong({ type })), null, `accepted type ${type}`);

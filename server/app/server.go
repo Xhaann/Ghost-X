@@ -40,6 +40,8 @@ func New(cfg config.Config) *Server {
 		"ping":         protocol.Ping(time.Now),
 		"challenge":    protocol.Challenge(),
 		"authenticate": protocol.Authenticate(),
+	}, map[string]protocol.ProtectedHandler{
+		"whoami": protocol.WhoAmI(),
 	})
 
 	opts := socket.DefaultOptions()
