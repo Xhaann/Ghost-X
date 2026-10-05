@@ -13,6 +13,7 @@ import (
 
 type Server struct {
 	cfg  config.Config
+	hub  *socket.Hub
 	http *http.Server
 }
 
@@ -25,6 +26,7 @@ func New(cfg config.Config) *Server {
 
 	return &Server{
 		cfg: cfg,
+		hub: hub,
 		http: &http.Server{
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,
@@ -61,14 +63,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer cancel()
 
-	if err := s.http.Shutdown(shutdownCtx); err != nil {
-		return err
-	}
+	httpErr := s.http.Shutdown(shutdownCtx)
+	hubErr := s.hub.Shutdown(shutdownCtx)
 
 	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
-	return nil
+	return errors.Join(httpErr, hubErr)
 }
 
 func health(w http.ResponseWriter, _ *http.Request) {

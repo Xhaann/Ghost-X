@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/Xhaann/ghost-x/server/config"
 )
 
@@ -92,5 +94,52 @@ func TestRunInvalidAddr(t *testing.T) {
 
 	if err := New(cfg).Run(context.Background()); err == nil {
 		t.Fatal("Run() error = nil, want error")
+	}
+}
+
+func TestServeClosesWebSockets(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := New(testConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Serve(ctx, ln)
+	}()
+
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+ln.Addr().String()+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	resp.Body.Close()
+	defer conn.Close()
+
+	cancel()
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			continue
+		}
+		if !websocket.IsCloseError(err, websocket.CloseGoingAway) {
+			t.Fatalf("read error = %v, want close code %d", err, websocket.CloseGoingAway)
+		}
+		break
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve() did not return after cancel")
+	}
+	if got := srv.hub.Len(); got != 0 {
+		t.Errorf("active connections = %d, want 0", got)
 	}
 }

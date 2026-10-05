@@ -1,6 +1,7 @@
 package socket
 
 import (
+	"context"
 	"errors"
 	"sync"
 
@@ -74,4 +75,36 @@ func (h *Hub) unregister(c *Client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.clients, c)
+}
+
+func (h *Hub) Shutdown(ctx context.Context) error {
+	h.mu.Lock()
+	h.closed = true
+	clients := make([]*Client, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.mu.Unlock()
+
+	for _, c := range clients {
+		c.Close(websocket.CloseGoingAway, "server shutdown")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		h.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+	}
+
+	for _, c := range clients {
+		_ = c.conn.Close()
+	}
+	<-done
+	return ctx.Err()
 }
