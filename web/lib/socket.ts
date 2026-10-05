@@ -1,3 +1,11 @@
+import {
+  type ClientMessage,
+  type ServerMessage,
+  createId,
+  encode,
+  parse,
+} from "./protocol.ts";
+
 export type SocketState =
   "disconnected" | "connecting" | "connected" | "reconnecting";
 
@@ -7,12 +15,14 @@ export type SocketOptions = {
 };
 
 type Listener = (state: SocketState) => void;
+type MessageListener = (message: ServerMessage) => void;
 
 export class Socket {
   readonly #url: string;
   readonly #minDelay: number;
   readonly #maxDelay: number;
   readonly #listeners = new Set<Listener>();
+  readonly #messageListeners = new Set<MessageListener>();
   #socket: WebSocket | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #attempt = 0;
@@ -34,6 +44,23 @@ export class Socket {
     return () => {
       this.#listeners.delete(listener);
     };
+  }
+
+  onMessage(listener: MessageListener): () => void {
+    this.#messageListeners.add(listener);
+    return () => {
+      this.#messageListeners.delete(listener);
+    };
+  }
+
+  send(message: ClientMessage): string | null {
+    const socket = this.#socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return null;
+    }
+    const id = createId();
+    socket.send(encode(message, id));
+    return id;
   }
 
   open(): void {
@@ -74,6 +101,14 @@ export class Socket {
       this.#attempt = 0;
       this.#setState("connected");
     };
+    socket.onmessage = (event: MessageEvent) => {
+      const message = parse(event.data);
+      if (message) {
+        for (const listener of this.#messageListeners) {
+          listener(message);
+        }
+      }
+    };
     socket.onclose = () => {
       this.#socket = null;
       this.#scheduleRetry();
@@ -109,6 +144,7 @@ export class Socket {
     }
     this.#socket = null;
     socket.onclose = null;
+    socket.onmessage = null;
     if (socket.readyState === WebSocket.CONNECTING) {
       socket.onopen = () => socket.close(1000);
     } else {

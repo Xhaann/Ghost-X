@@ -1,8 +1,12 @@
 import { useEffect, useState } from "react";
 import { Socket, type SocketState } from "./socket.ts";
 
-export function useSocket(url: string | undefined): SocketState {
+export function useSocket(url: string | undefined): {
+  state: SocketState;
+  socket: Socket | null;
+} {
   const [state, setState] = useState<SocketState>("disconnected");
+  const [socket, setSocket] = useState<Socket | null>(null);
 
   useEffect(() => {
     if (!url) {
@@ -11,6 +15,7 @@ export function useSocket(url: string | undefined): SocketState {
 
     const socket = new Socket(url);
     const unsubscribe = socket.subscribe(setState);
+    setSocket(socket);
     const retry = () => {
       if (document.visibilityState === "visible") {
         socket.retry();
@@ -37,8 +42,9 @@ export function useSocket(url: string | undefined): SocketState {
       unsubscribe();
       socket.close();
       setState("disconnected");
+      setSocket(null);
     };
   }, [url]);
 
-  return state;
+  return { state, socket };
 }

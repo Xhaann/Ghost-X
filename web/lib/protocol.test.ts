@@ -1,0 +1,92 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { createId, encode, parse } from "./protocol.ts";
+
+const pong = (overrides: Record<string, unknown> = {}) =>
+  JSON.stringify({
+    type: "pong",
+    id: "r1",
+    payload: { sentAt: 1, receivedAt: 2 },
+    ...overrides,
+  });
+
+test("parses a pong", () => {
+  assert.deepEqual(parse(pong()), {
+    type: "pong",
+    id: "r1",
+    payload: { sentAt: 1, receivedAt: 2 },
+  });
+});
+
+test("parses errors with and without an id", () => {
+  assert.deepEqual(
+    parse('{"type":"error","id":"r1","payload":{"code":"invalid_payload"}}'),
+    { type: "error", id: "r1", payload: { code: "invalid_payload" } },
+  );
+  assert.deepEqual(
+    parse('{"type":"error","payload":{"code":"invalid_message"}}'),
+    { type: "error", payload: { code: "invalid_message" } },
+  );
+});
+
+test("rejects malformed messages", () => {
+  const invalid: unknown[] = [
+    undefined,
+    null,
+    42,
+    new ArrayBuffer(4),
+    "",
+    "not json",
+    "{",
+    "null",
+    "[]",
+    '"pong"',
+    "{}",
+    '{"type":"pong","id":"r1"}',
+    '{"type":"pong","id":"r1","payload":null}',
+    '{"type":"pong","id":"r1","payload":[]}',
+    pong({ id: undefined }),
+    pong({ id: "" }),
+    pong({ id: "has space" }),
+    pong({ id: "a".repeat(65) }),
+    pong({ id: 7 }),
+    pong({ extra: true }),
+    pong({ payload: { sentAt: 1 } }),
+    pong({ payload: { sentAt: 1, receivedAt: 2, extra: 3 } }),
+    pong({ payload: { sentAt: "1", receivedAt: 2 } }),
+    pong({ payload: { sentAt: 1.5, receivedAt: 2 } }),
+    pong({ payload: { sentAt: -1, receivedAt: 2 } }),
+    pong({ payload: { sentAt: 2 ** 53, receivedAt: 2 } }),
+    '{"type":"pong","id":"r1","payload":{"sentAt":1,"receivedAt":2},"__proto__":{}}',
+    '{"type":"error","payload":{"code":"unknown_code"}}',
+    '{"type":"error","payload":{"code":1}}',
+    '{"type":"error","payload":{"code":"internal_error","detail":"x"}}',
+    '{"type":"error","id":"bad id","payload":{"code":"internal_error"}}',
+    '{"type":"error","extra":1,"payload":{"code":"internal_error"}}',
+  ];
+
+  for (const data of invalid) {
+    assert.equal(parse(data), null, `accepted ${String(data)}`);
+  }
+});
+
+test("rejects unsupported message types", () => {
+  for (const type of ["ping", "unknown", "PONG", "", 1, null]) {
+    assert.equal(parse(pong({ type })), null, `accepted type ${type}`);
+  }
+});
+
+test("encodes a client message", () => {
+  assert.deepEqual(
+    JSON.parse(encode({ type: "ping", payload: { sentAt: 5 } }, "r1")),
+    { type: "ping", id: "r1", payload: { sentAt: 5 } },
+  );
+});
+
+test("creates unique valid ids", () => {
+  const ids = new Set(Array.from({ length: 1000 }, createId));
+  assert.equal(ids.size, 1000);
+  for (const id of ids) {
+    assert.match(id, /^[a-f0-9]{24}$/);
+  }
+});

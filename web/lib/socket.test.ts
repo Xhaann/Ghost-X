@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import type { ServerMessage } from "./protocol.ts";
 import { Socket, type SocketState } from "./socket.ts";
 
 const NativeWebSocket = globalThis.WebSocket;
@@ -410,5 +411,165 @@ test("reopens after an intentional close", async () => {
     "connected",
   ]);
   await sleep(100);
+  assert.equal(openSockets().length, 1);
+});
+
+function collect(socket: Socket): ServerMessage[] {
+  const messages: ServerMessage[] = [];
+  socket.onMessage((message) => messages.push(message));
+  return messages;
+}
+
+async function waitForMessages(
+  messages: ServerMessage[],
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (messages.length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`received ${messages.length} of ${count} messages`);
+    }
+    await sleep(5);
+  }
+}
+
+async function connected(port: number): Promise<Socket> {
+  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 });
+  track(socket);
+  socket.open();
+  await waitFor(socket, "connected");
+  return socket;
+}
+
+test("does not send while disconnected", async () => {
+  const port = await freePort();
+  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 5000 });
+  track(socket);
+
+  assert.equal(socket.send({ type: "ping", payload: { sentAt: 1 } }), null);
+  socket.open();
+  assert.equal(socket.send({ type: "ping", payload: { sentAt: 1 } }), null);
+});
+
+test("receives a pong for a ping", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const socket = await connected(port);
+  const messages = collect(socket);
+
+  const sentAt = Date.now();
+  const id = socket.send({ type: "ping", payload: { sentAt } });
+  assert.ok(id);
+  await waitForMessages(messages, 1);
+
+  const [message] = messages;
+  assert.equal(message.type, "pong");
+  assert.equal(message.id, id);
+  assert.ok(message.type === "pong");
+  assert.equal(message.payload.sentAt, sentAt);
+  assert.ok(message.payload.receivedAt >= sentAt - 1000);
+});
+
+test("correlates concurrent requests", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const socket = await connected(port);
+  const messages = collect(socket);
+
+  const ids = Array.from({ length: 20 }, (_, i) =>
+    socket.send({ type: "ping", payload: { sentAt: i } }),
+  );
+  await waitForMessages(messages, ids.length);
+
+  assert.deepEqual(
+    messages.map((message) => message.id),
+    ids,
+  );
+  assert.equal(new Set(ids).size, ids.length);
+});
+
+test("receives protocol errors from the server", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const socket = await connected(port);
+  const messages = collect(socket);
+
+  const id = socket.send({ type: "ping", payload: { sentAt: -1 } });
+  await waitForMessages(messages, 1);
+
+  assert.deepEqual(messages, [
+    { type: "error", id, payload: { code: "invalid_payload" } },
+  ]);
+  assert.equal(socket.state, "connected");
+});
+
+test("stops delivering messages after unsubscribe", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const socket = await connected(port);
+  const kept = collect(socket);
+  const removed: ServerMessage[] = [];
+  const unsubscribe = socket.onMessage((message) => removed.push(message));
+
+  unsubscribe();
+  unsubscribe();
+  socket.send({ type: "ping", payload: { sentAt: 1 } });
+  await waitForMessages(kept, 1);
+  await sleep(50);
+
+  assert.equal(kept.length, 1);
+  assert.equal(removed.length, 0);
+});
+
+test("drops replies that arrive after close", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const socket = await connected(port);
+  const messages = collect(socket);
+
+  socket.send({ type: "ping", payload: { sentAt: 1 } });
+  socket.close();
+  await sleep(200);
+
+  assert.equal(messages.length, 0);
+});
+
+test("delivers each message once across reconnects", async () => {
+  const port = await freePort();
+  const server = await startServer(port);
+  const socket = await connected(port);
+  const messages = collect(socket);
+
+  socket.send({ type: "ping", payload: { sentAt: 1 } });
+  await waitForMessages(messages, 1);
+
+  await stopServer(server);
+  await waitFor(socket, "reconnecting");
+  await startServer(port);
+  await waitFor(socket, "connected");
+
+  const id = socket.send({ type: "ping", payload: { sentAt: 2 } });
+  await waitForMessages(messages, 2);
+  await sleep(100);
+
+  assert.equal(messages.length, 2);
+  assert.equal(messages[1].id, id);
+  assert.equal(openSockets().length, 1);
+});
+
+test("delivers messages after an intentional reopen", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const socket = await connected(port);
+  const messages = collect(socket);
+
+  socket.close();
+  socket.open();
+  await waitFor(socket, "connected");
+  socket.send({ type: "ping", payload: { sentAt: 1 } });
+  await waitForMessages(messages, 1);
+  await sleep(100);
+
+  assert.equal(messages.length, 1);
   assert.equal(openSockets().length, 1);
 });
