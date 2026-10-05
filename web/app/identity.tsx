@@ -1,34 +1,27 @@
 "use client";
 
+import type { AuthState } from "@/lib/auth.ts";
 import type { Client } from "@/lib/client.ts";
+import { useAuth } from "@/lib/useAuth.ts";
 import { useIdentity } from "@/lib/useIdentity.ts";
-import { useProof } from "@/lib/useProof.ts";
 
-export default function Identity({
-  client,
-  connected,
-}: {
-  client: Client | null;
-  connected: boolean;
-}) {
+const labels: Record<AuthState, string> = {
+  unauthenticated: "Unauthenticated",
+  authenticating: "Authenticating",
+  authenticated: "Authenticated",
+  failed: "Authentication failed",
+};
+
+export default function Identity({ client }: { client: Client | null }) {
   const key = useIdentity();
-  const { prove, proven, pending } = useProof(client, key);
+  const state = useAuth(client, key);
 
   return (
     <section>
       <p>
         Identity <code>{key ? key.identity : "Generating"}</code>
       </p>
-      <button
-        type="button"
-        onClick={prove}
-        disabled={!key || !connected || pending}
-      >
-        Verify identity
-      </button>
-      {proven !== null && (
-        <output>{proven ? "Identity verified" : "Verification failed"}</output>
-      )}
+      <p data-auth={state}>{labels[state]}</p>
     </section>
   );
 }

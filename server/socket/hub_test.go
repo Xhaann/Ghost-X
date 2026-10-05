@@ -13,6 +13,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type receiveFunc func([]byte)
+
+func (f receiveFunc) Receive(data []byte) { f(data) }
+
+func (receiveFunc) Close() {}
+
 func testOptions() Options {
 	opts := DefaultOptions()
 	opts.WriteTimeout = time.Second
@@ -113,7 +119,7 @@ func TestConcurrentConnections(t *testing.T) {
 	const n = 50
 	var received atomic.Int64
 	opts := testOptions()
-	opts.Accept = func(*Client) func([]byte) { return func([]byte) { received.Add(1) } }
+	opts.Accept = func(*Client) Receiver { return receiveFunc(func([]byte) { received.Add(1) }) }
 	hub, url := startServer(t, opts)
 
 	var wg sync.WaitGroup

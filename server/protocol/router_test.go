@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Xhaann/ghost-x/server/auth"
 )
 
 type response struct {
@@ -40,18 +42,22 @@ func errorCode(t *testing.T, resp response) Code {
 	return payload.Code
 }
 
+func testSession() *auth.Session {
+	return auth.NewRegistry(time.Now).Open()
+}
+
 func newTestRouter() *Router {
 	return NewRouter(map[string]Handler{
-		"ping":      Ping(time.Now),
-		"challenge": Challenge(time.Now),
-		"prove":     Prove(time.Now),
+		"ping":         Ping(time.Now),
+		"challenge":    Challenge(),
+		"authenticate": Authenticate(),
 	})
 }
 
 func TestRouterPing(t *testing.T) {
 	before := time.Now().UnixMilli()
 	sentAt := strconv.FormatInt(before, 10)
-	data := newTestRouter().Conn().Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":` + sentAt + `}}`))
+	data := newTestRouter().Conn(testSession()).Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":` + sentAt + `}}`))
 	after := time.Now().UnixMilli()
 
 	resp := decodeResponse(t, data)
@@ -98,7 +104,7 @@ func TestRouterErrors(t *testing.T) {
 	router := newTestRouter()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resp := decodeResponse(t, router.Conn().Handle([]byte(tt.input)))
+			resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(tt.input)))
 			if code := errorCode(t, resp); code != tt.code {
 				t.Errorf("code = %q, want %q", code, tt.code)
 			}
@@ -115,7 +121,7 @@ func TestRouterHidesInternalErrors(t *testing.T) {
 		"fail": func(*Conn, []byte) (Reply, error) { return Reply{}, internal },
 	})
 
-	data := router.Conn().Handle([]byte(`{"type":"fail","id":"r1"}`))
+	data := router.Conn(testSession()).Handle([]byte(`{"type":"fail","id":"r1"}`))
 
 	if code := errorCode(t, decodeResponse(t, data)); code != CodeInternalError {
 		t.Errorf("code = %q, want %q", code, CodeInternalError)
@@ -130,7 +136,7 @@ func TestRouterUnencodableReply(t *testing.T) {
 		"bad": func(*Conn, []byte) (Reply, error) { return Reply{Type: "bad", Payload: make(chan int)}, nil },
 	})
 
-	resp := decodeResponse(t, router.Conn().Handle([]byte(`{"type":"bad","id":"r1"}`)))
+	resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(`{"type":"bad","id":"r1"}`)))
 
 	if code := errorCode(t, resp); code != CodeInternalError {
 		t.Errorf("code = %q, want %q", code, CodeInternalError)
@@ -145,7 +151,7 @@ func TestRouterIgnoresLaterHandlerChanges(t *testing.T) {
 	router := NewRouter(handlers)
 	delete(handlers, "ping")
 
-	resp := decodeResponse(t, router.Conn().Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":1}}`)))
+	resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":1}}`)))
 	if resp.Type != "pong" {
 		t.Errorf("type = %q, want pong", resp.Type)
 	}
@@ -158,7 +164,7 @@ func TestRouterConcurrent(t *testing.T) {
 		wg.Go(func() {
 			for i := range 200 {
 				id := "g" + strconv.Itoa(g) + "_" + strconv.Itoa(i)
-				resp := decodeResponse(t, router.Conn().Handle([]byte(`{"type":"ping","id":"`+id+`","payload":{"sentAt":`+strconv.Itoa(i)+`}}`)))
+				resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(`{"type":"ping","id":"`+id+`","payload":{"sentAt":`+strconv.Itoa(i)+`}}`)))
 				if resp.Type != "pong" || resp.ID != id {
 					t.Errorf("response = %+v, want pong %s", resp, id)
 					return
@@ -182,14 +188,14 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"ping","id":"a","payload":{"sentAt":1}` + strings.Repeat(" ", 100),
 		"{\"type\":\"ping\",\"id\":\"a\"}\x00",
 		`{"type":"challenge","id":"a","payload":{}}`,
-		`{"type":"prove","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
+		`{"type":"authenticate","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 	} {
 		f.Add([]byte(seed))
 	}
 
 	router := newTestRouter()
 	f.Fuzz(func(t *testing.T, data []byte) {
-		out := router.Conn().Handle(data)
+		out := router.Conn(testSession()).Handle(data)
 		if !json.Valid(out) || !utf8.Valid(out) {
 			t.Fatalf("invalid response %q for input %q", out, data)
 		}

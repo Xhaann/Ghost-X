@@ -35,7 +35,7 @@ export default function Status({ url }: { url: string | undefined }) {
           </output>
         )}
       </section>
-      <Identity client={client} connected={state === "connected"} />
+      <Identity client={client} />
     </>
   );
 }

@@ -70,7 +70,7 @@ test("rejects malformed messages", () => {
   }
 });
 
-test("parses challenge and proven messages", () => {
+test("parses challenge and authenticated messages", () => {
   const nonce = "A".repeat(43);
   const identity = "B".repeat(42) + "A";
   assert.deepEqual(
@@ -78,16 +78,24 @@ test("parses challenge and proven messages", () => {
     { type: "challenge", id: "c1", payload: { nonce } },
   );
   assert.deepEqual(
-    parse(JSON.stringify({ type: "proven", id: "p1", payload: { identity } })),
-    { type: "proven", id: "p1", payload: { identity } },
+    parse(
+      JSON.stringify({
+        type: "authenticated",
+        id: "p1",
+        payload: { identity },
+      }),
+    ),
+    { type: "authenticated", id: "p1", payload: { identity } },
   );
   assert.deepEqual(
-    parse('{"type":"error","id":"p1","payload":{"code":"invalid_proof"}}'),
-    { type: "error", id: "p1", payload: { code: "invalid_proof" } },
+    parse(
+      '{"type":"error","id":"p1","payload":{"code":"authentication_failed"}}',
+    ),
+    { type: "error", id: "p1", payload: { code: "authentication_failed" } },
   );
 });
 
-test("rejects malformed challenge and proven messages", () => {
+test("rejects malformed challenge and authenticated messages", () => {
   const nonce = "A".repeat(43);
   const identity = "B".repeat(42) + "A";
   const invalid = [
@@ -100,12 +108,12 @@ test("rejects malformed challenge and proven messages", () => {
     { type: "challenge", id: "c1", payload: { nonce: 1 } },
     { type: "challenge", id: "c1", payload: { nonce, extra: 1 } },
     { type: "challenge", id: "c1", payload: { nonce }, extra: 1 },
-    { type: "proven", payload: { identity } },
-    { type: "proven", id: "p1", payload: {} },
-    { type: "proven", id: "p1", payload: { identity: identity + "A" } },
-    { type: "proven", id: "p1", payload: { identity: "B".repeat(43) } },
-    { type: "proven", id: "p1", payload: { identity: null } },
-    { type: "proven", id: "p1", payload: { identity, extra: 1 } },
+    { type: "authenticated", payload: { identity } },
+    { type: "authenticated", id: "p1", payload: {} },
+    { type: "authenticated", id: "p1", payload: { identity: identity + "A" } },
+    { type: "authenticated", id: "p1", payload: { identity: "B".repeat(43) } },
+    { type: "authenticated", id: "p1", payload: { identity: null } },
+    { type: "authenticated", id: "p1", payload: { identity, extra: 1 } },
   ];
   for (const message of invalid) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));

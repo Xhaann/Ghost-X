@@ -7,30 +7,45 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Xhaann/ghost-x/server/auth"
 	"github.com/Xhaann/ghost-x/server/config"
 	"github.com/Xhaann/ghost-x/server/protocol"
 	"github.com/Xhaann/ghost-x/server/socket"
 )
 
 type Server struct {
-	cfg  config.Config
-	hub  *socket.Hub
-	http *http.Server
+	cfg      config.Config
+	hub      *socket.Hub
+	sessions *auth.Registry
+	http     *http.Server
+}
+
+type endpoint struct {
+	client  *socket.Client
+	conn    *protocol.Conn
+	session *auth.Session
+}
+
+func (e *endpoint) Receive(data []byte) {
+	_ = e.client.Send(e.conn.Handle(data))
+}
+
+func (e *endpoint) Close() {
+	e.session.Close()
 }
 
 func New(cfg config.Config) *Server {
+	sessions := auth.NewRegistry(time.Now)
 	router := protocol.NewRouter(map[string]protocol.Handler{
-		"ping":      protocol.Ping(time.Now),
-		"challenge": protocol.Challenge(time.Now),
-		"prove":     protocol.Prove(time.Now),
+		"ping":         protocol.Ping(time.Now),
+		"challenge":    protocol.Challenge(),
+		"authenticate": protocol.Authenticate(),
 	})
 
 	opts := socket.DefaultOptions()
-	opts.Accept = func(c *socket.Client) func([]byte) {
-		conn := router.Conn()
-		return func(data []byte) {
-			_ = c.Send(conn.Handle(data))
-		}
+	opts.Accept = func(c *socket.Client) socket.Receiver {
+		session := sessions.Open()
+		return &endpoint{client: c, conn: router.Conn(session), session: session}
 	}
 	hub := socket.NewHub(opts)
 
@@ -39,8 +54,9 @@ func New(cfg config.Config) *Server {
 	mux.Handle("GET /ws", socket.NewHandler(hub, cfg.AllowedOrigins))
 
 	return &Server{
-		cfg: cfg,
-		hub: hub,
+		cfg:      cfg,
+		hub:      hub,
+		sessions: sessions,
 		http: &http.Server{
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,

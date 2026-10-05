@@ -2,6 +2,11 @@ package socket
 
 import "time"
 
+type Receiver interface {
+	Receive(data []byte)
+	Close()
+}
+
 type Options struct {
 	MaxConnections int
 	MaxMessageSize int64
@@ -9,7 +14,7 @@ type Options struct {
 	WriteTimeout   time.Duration
 	PingInterval   time.Duration
 	PongTimeout    time.Duration
-	Accept         func(c *Client) func(data []byte)
+	Accept         func(c *Client) Receiver
 }
 
 func DefaultOptions() Options {

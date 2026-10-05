@@ -13,7 +13,7 @@ import (
 func TestReadLifecycle(t *testing.T) {
 	received := make(chan []byte, 1)
 	opts := testOptions()
-	opts.Accept = func(*Client) func([]byte) { return func(data []byte) { received <- data } }
+	opts.Accept = func(*Client) Receiver { return receiveFunc(func(data []byte) { received <- data }) }
 	_, url := startServer(t, opts)
 	conn := dial(t, url)
 
@@ -67,7 +67,7 @@ func TestServerInitiatedClose(t *testing.T) {
 func TestOversizedMessage(t *testing.T) {
 	opts := testOptions()
 	opts.MaxMessageSize = 16
-	opts.Accept = func(*Client) func([]byte) { return func([]byte) { t.Error("oversized message delivered") } }
+	opts.Accept = func(*Client) Receiver { return receiveFunc(func([]byte) { t.Error("oversized message delivered") }) }
 	hub, url := startServer(t, opts)
 	conn := dial(t, url)
 	onlyClient(t, hub)
@@ -83,7 +83,7 @@ func TestMessageAtSizeLimit(t *testing.T) {
 	received := make(chan []byte, 1)
 	opts := testOptions()
 	opts.MaxMessageSize = 16
-	opts.Accept = func(*Client) func([]byte) { return func(data []byte) { received <- data } }
+	opts.Accept = func(*Client) Receiver { return receiveFunc(func(data []byte) { received <- data }) }
 	_, url := startServer(t, opts)
 	conn := dial(t, url)
 
@@ -114,7 +114,7 @@ func TestRejectedPayloads(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := testOptions()
-			opts.Accept = func(*Client) func([]byte) { return func([]byte) { t.Error("rejected payload delivered") } }
+			opts.Accept = func(*Client) Receiver { return receiveFunc(func([]byte) { t.Error("rejected payload delivered") }) }
 			hub, url := startServer(t, opts)
 			conn := dial(t, url)
 			onlyClient(t, hub)
@@ -182,16 +182,16 @@ func TestAcceptRunsOncePerConnection(t *testing.T) {
 	var mu sync.Mutex
 	counts := make(map[*Client]*int)
 	opts := testOptions()
-	opts.Accept = func(c *Client) func([]byte) {
+	opts.Accept = func(c *Client) Receiver {
 		n := new(int)
 		mu.Lock()
 		counts[c] = n
 		mu.Unlock()
-		return func([]byte) {
+		return receiveFunc(func([]byte) {
 			mu.Lock()
 			*n++
 			mu.Unlock()
-		}
+		})
 	}
 	hub, url := startServer(t, opts)
 	first := dial(t, url)
@@ -227,5 +227,77 @@ func TestAcceptRunsOncePerConnection(t *testing.T) {
 	}
 	if !(got[0] == 3 && got[1] == 1) && !(got[0] == 1 && got[1] == 3) {
 		t.Errorf("per-connection counts = %v, want 3 and 1", got)
+	}
+}
+
+type trackingReceiver struct {
+	mu       sync.Mutex
+	received int
+	closes   int
+	late     bool
+}
+
+func (r *trackingReceiver) Receive([]byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.received++
+	if r.closes > 0 {
+		r.late = true
+	}
+}
+
+func (r *trackingReceiver) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closes++
+}
+
+func (r *trackingReceiver) snapshot() (int, int, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.received, r.closes, r.late
+}
+
+func TestReceiverClosedOnceWhenConnectionEnds(t *testing.T) {
+	tests := map[string]func(t *testing.T, hub *Hub, conn *websocket.Conn){
+		"client close": func(t *testing.T, hub *Hub, conn *websocket.Conn) {
+			msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+			conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second))
+		},
+		"abrupt disconnect": func(t *testing.T, hub *Hub, conn *websocket.Conn) {
+			conn.NetConn().Close()
+		},
+		"server close": func(t *testing.T, hub *Hub, conn *websocket.Conn) {
+			onlyClient(t, hub).Close(websocket.CloseNormalClosure, "")
+		},
+		"shutdown": func(t *testing.T, hub *Hub, conn *websocket.Conn) {
+			if err := shutdown(t, hub, 5*time.Second); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, end := range tests {
+		t.Run(name, func(t *testing.T) {
+			receiver := &trackingReceiver{}
+			opts := testOptions()
+			opts.Accept = func(*Client) Receiver { return receiver }
+			hub, url := startServer(t, opts)
+			conn := dial(t, url)
+			onlyClient(t, hub)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("a")); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "delivery", func() bool { n, _, _ := receiver.snapshot(); return n == 1 })
+
+			end(t, hub, conn)
+			waitFor(t, "receiver close", func() bool { _, c, _ := receiver.snapshot(); return c > 0 })
+			waitFor(t, "unregistration", func() bool { return hub.Len() == 0 })
+			time.Sleep(50 * time.Millisecond)
+
+			received, closes, late := receiver.snapshot()
+			if closes != 1 || late || received != 1 {
+				t.Fatalf("received %d, closes %d, late delivery %v", received, closes, late)
+			}
+		})
 	}
 }

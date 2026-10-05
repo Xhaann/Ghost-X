@@ -3,7 +3,8 @@ package protocol
 import (
 	"errors"
 	"maps"
-	"time"
+
+	"github.com/Xhaann/ghost-x/server/auth"
 )
 
 type Handler func(c *Conn, payload []byte) (Reply, error)
@@ -13,17 +14,16 @@ type Router struct {
 }
 
 type Conn struct {
-	router    *Router
-	challenge []byte
-	expires   time.Time
+	router  *Router
+	session *auth.Session
 }
 
 func NewRouter(handlers map[string]Handler) *Router {
 	return &Router{handlers: maps.Clone(handlers)}
 }
 
-func (r *Router) Conn() *Conn {
-	return &Conn{router: r}
+func (r *Router) Conn(session *auth.Session) *Conn {
+	return &Conn{router: r, session: session}
 }
 
 func (c *Conn) Handle(data []byte) []byte {
