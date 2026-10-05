@@ -1,66 +1,53 @@
-import {
-  type ClientMessage,
-  type ServerMessage,
-  createId,
-  encode,
-  parse,
-} from "./protocol.ts";
+import { Listeners } from "./listeners.ts";
+import type { Transport, TransportError, TransportState } from "./transport.ts";
 
-export type SocketState =
-  "disconnected" | "connecting" | "connected" | "reconnecting";
-
-export type SocketOptions = {
+export type WebSocketOptions = {
   minDelay?: number;
   maxDelay?: number;
 };
 
-type Listener = (state: SocketState) => void;
-type MessageListener = (message: ServerMessage) => void;
-
-export class Socket {
+export class WebSocketTransport implements Transport {
   readonly #url: string;
   readonly #minDelay: number;
   readonly #maxDelay: number;
-  readonly #listeners = new Set<Listener>();
-  readonly #messageListeners = new Set<MessageListener>();
+  readonly #states = new Listeners<TransportState>();
+  readonly #data = new Listeners<string>();
+  readonly #errors = new Listeners<TransportError>();
   #socket: WebSocket | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #attempt = 0;
-  #state: SocketState = "disconnected";
+  #state: TransportState = "disconnected";
   #active = false;
 
-  constructor(url: string, options: SocketOptions = {}) {
+  constructor(url: string, options: WebSocketOptions = {}) {
     this.#url = url;
     this.#minDelay = options.minDelay ?? 1000;
     this.#maxDelay = options.maxDelay ?? 30000;
   }
 
-  get state(): SocketState {
+  get state(): TransportState {
     return this.#state;
   }
 
-  subscribe(listener: Listener): () => void {
-    this.#listeners.add(listener);
-    return () => {
-      this.#listeners.delete(listener);
-    };
+  onState(listener: (state: TransportState) => void): () => void {
+    return this.#states.add(listener);
   }
 
-  onMessage(listener: MessageListener): () => void {
-    this.#messageListeners.add(listener);
-    return () => {
-      this.#messageListeners.delete(listener);
-    };
+  onData(listener: (data: string) => void): () => void {
+    return this.#data.add(listener);
   }
 
-  send(message: ClientMessage): string | null {
+  onError(listener: (error: TransportError) => void): () => void {
+    return this.#errors.add(listener);
+  }
+
+  send(data: string): boolean {
     const socket = this.#socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return null;
+      return false;
     }
-    const id = createId();
-    socket.send(encode(message, id));
-    return id;
+    socket.send(data);
+    return true;
   }
 
   open(): void {
@@ -93,24 +80,25 @@ export class Socket {
       socket = new WebSocket(this.#url);
     } catch {
       this.close();
+      this.#errors.emit("unavailable");
       return;
     }
 
+    let opened = false;
     this.#socket = socket;
     socket.onopen = () => {
+      opened = true;
       this.#attempt = 0;
       this.#setState("connected");
     };
     socket.onmessage = (event: MessageEvent) => {
-      const message = parse(event.data);
-      if (message) {
-        for (const listener of this.#messageListeners) {
-          listener(message);
-        }
+      if (typeof event.data === "string") {
+        this.#data.emit(event.data);
       }
     };
     socket.onclose = () => {
       this.#socket = null;
+      this.#errors.emit(opened ? "lost" : "unavailable");
       this.#scheduleRetry();
     };
     this.#setState(this.#attempt === 0 ? "connecting" : "reconnecting");
@@ -153,13 +141,11 @@ export class Socket {
     }
   }
 
-  #setState(state: SocketState): void {
+  #setState(state: TransportState): void {
     if (this.#state === state) {
       return;
     }
     this.#state = state;
-    for (const listener of this.#listeners) {
-      listener(state);
-    }
+    this.#states.emit(state);
   }
 }

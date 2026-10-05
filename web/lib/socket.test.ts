@@ -1,126 +1,29 @@
 import assert from "node:assert/strict";
-import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, afterEach, before, test } from "node:test";
-import { fileURLToPath } from "node:url";
-import type { ServerMessage } from "./protocol.ts";
-import { Socket, type SocketState } from "./socket.ts";
+import { test } from "node:test";
+import { WebSocketTransport, type WebSocketOptions } from "./socket.ts";
+import {
+  created,
+  freePort,
+  openSockets,
+  record,
+  sleep,
+  startServer,
+  stopServer,
+  track,
+  useServer,
+  waitFor,
+} from "./testing.ts";
+import type { TransportError } from "./transport.ts";
 
-const NativeWebSocket = globalThis.WebSocket;
-const created: WebSocket[] = [];
+useServer();
 
-class TrackedWebSocket extends NativeWebSocket {
-  constructor(url: string | URL, protocols?: string | string[]) {
-    super(url, protocols);
-    created.push(this);
-  }
-}
-
-let workdir = "";
-let binary = "";
-const servers = new Set<ChildProcess>();
-const sockets = new Set<Socket>();
-
-before(() => {
-  globalThis.WebSocket = TrackedWebSocket;
-  workdir = mkdtempSync(join(tmpdir(), "ghostx-"));
-  binary = join(workdir, "server");
-  const serverDir = fileURLToPath(new URL("../../server", import.meta.url));
-  execFileSync("go", ["build", "-o", binary, "."], { cwd: serverDir });
-});
-
-afterEach(async () => {
-  for (const socket of sockets) {
-    socket.close();
-  }
-  sockets.clear();
-  created.length = 0;
-  await Promise.all([...servers].map(stopServer));
-});
-
-after(() => {
-  globalThis.WebSocket = NativeWebSocket;
-  rmSync(workdir, { recursive: true, force: true });
-});
-
-async function freePort(): Promise<number> {
-  const server = createServer();
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const address = server.address();
-  server.close();
-  await once(server, "close");
-  assert.ok(address && typeof address === "object");
-  return address.port;
-}
-
-async function startServer(port: number): Promise<ChildProcess> {
-  const server = spawn(binary, [], {
-    env: { ...process.env, SERVER_ADDR: `127.0.0.1:${port}` },
-    stdio: "ignore",
-  });
-  servers.add(server);
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/healthz`);
-      if (response.status === 204) {
-        return server;
-      }
-    } catch {}
-    await sleep(20);
-  }
-  throw new Error("server did not start");
-}
-
-async function stopServer(server: ChildProcess): Promise<void> {
-  servers.delete(server);
-  if (server.exitCode !== null || server.signalCode !== null) {
-    return;
-  }
-  const exited = once(server, "exit");
-  server.kill("SIGTERM");
-  await exited;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function track(socket: Socket): SocketState[] {
-  sockets.add(socket);
-  const states: SocketState[] = [];
-  socket.subscribe((state) => states.push(state));
-  return states;
-}
-
-async function waitFor(socket: Socket, state: SocketState): Promise<void> {
-  const deadline = Date.now() + 5000;
-  while (socket.state !== state) {
-    if (Date.now() > deadline) {
-      throw new Error(
-        `timed out waiting for ${state}, state is ${socket.state}`,
-      );
-    }
-    await sleep(10);
-  }
-}
-
-function openSockets(): WebSocket[] {
-  return created.filter(
-    (ws) =>
-      ws.readyState === NativeWebSocket.CONNECTING ||
-      ws.readyState === NativeWebSocket.OPEN,
-  );
+function transport(port: number, options?: WebSocketOptions) {
+  return track(new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, options));
 }
 
 test("starts disconnected without creating a connection", () => {
-  const socket = new Socket("ws://127.0.0.1:1/ws");
-  track(socket);
+  const socket = track(new WebSocketTransport("ws://127.0.0.1:1/ws"));
+  record(socket);
   assert.equal(socket.state, "disconnected");
   assert.equal(created.length, 0);
 });
@@ -128,8 +31,8 @@ test("starts disconnected without creating a connection", () => {
 test("connects to the server", async () => {
   const port = await freePort();
   await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`);
-  const states = track(socket);
+  const socket = transport(port);
+  const states = record(socket);
 
   socket.open();
   await waitFor(socket, "connected");
@@ -141,8 +44,7 @@ test("connects to the server", async () => {
 test("ignores repeated open calls", async () => {
   const port = await freePort();
   await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`);
-  track(socket);
+  const socket = transport(port);
 
   socket.open();
   socket.open();
@@ -156,8 +58,8 @@ test("ignores repeated open calls", async () => {
 test("closes intentionally", async () => {
   const port = await freePort();
   await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`);
-  const states = track(socket);
+  const socket = transport(port);
+  const states = record(socket);
 
   socket.open();
   await waitFor(socket, "connected");
@@ -173,8 +75,8 @@ test("closes intentionally", async () => {
 test("closes while connecting", async () => {
   const port = await freePort();
   await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`);
-  const states = track(socket);
+  const socket = transport(port);
+  const states = record(socket);
 
   socket.open();
   socket.close();
@@ -187,10 +89,9 @@ test("closes while connecting", async () => {
 test("stops notifying after unsubscribe", async () => {
   const port = await freePort();
   await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`);
-  sockets.add(socket);
-  const states: SocketState[] = [];
-  const unsubscribe = socket.subscribe((state) => states.push(state));
+  const socket = transport(port);
+  const states: string[] = [];
+  const unsubscribe = socket.onState((state) => states.push(state));
 
   socket.open();
   unsubscribe();
@@ -200,20 +101,23 @@ test("stops notifying after unsubscribe", async () => {
 });
 
 test("rejects an invalid url without throwing", () => {
-  const socket = new Socket("not a url");
-  const states = track(socket);
+  const socket = track(new WebSocketTransport("not a url"));
+  const states = record(socket);
+  const errors: TransportError[] = [];
+  socket.onError((error) => errors.push(error));
 
   socket.open();
 
   assert.equal(socket.state, "disconnected");
   assert.deepEqual(states, []);
+  assert.deepEqual(errors, ["unavailable"]);
   assert.equal(created.length, 0);
 });
 
 test("retries when the server is unavailable", async () => {
   const port = await freePort();
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 5000 });
-  const states = track(socket);
+  const socket = transport(port, { minDelay: 5000 });
+  const states = record(socket);
 
   socket.open();
   await waitFor(socket, "reconnecting");
@@ -226,8 +130,8 @@ test("retries when the server is unavailable", async () => {
 test("detects server shutdown", async () => {
   const port = await freePort();
   const server = await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`);
-  const states = track(socket);
+  const socket = transport(port);
+  const states = record(socket);
 
   socket.open();
   await waitFor(socket, "connected");
@@ -240,8 +144,8 @@ test("detects server shutdown", async () => {
 test("reconnects after the server restarts", async () => {
   const port = await freePort();
   const server = await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 });
-  const states = track(socket);
+  const socket = transport(port, { minDelay: 50 });
+  const states = record(socket);
 
   socket.open();
   await waitFor(socket, "connected");
@@ -262,8 +166,8 @@ test("reconnects after the server restarts", async () => {
 
 test("connects once the server becomes available", async () => {
   const port = await freePort();
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 });
-  const states = track(socket);
+  const socket = transport(port, { minDelay: 50 });
+  const states = record(socket);
 
   socket.open();
   await waitFor(socket, "reconnecting");
@@ -277,11 +181,7 @@ test("backs off between attempts without overlapping", async () => {
   const port = await freePort();
   const minDelay = 40;
   const maxDelay = 160;
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, {
-    minDelay,
-    maxDelay,
-  });
-  track(socket);
+  const socket = transport(port, { minDelay, maxDelay });
   const times: number[] = [];
   let seen = 0;
   let maxOpen = 0;
@@ -310,12 +210,7 @@ test("backs off between attempts without overlapping", async () => {
 
 test("resets backoff after a successful connection", async () => {
   const port = await freePort();
-  const minDelay = 50;
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, {
-    minDelay,
-    maxDelay: 5000,
-  });
-  track(socket);
+  const socket = transport(port, { minDelay: 50, maxDelay: 5000 });
 
   socket.open();
   await waitFor(socket, "reconnecting");
@@ -334,8 +229,8 @@ test("resets backoff after a successful connection", async () => {
 
 test("cancels a pending retry on close", async () => {
   const port = await freePort();
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 100 });
-  const states = track(socket);
+  const socket = transport(port, { minDelay: 100 });
+  const states = record(socket);
 
   socket.open();
   await waitFor(socket, "reconnecting");
@@ -350,8 +245,7 @@ test("cancels a pending retry on close", async () => {
 test("stops reconnecting after an intentional close", async () => {
   const port = await freePort();
   const server = await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 });
-  track(socket);
+  const socket = transport(port, { minDelay: 50 });
 
   socket.open();
   await waitFor(socket, "connected");
@@ -366,8 +260,7 @@ test("stops reconnecting after an intentional close", async () => {
 
 test("retries immediately on request", async () => {
   const port = await freePort();
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 60000 });
-  track(socket);
+  const socket = transport(port, { minDelay: 60000 });
 
   socket.open();
   await waitFor(socket, "reconnecting");
@@ -382,8 +275,7 @@ test("retries immediately on request", async () => {
 });
 
 test("ignores retry when not reconnecting", () => {
-  const socket = new Socket("ws://127.0.0.1:1/ws");
-  track(socket);
+  const socket = track(new WebSocketTransport("ws://127.0.0.1:1/ws"));
 
   socket.retry();
 
@@ -394,8 +286,8 @@ test("ignores retry when not reconnecting", () => {
 test("reopens after an intentional close", async () => {
   const port = await freePort();
   await startServer(port);
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`);
-  const states = track(socket);
+  const socket = transport(port);
+  const states = record(socket);
 
   socket.open();
   await waitFor(socket, "connected");
@@ -414,162 +306,30 @@ test("reopens after an intentional close", async () => {
   assert.equal(openSockets().length, 1);
 });
 
-function collect(socket: Socket): ServerMessage[] {
-  const messages: ServerMessage[] = [];
-  socket.onMessage((message) => messages.push(message));
-  return messages;
-}
+test("reports each failed attempt as unavailable", async () => {
+  const port = await freePort();
+  const socket = transport(port, { minDelay: 40, maxDelay: 40 });
+  const errors: TransportError[] = [];
+  socket.onError((error) => errors.push(error));
 
-async function waitForMessages(
-  messages: ServerMessage[],
-  count: number,
-): Promise<void> {
-  const deadline = Date.now() + 5000;
-  while (messages.length < count) {
-    if (Date.now() > deadline) {
-      throw new Error(`received ${messages.length} of ${count} messages`);
-    }
-    await sleep(5);
-  }
-}
+  socket.open();
+  await sleep(300);
 
-async function connected(port: number): Promise<Socket> {
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 });
-  track(socket);
+  assert.ok(errors.length >= 2, `errors = ${errors.length}`);
+  assert.ok(errors.every((error) => error === "unavailable"));
+});
+
+test("reports no error on intentional close", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const socket = transport(port);
+  const errors: TransportError[] = [];
+  socket.onError((error) => errors.push(error));
+
   socket.open();
   await waitFor(socket, "connected");
-  return socket;
-}
-
-test("does not send while disconnected", async () => {
-  const port = await freePort();
-  const socket = new Socket(`ws://127.0.0.1:${port}/ws`, { minDelay: 5000 });
-  track(socket);
-
-  assert.equal(socket.send({ type: "ping", payload: { sentAt: 1 } }), null);
-  socket.open();
-  assert.equal(socket.send({ type: "ping", payload: { sentAt: 1 } }), null);
-});
-
-test("receives a pong for a ping", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const socket = await connected(port);
-  const messages = collect(socket);
-
-  const sentAt = Date.now();
-  const id = socket.send({ type: "ping", payload: { sentAt } });
-  assert.ok(id);
-  await waitForMessages(messages, 1);
-
-  const [message] = messages;
-  assert.equal(message.type, "pong");
-  assert.equal(message.id, id);
-  assert.ok(message.type === "pong");
-  assert.equal(message.payload.sentAt, sentAt);
-  assert.ok(message.payload.receivedAt >= sentAt - 1000);
-});
-
-test("correlates concurrent requests", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const socket = await connected(port);
-  const messages = collect(socket);
-
-  const ids = Array.from({ length: 20 }, (_, i) =>
-    socket.send({ type: "ping", payload: { sentAt: i } }),
-  );
-  await waitForMessages(messages, ids.length);
-
-  assert.deepEqual(
-    messages.map((message) => message.id),
-    ids,
-  );
-  assert.equal(new Set(ids).size, ids.length);
-});
-
-test("receives protocol errors from the server", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const socket = await connected(port);
-  const messages = collect(socket);
-
-  const id = socket.send({ type: "ping", payload: { sentAt: -1 } });
-  await waitForMessages(messages, 1);
-
-  assert.deepEqual(messages, [
-    { type: "error", id, payload: { code: "invalid_payload" } },
-  ]);
-  assert.equal(socket.state, "connected");
-});
-
-test("stops delivering messages after unsubscribe", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const socket = await connected(port);
-  const kept = collect(socket);
-  const removed: ServerMessage[] = [];
-  const unsubscribe = socket.onMessage((message) => removed.push(message));
-
-  unsubscribe();
-  unsubscribe();
-  socket.send({ type: "ping", payload: { sentAt: 1 } });
-  await waitForMessages(kept, 1);
-  await sleep(50);
-
-  assert.equal(kept.length, 1);
-  assert.equal(removed.length, 0);
-});
-
-test("drops replies that arrive after close", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const socket = await connected(port);
-  const messages = collect(socket);
-
-  socket.send({ type: "ping", payload: { sentAt: 1 } });
   socket.close();
-  await sleep(200);
-
-  assert.equal(messages.length, 0);
-});
-
-test("delivers each message once across reconnects", async () => {
-  const port = await freePort();
-  const server = await startServer(port);
-  const socket = await connected(port);
-  const messages = collect(socket);
-
-  socket.send({ type: "ping", payload: { sentAt: 1 } });
-  await waitForMessages(messages, 1);
-
-  await stopServer(server);
-  await waitFor(socket, "reconnecting");
-  await startServer(port);
-  await waitFor(socket, "connected");
-
-  const id = socket.send({ type: "ping", payload: { sentAt: 2 } });
-  await waitForMessages(messages, 2);
   await sleep(100);
 
-  assert.equal(messages.length, 2);
-  assert.equal(messages[1].id, id);
-  assert.equal(openSockets().length, 1);
-});
-
-test("delivers messages after an intentional reopen", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const socket = await connected(port);
-  const messages = collect(socket);
-
-  socket.close();
-  socket.open();
-  await waitFor(socket, "connected");
-  socket.send({ type: "ping", payload: { sentAt: 1 } });
-  await waitForMessages(messages, 1);
-  await sleep(100);
-
-  assert.equal(messages.length, 1);
-  assert.equal(openSockets().length, 1);
+  assert.deepEqual(errors, []);
 });

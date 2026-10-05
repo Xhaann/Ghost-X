@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { Client } from "./client.ts";
 import type { ErrorCode } from "./protocol.ts";
-import type { Socket } from "./socket.ts";
 
 export type PingResult =
   { ok: true; roundTrip: number } | { ok: false; code: ErrorCode };
 
-export function usePing(socket: Socket | null): {
+export function usePing(client: Client | null): {
   ping: () => void;
   result: PingResult | null;
 } {
@@ -13,11 +13,11 @@ export function usePing(socket: Socket | null): {
   const pending = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!socket) {
+    if (!client) {
       return;
     }
 
-    const unsubscribe = socket.onMessage((message) => {
+    const unsubscribe = client.onMessage((message) => {
       if (message.id === undefined || message.id !== pending.current) {
         return;
       }
@@ -36,12 +36,12 @@ export function usePing(socket: Socket | null): {
       unsubscribe();
       pending.current = null;
     };
-  }, [socket]);
+  }, [client]);
 
   const ping = useCallback(() => {
     pending.current =
-      socket?.send({ type: "ping", payload: { sentAt: Date.now() } }) ?? null;
-  }, [socket]);
+      client?.send({ type: "ping", payload: { sentAt: Date.now() } }) ?? null;
+  }, [client]);
 
   return { ping, result };
 }
