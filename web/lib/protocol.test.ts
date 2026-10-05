@@ -142,6 +142,39 @@ test("parses whoami and authentication_required", () => {
   }
 });
 
+test("parses presence messages", () => {
+  const identity = "B".repeat(42) + "A";
+  assert.deepEqual(parse('{"type":"presence","id":"s1","payload":{}}'), {
+    type: "presence",
+    id: "s1",
+    payload: {},
+  });
+  for (const type of ["present", "absent"]) {
+    assert.deepEqual(parse(JSON.stringify({ type, payload: { identity } })), {
+      type,
+      payload: { identity },
+    });
+  }
+});
+
+test("rejects malformed presence messages", () => {
+  const identity = "B".repeat(42) + "A";
+  for (const message of [
+    { type: "presence", payload: {} },
+    { type: "presence", id: "s1", payload: { identity } },
+    { type: "presence", id: "s1" },
+    { type: "present", id: "p1", payload: { identity } },
+    { type: "present", payload: {} },
+    { type: "present", payload: { identity: "short" } },
+    { type: "present", payload: { identity: "B".repeat(43) } },
+    { type: "present", payload: { identity, extra: 1 } },
+    { type: "absent", payload: { identity: null } },
+    { type: "absent", payload: { identity }, extra: 1 },
+  ]) {
+    assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
+  }
+});
+
 test("rejects unsupported message types", () => {
   for (const type of ["ping", "unknown", "PONG", "", 1, null]) {
     assert.equal(parse(pong({ type })), null, `accepted type ${type}`);

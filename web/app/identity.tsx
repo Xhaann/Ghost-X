@@ -2,8 +2,10 @@
 
 import type { AuthState } from "@/lib/auth.ts";
 import type { Client } from "@/lib/client.ts";
+import type { PresenceState } from "@/lib/presence.ts";
 import { useAuth } from "@/lib/useAuth.ts";
 import { useIdentity } from "@/lib/useIdentity.ts";
+import { usePresence } from "@/lib/usePresence.ts";
 import { useWhoami } from "@/lib/useWhoami.ts";
 
 const labels: Record<AuthState, string> = {
@@ -13,10 +15,26 @@ const labels: Record<AuthState, string> = {
   failed: "Authentication failed",
 };
 
+function presenceLabel(presence: PresenceState, self: string | undefined) {
+  if (presence.status === "pending") {
+    return "Establishing presence";
+  }
+  if (
+    presence.status === "active" &&
+    self &&
+    presence.identities.includes(self)
+  ) {
+    return "Present";
+  }
+  return "Presence not established";
+}
+
 export default function Identity({ client }: { client: Client | null }) {
   const key = useIdentity();
-  const state = useAuth(client, key);
+  const { state, authenticator } = useAuth(client, key);
+  const presence = usePresence(client, authenticator);
   const { query, result } = useWhoami(client, state);
+  const others = presence.identities.filter((id) => id !== key?.identity);
 
   return (
     <section>
@@ -39,6 +57,25 @@ export default function Identity({ client }: { client: Client | null }) {
               ? "Authentication required"
               : "Request failed"}
         </output>
+      )}
+      {state === "authenticated" && (
+        <>
+          <p data-presence={presence.status}>
+            {presenceLabel(presence, key?.identity)}
+          </p>
+          {presence.status === "active" &&
+            (others.length === 0 ? (
+              <p data-others="0">No other identities present</p>
+            ) : (
+              <ul data-others={others.length}>
+                {others.map((id) => (
+                  <li key={id}>
+                    <code>{id}</code>
+                  </li>
+                ))}
+              </ul>
+            ))}
+        </>
       )}
     </section>
   );

@@ -13,7 +13,8 @@ export type ClientMessage =
   | { type: "ping"; payload: { sentAt: number } }
   | { type: "challenge"; payload: Record<string, never> }
   | { type: "authenticate"; payload: { identity: string; signature: string } }
-  | { type: "whoami"; payload: Record<string, never> };
+  | { type: "whoami"; payload: Record<string, never> }
+  | { type: "presence"; payload: Record<string, never> };
 
 export type ServerMessage =
   | {
@@ -24,6 +25,12 @@ export type ServerMessage =
   | { type: "challenge"; id: string; payload: { nonce: string } }
   | { type: "authenticated"; id: string; payload: { identity: string } }
   | { type: "whoami"; id: string; payload: { identity: string } }
+  | { type: "presence"; id: string; payload: Record<string, never> }
+  | {
+      type: "present" | "absent";
+      id?: undefined;
+      payload: { identity: string };
+    }
   | { type: "error"; id?: string; payload: { code: ErrorCode } };
 
 export const nonceSize = 32;
@@ -125,6 +132,28 @@ export function parse(data: unknown): ServerMessage | null {
       isIdentity(payload.identity)
     ) {
       return { type, id, payload: { identity: payload.identity } };
+    }
+    return null;
+  }
+
+  if (type === "presence") {
+    if (
+      hasOnly(value, ["type", "id", "payload"]) &&
+      isValidId(id) &&
+      hasOnly(payload, [])
+    ) {
+      return { type, id, payload: {} };
+    }
+    return null;
+  }
+
+  if (type === "present" || type === "absent") {
+    if (
+      hasOnly(value, ["type", "payload"]) &&
+      hasOnly(payload, ["identity"]) &&
+      isIdentity(payload.identity)
+    ) {
+      return { type, payload: { identity: payload.identity } };
     }
     return null;
   }
