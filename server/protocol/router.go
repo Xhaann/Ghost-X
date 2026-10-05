@@ -20,6 +20,7 @@ type Router struct {
 type Conn struct {
 	router  *Router
 	session *auth.Session
+	push    func([]byte)
 }
 
 func NewRouter(public map[string]Handler, protected map[string]ProtectedHandler) *Router {
@@ -31,8 +32,8 @@ func NewRouter(public map[string]Handler, protected map[string]ProtectedHandler)
 	return &Router{public: maps.Clone(public), protected: maps.Clone(protected)}
 }
 
-func (r *Router) Conn(session *auth.Session) *Conn {
-	return &Conn{router: r, session: session}
+func (r *Router) Conn(session *auth.Session, push func([]byte)) *Conn {
+	return &Conn{router: r, session: session, push: push}
 }
 
 func (c *Conn) Handle(data []byte) []byte {

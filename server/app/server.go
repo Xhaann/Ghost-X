@@ -9,6 +9,7 @@ import (
 
 	"github.com/Xhaann/ghost-x/server/auth"
 	"github.com/Xhaann/ghost-x/server/config"
+	"github.com/Xhaann/ghost-x/server/presence"
 	"github.com/Xhaann/ghost-x/server/protocol"
 	"github.com/Xhaann/ghost-x/server/socket"
 )
@@ -17,6 +18,7 @@ type Server struct {
 	cfg      config.Config
 	hub      *socket.Hub
 	sessions *auth.Registry
+	presence *presence.Registry
 	http     *http.Server
 }
 
@@ -35,19 +37,22 @@ func (e *endpoint) Close() {
 }
 
 func New(cfg config.Config) *Server {
-	sessions := auth.NewRegistry(time.Now)
+	present := presence.NewRegistry()
+	sessions := auth.NewRegistry(time.Now, present)
 	router := protocol.NewRouter(map[string]protocol.Handler{
 		"ping":         protocol.Ping(time.Now),
 		"challenge":    protocol.Challenge(),
 		"authenticate": protocol.Authenticate(),
 	}, map[string]protocol.ProtectedHandler{
-		"whoami": protocol.WhoAmI(),
+		"whoami":   protocol.WhoAmI(),
+		"presence": protocol.Presence(present),
 	})
 
 	opts := socket.DefaultOptions()
 	opts.Accept = func(c *socket.Client) socket.Receiver {
 		session := sessions.Open()
-		return &endpoint{client: c, conn: router.Conn(session), session: session}
+		push := func(data []byte) { _ = c.Send(data) }
+		return &endpoint{client: c, conn: router.Conn(session, push), session: session}
 	}
 	hub := socket.NewHub(opts)
 
@@ -59,6 +64,7 @@ func New(cfg config.Config) *Server {
 		cfg:      cfg,
 		hub:      hub,
 		sessions: sessions,
+		presence: present,
 		http: &http.Server{
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,

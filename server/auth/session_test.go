@@ -59,7 +59,7 @@ func (s signer) prove(t testing.TB, session *Session) error {
 }
 
 func TestNewSessionIsUnauthenticated(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	s := r.Open()
 
 	if s.State() != Unauthenticated {
@@ -74,7 +74,7 @@ func TestNewSessionIsUnauthenticated(t *testing.T) {
 }
 
 func TestAuthenticate(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	s := r.Open()
 	signer := newSigner(t)
 
@@ -100,7 +100,7 @@ func TestMessageIsDomainSeparated(t *testing.T) {
 }
 
 func TestChallengesAreUniqueAndCopied(t *testing.T) {
-	s := NewRegistry(time.Now).Open()
+	s := NewRegistry(time.Now, nil).Open()
 	seen := make(map[string]struct{})
 	for range 100 {
 		nonce, err := s.Challenge()
@@ -188,7 +188,7 @@ func TestAuthenticateRejected(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			c := newClock()
-			r := NewRegistry(c.Now)
+			r := NewRegistry(c.Now, nil)
 			s := r.Open()
 			if err := run(t, c, s); !errors.Is(err, ErrFailed) {
 				t.Fatalf("error = %v, want %v", err, ErrFailed)
@@ -202,7 +202,7 @@ func TestAuthenticateRejected(t *testing.T) {
 
 func TestExpiryBoundary(t *testing.T) {
 	c := newClock()
-	s := NewRegistry(c.Now).Open()
+	s := NewRegistry(c.Now, nil).Open()
 	signer := newSigner(t)
 
 	nonce, _ := s.Challenge()
@@ -213,7 +213,7 @@ func TestExpiryBoundary(t *testing.T) {
 }
 
 func TestMalformedIdentityConsumesChallenge(t *testing.T) {
-	s := NewRegistry(time.Now).Open()
+	s := NewRegistry(time.Now, nil).Open()
 	signer := newSigner(t)
 
 	nonce, _ := s.Challenge()
@@ -228,7 +228,7 @@ func TestMalformedIdentityConsumesChallenge(t *testing.T) {
 }
 
 func TestChallengesAreBoundToSession(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	first, second := r.Open(), r.Open()
 	signer := newSigner(t)
 
@@ -246,7 +246,7 @@ func TestChallengesAreBoundToSession(t *testing.T) {
 }
 
 func TestFailuresLockSession(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	s := r.Open()
 	signer := newSigner(t)
 	other := newSigner(t)
@@ -271,7 +271,7 @@ func TestFailuresLockSession(t *testing.T) {
 }
 
 func TestAuthenticatedSessionCannotReauthenticate(t *testing.T) {
-	s := NewRegistry(time.Now).Open()
+	s := NewRegistry(time.Now, nil).Open()
 	signer := newSigner(t)
 	other := newSigner(t)
 
@@ -290,7 +290,7 @@ func TestAuthenticatedSessionCannotReauthenticate(t *testing.T) {
 }
 
 func TestCloseDestroysSession(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	s := r.Open()
 	signer := newSigner(t)
 
@@ -310,7 +310,7 @@ func TestCloseDestroysSession(t *testing.T) {
 }
 
 func TestCloseClearsAuthentication(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	s := r.Open()
 	if err := newSigner(t).prove(t, s); err != nil {
 		t.Fatal(err)
@@ -327,7 +327,7 @@ func TestCloseClearsAuthentication(t *testing.T) {
 }
 
 func TestSameIdentityOnIndependentSessions(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	signer := newSigner(t)
 	first, second := r.Open(), r.Open()
 
@@ -354,7 +354,7 @@ func TestSameIdentityOnIndependentSessions(t *testing.T) {
 }
 
 func TestConcurrentAuthentication(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	signer := newSigner(t)
 	var wg sync.WaitGroup
 	for range 32 {
@@ -374,7 +374,7 @@ func TestConcurrentAuthentication(t *testing.T) {
 }
 
 func TestConcurrentAttemptsOnOneSession(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	s := r.Open()
 	signer := newSigner(t)
 	nonce, _ := s.Challenge()
@@ -397,7 +397,7 @@ func TestConcurrentAttemptsOnOneSession(t *testing.T) {
 }
 
 func TestConcurrentCloseDuringAuthentication(t *testing.T) {
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	signer := newSigner(t)
 	for range 50 {
 		s := r.Open()
@@ -422,7 +422,7 @@ func FuzzAuthenticate(f *testing.F) {
 	f.Add("", "")
 	f.Add(strings.Repeat("A", 43), strings.Repeat("A", 86))
 
-	r := NewRegistry(time.Now)
+	r := NewRegistry(time.Now, nil)
 	f.Fuzz(func(t *testing.T, encoded, signature string) {
 		s := r.Open()
 		defer s.Close()

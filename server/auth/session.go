@@ -37,14 +37,20 @@ func Message(nonce []byte) []byte {
 	return append([]byte(context), nonce...)
 }
 
+type Observer interface {
+	Authenticated(s *Session, id identity.Identity)
+	Closed(s *Session, id identity.Identity)
+}
+
 type Registry struct {
 	now      func() time.Time
+	observer Observer
 	mu       sync.Mutex
 	sessions map[*Session]struct{}
 }
 
-func NewRegistry(now func() time.Time) *Registry {
-	return &Registry{now: now, sessions: make(map[*Session]struct{})}
+func NewRegistry(now func() time.Time, observer Observer) *Registry {
+	return &Registry{now: now, observer: observer, sessions: make(map[*Session]struct{})}
 }
 
 func (r *Registry) Open() *Session {
@@ -139,6 +145,9 @@ func (s *Session) Authenticate(encoded, signature string) (identity.Identity, er
 
 	s.state = Authenticated
 	s.identity = id
+	if s.registry.observer != nil {
+		s.registry.observer.Authenticated(s, id)
+	}
 	return id, nil
 }
 
@@ -148,9 +157,13 @@ func (s *Session) Close() {
 		s.mu.Unlock()
 		return
 	}
+	wasAuthenticated, id := s.state == Authenticated, s.identity
 	s.state = Closed
 	s.nonce = nil
 	s.identity = identity.Identity{}
+	if wasAuthenticated && s.registry.observer != nil {
+		s.registry.observer.Closed(s, id)
+	}
 	s.mu.Unlock()
 	s.registry.remove(s)
 }

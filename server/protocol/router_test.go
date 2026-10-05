@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Xhaann/ghost-x/server/auth"
+	"github.com/Xhaann/ghost-x/server/presence"
 )
 
 type response struct {
@@ -42,8 +43,10 @@ func errorCode(t *testing.T, resp response) Code {
 	return payload.Code
 }
 
+func discard([]byte) {}
+
 func testSession() *auth.Session {
-	return auth.NewRegistry(time.Now).Open()
+	return auth.NewRegistry(time.Now, nil).Open()
 }
 
 func newTestRouter() *Router {
@@ -52,14 +55,15 @@ func newTestRouter() *Router {
 		"challenge":    Challenge(),
 		"authenticate": Authenticate(),
 	}, map[string]ProtectedHandler{
-		"whoami": WhoAmI(),
+		"whoami":   WhoAmI(),
+		"presence": Presence(presence.NewRegistry()),
 	})
 }
 
 func TestRouterPing(t *testing.T) {
 	before := time.Now().UnixMilli()
 	sentAt := strconv.FormatInt(before, 10)
-	data := newTestRouter().Conn(testSession()).Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":` + sentAt + `}}`))
+	data := newTestRouter().Conn(testSession(), discard).Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":` + sentAt + `}}`))
 	after := time.Now().UnixMilli()
 
 	resp := decodeResponse(t, data)
@@ -106,7 +110,7 @@ func TestRouterErrors(t *testing.T) {
 	router := newTestRouter()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(tt.input)))
+			resp := decodeResponse(t, router.Conn(testSession(), discard).Handle([]byte(tt.input)))
 			if code := errorCode(t, resp); code != tt.code {
 				t.Errorf("code = %q, want %q", code, tt.code)
 			}
@@ -123,7 +127,7 @@ func TestRouterHidesInternalErrors(t *testing.T) {
 		"fail": func(*Conn, []byte) (Reply, error) { return Reply{}, internal },
 	}, nil)
 
-	data := router.Conn(testSession()).Handle([]byte(`{"type":"fail","id":"r1"}`))
+	data := router.Conn(testSession(), discard).Handle([]byte(`{"type":"fail","id":"r1"}`))
 
 	if code := errorCode(t, decodeResponse(t, data)); code != CodeInternalError {
 		t.Errorf("code = %q, want %q", code, CodeInternalError)
@@ -138,7 +142,7 @@ func TestRouterUnencodableReply(t *testing.T) {
 		"bad": func(*Conn, []byte) (Reply, error) { return Reply{Type: "bad", Payload: make(chan int)}, nil },
 	}, nil)
 
-	resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(`{"type":"bad","id":"r1"}`)))
+	resp := decodeResponse(t, router.Conn(testSession(), discard).Handle([]byte(`{"type":"bad","id":"r1"}`)))
 
 	if code := errorCode(t, resp); code != CodeInternalError {
 		t.Errorf("code = %q, want %q", code, CodeInternalError)
@@ -153,7 +157,7 @@ func TestRouterIgnoresLaterHandlerChanges(t *testing.T) {
 	router := NewRouter(handlers, nil)
 	delete(handlers, "ping")
 
-	resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":1}}`)))
+	resp := decodeResponse(t, router.Conn(testSession(), discard).Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":1}}`)))
 	if resp.Type != "pong" {
 		t.Errorf("type = %q, want pong", resp.Type)
 	}
@@ -166,7 +170,7 @@ func TestRouterConcurrent(t *testing.T) {
 		wg.Go(func() {
 			for i := range 200 {
 				id := "g" + strconv.Itoa(g) + "_" + strconv.Itoa(i)
-				resp := decodeResponse(t, router.Conn(testSession()).Handle([]byte(`{"type":"ping","id":"`+id+`","payload":{"sentAt":`+strconv.Itoa(i)+`}}`)))
+				resp := decodeResponse(t, router.Conn(testSession(), discard).Handle([]byte(`{"type":"ping","id":"`+id+`","payload":{"sentAt":`+strconv.Itoa(i)+`}}`)))
 				if resp.Type != "pong" || resp.ID != id {
 					t.Errorf("response = %+v, want pong %s", resp, id)
 					return
@@ -191,6 +195,8 @@ func FuzzRouterHandle(f *testing.F) {
 		"{\"type\":\"ping\",\"id\":\"a\"}\x00",
 		`{"type":"challenge","id":"a","payload":{}}`,
 		`{"type":"whoami","id":"a","payload":{}}`,
+		`{"type":"presence","id":"a","payload":{}}`,
+		`{"type":"present","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"authenticate","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 	} {
 		f.Add([]byte(seed))
@@ -198,7 +204,7 @@ func FuzzRouterHandle(f *testing.F) {
 
 	router := newTestRouter()
 	f.Fuzz(func(t *testing.T, data []byte) {
-		out := router.Conn(testSession()).Handle(data)
+		out := router.Conn(testSession(), discard).Handle(data)
 		if !json.Valid(out) || !utf8.Valid(out) {
 			t.Fatalf("invalid response %q for input %q", out, data)
 		}

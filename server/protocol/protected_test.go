@@ -29,7 +29,7 @@ func whoami(conn *Conn) []byte {
 }
 
 func TestProtectedRequiresAuthentication(t *testing.T) {
-	conn := protectedRouter().Conn(testSession())
+	conn := protectedRouter().Conn(testSession(), discard)
 
 	for _, input := range []string{
 		`{"type":"whoami","id":"w1","payload":{}}`,
@@ -44,7 +44,7 @@ func TestProtectedRequiresAuthentication(t *testing.T) {
 }
 
 func TestProtectedRequiresCompletedAuthentication(t *testing.T) {
-	conn := protectedRouter().Conn(testSession())
+	conn := protectedRouter().Conn(testSession(), discard)
 	s := newSigner(t)
 	other := newSigner(t)
 
@@ -59,7 +59,7 @@ func TestProtectedReturnsSessionIdentity(t *testing.T) {
 	router := protectedRouter()
 	s := newSigner(t)
 	other := newSigner(t)
-	first, second := router.Conn(testSession()), router.Conn(testSession())
+	first, second := router.Conn(testSession(), discard), router.Conn(testSession(), discard)
 
 	authenticated(t, first, s)
 	authenticated(t, second, other)
@@ -74,11 +74,11 @@ func TestProtectedReturnsSessionIdentity(t *testing.T) {
 }
 
 func conn(r *Router) *Conn {
-	return r.Conn(testSession())
+	return r.Conn(testSession(), discard)
 }
 
 func TestProtectedValidatesPayloadAfterAuthentication(t *testing.T) {
-	c := protectedRouter().Conn(testSession())
+	c := protectedRouter().Conn(testSession(), discard)
 	authenticated(t, c, newSigner(t))
 
 	expectCode(t, c.Handle([]byte(`{"type":"whoami","id":"w1","payload":{"x":1}}`)), CodeInvalidPayload)
@@ -87,7 +87,7 @@ func TestProtectedValidatesPayloadAfterAuthentication(t *testing.T) {
 
 func TestProtectedRejectedAfterSessionClose(t *testing.T) {
 	session := testSession()
-	c := protectedRouter().Conn(session)
+	c := protectedRouter().Conn(session, discard)
 	authenticated(t, c, newSigner(t))
 
 	session.Close()
@@ -96,7 +96,7 @@ func TestProtectedRejectedAfterSessionClose(t *testing.T) {
 }
 
 func TestProtectedRejectedAfterLockout(t *testing.T) {
-	c := protectedRouter().Conn(testSession())
+	c := protectedRouter().Conn(testSession(), discard)
 	s := newSigner(t)
 	other := newSigner(t)
 	for range auth.MaxFailures {
@@ -116,20 +116,20 @@ func TestRouterRejectsAmbiguousRoutes(t *testing.T) {
 }
 
 func TestUnknownTypeIsUnsupportedRegardlessOfAuthentication(t *testing.T) {
-	c := protectedRouter().Conn(testSession())
+	c := protectedRouter().Conn(testSession(), discard)
 	expectCode(t, c.Handle([]byte(`{"type":"unknown","id":"u1","payload":{}}`)), CodeUnsupportedType)
 	authenticated(t, c, newSigner(t))
 	expectCode(t, c.Handle([]byte(`{"type":"unknown","id":"u1","payload":{}}`)), CodeUnsupportedType)
 }
 
 func TestSessionsAreIndependentAcrossRegistries(t *testing.T) {
-	registry := auth.NewRegistry(time.Now)
+	registry := auth.NewRegistry(time.Now, nil)
 	router := protectedRouter()
 	s := newSigner(t)
 	session := registry.Open()
-	authenticated(t, router.Conn(session), s)
+	authenticated(t, router.Conn(session, discard), s)
 
-	expectCode(t, router.Conn(registry.Open()).Handle([]byte(`{"type":"whoami","id":"w1","payload":{}}`)), CodeAuthRequired)
+	expectCode(t, router.Conn(registry.Open(), discard).Handle([]byte(`{"type":"whoami","id":"w1","payload":{}}`)), CodeAuthRequired)
 	if registry.Authenticated() != 1 {
 		t.Fatalf("Authenticated() = %d, want 1", registry.Authenticated())
 	}

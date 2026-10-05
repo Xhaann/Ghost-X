@@ -69,9 +69,9 @@ func expectCode(t *testing.T, data []byte, code Code) {
 }
 
 func TestAuthenticateBindsSession(t *testing.T) {
-	registry := auth.NewRegistry(time.Now)
+	registry := auth.NewRegistry(time.Now, nil)
 	session := registry.Open()
-	conn := authRouter().Conn(session)
+	conn := authRouter().Conn(session, discard)
 	s := newSigner(t)
 
 	nonce := requestChallenge(t, conn)
@@ -86,10 +86,10 @@ func TestAuthenticateBindsSession(t *testing.T) {
 }
 
 func TestAuthenticateRejectsCrossConnectionProof(t *testing.T) {
-	registry := auth.NewRegistry(time.Now)
+	registry := auth.NewRegistry(time.Now, nil)
 	router := authRouter()
 	firstSession, secondSession := registry.Open(), registry.Open()
-	first, second := router.Conn(firstSession), router.Conn(secondSession)
+	first, second := router.Conn(firstSession, discard), router.Conn(secondSession, discard)
 	s := newSigner(t)
 
 	nonce := requestChallenge(t, first)
@@ -153,14 +153,14 @@ func TestAuthenticateFailures(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			conn := authRouter().Conn(testSession())
+			conn := authRouter().Conn(testSession(), discard)
 			expectCode(t, tt.run(t, conn), tt.code)
 		})
 	}
 }
 
 func TestMalformedAuthenticateConsumesChallenge(t *testing.T) {
-	conn := authRouter().Conn(testSession())
+	conn := authRouter().Conn(testSession(), discard)
 	s := newSigner(t)
 
 	nonce := requestChallenge(t, conn)
@@ -170,7 +170,7 @@ func TestMalformedAuthenticateConsumesChallenge(t *testing.T) {
 
 func TestAuthenticationLocksAfterFailures(t *testing.T) {
 	session := testSession()
-	conn := authRouter().Conn(session)
+	conn := authRouter().Conn(session, discard)
 	s := newSigner(t)
 	other := newSigner(t)
 
@@ -186,7 +186,7 @@ func TestAuthenticationLocksAfterFailures(t *testing.T) {
 
 func TestClosedSessionRejectsAuthentication(t *testing.T) {
 	session := testSession()
-	conn := authRouter().Conn(session)
+	conn := authRouter().Conn(session, discard)
 	s := newSigner(t)
 
 	nonce := requestChallenge(t, conn)
@@ -200,7 +200,7 @@ func TestClosedSessionRejectsAuthentication(t *testing.T) {
 }
 
 func TestAuthErrorsDoNotLeakDetails(t *testing.T) {
-	conn := authRouter().Conn(testSession())
+	conn := authRouter().Conn(testSession(), discard)
 	s := newSigner(t)
 
 	for _, out := range [][]byte{
@@ -225,11 +225,11 @@ func FuzzAuthenticateMessage(f *testing.F) {
 	f.Add(`{"identity":"` + strings.Repeat("A", 43) + `","signature":"` + strings.Repeat("_", 86) + `","x":1}`)
 
 	router := authRouter()
-	registry := auth.NewRegistry(time.Now)
+	registry := auth.NewRegistry(time.Now, nil)
 	f.Fuzz(func(t *testing.T, payload string) {
 		session := registry.Open()
 		defer session.Close()
-		conn := router.Conn(session)
+		conn := router.Conn(session, discard)
 		conn.Handle([]byte(`{"type":"challenge","id":"c1","payload":{}}`))
 		out := conn.Handle([]byte(`{"type":"authenticate","id":"a1","payload":` + payload + `}`))
 		var resp response
