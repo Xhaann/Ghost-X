@@ -7,6 +7,8 @@ type Options struct {
 	MaxMessageSize int64
 	SendQueueSize  int
 	WriteTimeout   time.Duration
+	PingInterval   time.Duration
+	PongTimeout    time.Duration
 	OnMessage      func(c *Client, data []byte)
 }
 
@@ -16,5 +18,7 @@ func DefaultOptions() Options {
 		MaxMessageSize: 32 << 10,
 		SendQueueSize:  64,
 		WriteTimeout:   10 * time.Second,
+		PingInterval:   30 * time.Second,
+		PongTimeout:    60 * time.Second,
 	}
 }

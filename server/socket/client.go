@@ -84,6 +84,11 @@ func (c *Client) readLoop() {
 	defer close(c.readDone)
 
 	c.conn.SetReadLimit(c.hub.opts.MaxMessageSize)
+	c.conn.SetPongHandler(func(string) error { return c.extendReadDeadline() })
+	if err := c.extendReadDeadline(); err != nil {
+		c.Close(websocket.CloseGoingAway, "")
+		return
+	}
 	for {
 		kind, data, err := c.conn.ReadMessage()
 		if err != nil {
@@ -107,12 +112,24 @@ func (c *Client) readLoop() {
 	}
 }
 
+func (c *Client) extendReadDeadline() error {
+	return c.conn.SetReadDeadline(time.Now().Add(c.hub.opts.PongTimeout))
+}
+
 func (c *Client) writeLoop() {
 	defer c.hub.wg.Done()
 	defer c.conn.Close()
 
+	ticker := time.NewTicker(c.hub.opts.PingInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
+		case <-ticker.C:
+			if err := c.write(websocket.PingMessage, nil); err != nil {
+				c.Close(websocket.CloseGoingAway, "")
+				return
+			}
 		case data := <-c.send:
 			if err := c.write(websocket.TextMessage, data); err != nil {
 				c.Close(websocket.CloseGoingAway, "")
