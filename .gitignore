@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.env.*
+*.log
+
+/server/bin/
+
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
