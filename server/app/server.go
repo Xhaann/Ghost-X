@@ -20,12 +20,17 @@ type Server struct {
 
 func New(cfg config.Config) *Server {
 	router := protocol.NewRouter(map[string]protocol.Handler{
-		"ping": protocol.Ping(time.Now),
+		"ping":      protocol.Ping(time.Now),
+		"challenge": protocol.Challenge(time.Now),
+		"prove":     protocol.Prove(time.Now),
 	})
 
 	opts := socket.DefaultOptions()
-	opts.OnMessage = func(c *socket.Client, data []byte) {
-		_ = c.Send(router.Handle(data))
+	opts.Accept = func(c *socket.Client) func([]byte) {
+		conn := router.Conn()
+		return func(data []byte) {
+			_ = c.Send(conn.Handle(data))
+		}
 	}
 	hub := socket.NewHub(opts)
 

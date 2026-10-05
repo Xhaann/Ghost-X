@@ -304,3 +304,58 @@ test("drops malformed data from the transport", async () => {
   assert.equal(messages[0].id, id);
   assert.equal(client.state, "connected");
 });
+
+test("correlates a request with its reply", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const client = await connected(port);
+
+  const [first, second] = await Promise.all([
+    client.request({ type: "ping", payload: { sentAt: 1 } }),
+    client.request({ type: "ping", payload: { sentAt: 2 } }),
+  ]);
+
+  assert.equal(first?.type, "pong");
+  assert.equal(second?.type, "pong");
+  assert.ok(first?.type === "pong" && second?.type === "pong");
+  assert.equal(first.payload.sentAt, 1);
+  assert.equal(second.payload.sentAt, 2);
+});
+
+test("resolves a request with null when it cannot be sent", async () => {
+  const port = await freePort();
+  const client = track(new Client(websocket(port)));
+
+  assert.equal(
+    await client.request({ type: "ping", payload: { sentAt: 1 } }),
+    null,
+  );
+});
+
+test("resolves a pending request with null when the connection closes", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const client = await connected(port);
+
+  const reply = client.request({ type: "ping", payload: { sentAt: 1 } });
+  client.close();
+
+  assert.equal(await reply, null);
+});
+
+test("resolves a request with null on timeout", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const client = await connected(port);
+  const [socket] = openSockets();
+  socket.onmessage = null;
+
+  const started = Date.now();
+  const reply = await client.request(
+    { type: "ping", payload: { sentAt: 1 } },
+    100,
+  );
+
+  assert.equal(reply, null);
+  assert.ok(Date.now() - started >= 90);
+});

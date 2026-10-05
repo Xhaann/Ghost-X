@@ -8,7 +8,7 @@ type pong struct {
 }
 
 func Ping(now func() time.Time) Handler {
-	return func(payload []byte) (Reply, error) {
+	return func(_ *Conn, payload []byte) (Reply, error) {
 		fields, err := decodeObject(payload, "sentAt")
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}

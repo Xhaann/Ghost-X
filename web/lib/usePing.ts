@@ -22,14 +22,14 @@ export function usePing(client: Client | null): {
         return;
       }
       pending.current = null;
-      setResult(
-        message.type === "pong"
-          ? {
-              ok: true,
-              roundTrip: Math.max(0, Date.now() - message.payload.sentAt),
-            }
-          : { ok: false, code: message.payload.code },
-      );
+      if (message.type === "pong") {
+        setResult({
+          ok: true,
+          roundTrip: Math.max(0, Date.now() - message.payload.sentAt),
+        });
+      } else if (message.type === "error") {
+        setResult({ ok: false, code: message.payload.code });
+      }
     });
 
     return () => {

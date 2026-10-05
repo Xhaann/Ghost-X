@@ -3,6 +3,7 @@ package socket
 import (
 	"bytes"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,7 +13,7 @@ import (
 func TestReadLifecycle(t *testing.T) {
 	received := make(chan []byte, 1)
 	opts := testOptions()
-	opts.OnMessage = func(_ *Client, data []byte) { received <- data }
+	opts.Accept = func(*Client) func([]byte) { return func(data []byte) { received <- data } }
 	_, url := startServer(t, opts)
 	conn := dial(t, url)
 
@@ -66,7 +67,7 @@ func TestServerInitiatedClose(t *testing.T) {
 func TestOversizedMessage(t *testing.T) {
 	opts := testOptions()
 	opts.MaxMessageSize = 16
-	opts.OnMessage = func(*Client, []byte) { t.Error("oversized message delivered") }
+	opts.Accept = func(*Client) func([]byte) { return func([]byte) { t.Error("oversized message delivered") } }
 	hub, url := startServer(t, opts)
 	conn := dial(t, url)
 	onlyClient(t, hub)
@@ -82,7 +83,7 @@ func TestMessageAtSizeLimit(t *testing.T) {
 	received := make(chan []byte, 1)
 	opts := testOptions()
 	opts.MaxMessageSize = 16
-	opts.OnMessage = func(_ *Client, data []byte) { received <- data }
+	opts.Accept = func(*Client) func([]byte) { return func(data []byte) { received <- data } }
 	_, url := startServer(t, opts)
 	conn := dial(t, url)
 
@@ -113,7 +114,7 @@ func TestRejectedPayloads(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := testOptions()
-			opts.OnMessage = func(*Client, []byte) { t.Error("rejected payload delivered") }
+			opts.Accept = func(*Client) func([]byte) { return func([]byte) { t.Error("rejected payload delivered") } }
 			hub, url := startServer(t, opts)
 			conn := dial(t, url)
 			onlyClient(t, hub)
@@ -175,4 +176,56 @@ func TestSlowClient(t *testing.T) {
 
 	waitFor(t, "slow client removal", func() bool { return hub.Len() == 0 })
 	<-c.Done()
+}
+
+func TestAcceptRunsOncePerConnection(t *testing.T) {
+	var mu sync.Mutex
+	counts := make(map[*Client]*int)
+	opts := testOptions()
+	opts.Accept = func(c *Client) func([]byte) {
+		n := new(int)
+		mu.Lock()
+		counts[c] = n
+		mu.Unlock()
+		return func([]byte) {
+			mu.Lock()
+			*n++
+			mu.Unlock()
+		}
+	}
+	hub, url := startServer(t, opts)
+	first := dial(t, url)
+	second := dial(t, url)
+	waitFor(t, "registration", func() bool { return hub.Len() == 2 })
+
+	for range 3 {
+		if err := first.WriteMessage(websocket.TextMessage, []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := second.WriteMessage(websocket.TextMessage, []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "delivery", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		total := 0
+		for _, n := range counts {
+			total += *n
+		}
+		return total == 4
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(counts) != 2 {
+		t.Fatalf("Accept calls = %d, want 2", len(counts))
+	}
+	got := []int{}
+	for _, n := range counts {
+		got = append(got, *n)
+	}
+	if !(got[0] == 3 && got[1] == 1) && !(got[0] == 1 && got[1] == 3) {
+		t.Errorf("per-connection counts = %v, want 3 and 1", got)
+	}
 }

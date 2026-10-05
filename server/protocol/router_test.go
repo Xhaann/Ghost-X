@@ -41,13 +41,17 @@ func errorCode(t *testing.T, resp response) Code {
 }
 
 func newTestRouter() *Router {
-	return NewRouter(map[string]Handler{"ping": Ping(time.Now)})
+	return NewRouter(map[string]Handler{
+		"ping":      Ping(time.Now),
+		"challenge": Challenge(time.Now),
+		"prove":     Prove(time.Now),
+	})
 }
 
 func TestRouterPing(t *testing.T) {
 	before := time.Now().UnixMilli()
 	sentAt := strconv.FormatInt(before, 10)
-	data := newTestRouter().Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":` + sentAt + `}}`))
+	data := newTestRouter().Conn().Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":` + sentAt + `}}`))
 	after := time.Now().UnixMilli()
 
 	resp := decodeResponse(t, data)
@@ -94,7 +98,7 @@ func TestRouterErrors(t *testing.T) {
 	router := newTestRouter()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resp := decodeResponse(t, router.Handle([]byte(tt.input)))
+			resp := decodeResponse(t, router.Conn().Handle([]byte(tt.input)))
 			if code := errorCode(t, resp); code != tt.code {
 				t.Errorf("code = %q, want %q", code, tt.code)
 			}
@@ -108,10 +112,10 @@ func TestRouterErrors(t *testing.T) {
 func TestRouterHidesInternalErrors(t *testing.T) {
 	internal := errors.New("open /var/lib/ghost-x/state: permission denied")
 	router := NewRouter(map[string]Handler{
-		"fail": func([]byte) (Reply, error) { return Reply{}, internal },
+		"fail": func(*Conn, []byte) (Reply, error) { return Reply{}, internal },
 	})
 
-	data := router.Handle([]byte(`{"type":"fail","id":"r1"}`))
+	data := router.Conn().Handle([]byte(`{"type":"fail","id":"r1"}`))
 
 	if code := errorCode(t, decodeResponse(t, data)); code != CodeInternalError {
 		t.Errorf("code = %q, want %q", code, CodeInternalError)
@@ -123,10 +127,10 @@ func TestRouterHidesInternalErrors(t *testing.T) {
 
 func TestRouterUnencodableReply(t *testing.T) {
 	router := NewRouter(map[string]Handler{
-		"bad": func([]byte) (Reply, error) { return Reply{Type: "bad", Payload: make(chan int)}, nil },
+		"bad": func(*Conn, []byte) (Reply, error) { return Reply{Type: "bad", Payload: make(chan int)}, nil },
 	})
 
-	resp := decodeResponse(t, router.Handle([]byte(`{"type":"bad","id":"r1"}`)))
+	resp := decodeResponse(t, router.Conn().Handle([]byte(`{"type":"bad","id":"r1"}`)))
 
 	if code := errorCode(t, resp); code != CodeInternalError {
 		t.Errorf("code = %q, want %q", code, CodeInternalError)
@@ -141,7 +145,7 @@ func TestRouterIgnoresLaterHandlerChanges(t *testing.T) {
 	router := NewRouter(handlers)
 	delete(handlers, "ping")
 
-	resp := decodeResponse(t, router.Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":1}}`)))
+	resp := decodeResponse(t, router.Conn().Handle([]byte(`{"type":"ping","id":"r1","payload":{"sentAt":1}}`)))
 	if resp.Type != "pong" {
 		t.Errorf("type = %q, want pong", resp.Type)
 	}
@@ -154,7 +158,7 @@ func TestRouterConcurrent(t *testing.T) {
 		wg.Go(func() {
 			for i := range 200 {
 				id := "g" + strconv.Itoa(g) + "_" + strconv.Itoa(i)
-				resp := decodeResponse(t, router.Handle([]byte(`{"type":"ping","id":"`+id+`","payload":{"sentAt":`+strconv.Itoa(i)+`}}`)))
+				resp := decodeResponse(t, router.Conn().Handle([]byte(`{"type":"ping","id":"`+id+`","payload":{"sentAt":`+strconv.Itoa(i)+`}}`)))
 				if resp.Type != "pong" || resp.ID != id {
 					t.Errorf("response = %+v, want pong %s", resp, id)
 					return
@@ -177,13 +181,15 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"ping","id":"a","payload":` + strings.Repeat("[", 10000) + `}`,
 		`{"type":"ping","id":"a","payload":{"sentAt":1}` + strings.Repeat(" ", 100),
 		"{\"type\":\"ping\",\"id\":\"a\"}\x00",
+		`{"type":"challenge","id":"a","payload":{}}`,
+		`{"type":"prove","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 	} {
 		f.Add([]byte(seed))
 	}
 
 	router := newTestRouter()
 	f.Fuzz(func(t *testing.T, data []byte) {
-		out := router.Handle(data)
+		out := router.Conn().Handle(data)
 		if !json.Valid(out) || !utf8.Valid(out) {
 			t.Fatalf("invalid response %q for input %q", out, data)
 		}
@@ -191,7 +197,7 @@ func FuzzRouterHandle(f *testing.F) {
 		if err := json.Unmarshal(out, &resp); err != nil {
 			t.Fatal(err)
 		}
-		if resp.Type != "pong" && resp.Type != "error" {
+		if resp.Type != "pong" && resp.Type != "challenge" && resp.Type != "error" {
 			t.Fatalf("unexpected response type %q", resp.Type)
 		}
 	})

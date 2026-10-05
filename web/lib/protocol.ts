@@ -1,7 +1,17 @@
-export type ErrorCode =
-  "invalid_message" | "unsupported_type" | "invalid_payload" | "internal_error";
+import { decodeBase64Url } from "./base64.ts";
+import { isIdentity } from "./identity.ts";
 
-export type ClientMessage = { type: "ping"; payload: { sentAt: number } };
+export type ErrorCode =
+  | "invalid_message"
+  | "unsupported_type"
+  | "invalid_payload"
+  | "invalid_proof"
+  | "internal_error";
+
+export type ClientMessage =
+  | { type: "ping"; payload: { sentAt: number } }
+  | { type: "challenge"; payload: Record<string, never> }
+  | { type: "prove"; payload: { identity: string; signature: string } };
 
 export type ServerMessage =
   | {
@@ -9,12 +19,17 @@ export type ServerMessage =
       id: string;
       payload: { sentAt: number; receivedAt: number };
     }
+  | { type: "challenge"; id: string; payload: { nonce: string } }
+  | { type: "proven"; id: string; payload: { identity: string } }
   | { type: "error"; id?: string; payload: { code: ErrorCode } };
+
+export const nonceSize = 32;
 
 const errorCodes: readonly string[] = [
   "invalid_message",
   "unsupported_type",
   "invalid_payload",
+  "invalid_proof",
   "internal_error",
 ];
 
@@ -81,6 +96,31 @@ export function parse(data: unknown): ServerMessage | null {
         id,
         payload: { sentAt: payload.sentAt, receivedAt: payload.receivedAt },
       };
+    }
+    return null;
+  }
+
+  if (type === "challenge") {
+    if (
+      hasOnly(value, ["type", "id", "payload"]) &&
+      isValidId(id) &&
+      hasOnly(payload, ["nonce"]) &&
+      typeof payload.nonce === "string" &&
+      decodeBase64Url(payload.nonce, nonceSize) !== null
+    ) {
+      return { type, id, payload: { nonce: payload.nonce } };
+    }
+    return null;
+  }
+
+  if (type === "proven") {
+    if (
+      hasOnly(value, ["type", "id", "payload"]) &&
+      isValidId(id) &&
+      hasOnly(payload, ["identity"]) &&
+      isIdentity(payload.identity)
+    ) {
+      return { type, id, payload: { identity: payload.identity } };
     }
     return null;
   }

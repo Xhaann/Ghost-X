@@ -113,7 +113,7 @@ func TestConcurrentConnections(t *testing.T) {
 	const n = 50
 	var received atomic.Int64
 	opts := testOptions()
-	opts.OnMessage = func(*Client, []byte) { received.Add(1) }
+	opts.Accept = func(*Client) func([]byte) { return func([]byte) { received.Add(1) } }
 	hub, url := startServer(t, opts)
 
 	var wg sync.WaitGroup

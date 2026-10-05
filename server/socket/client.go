@@ -89,6 +89,10 @@ func (c *Client) readLoop() {
 		c.Close(websocket.CloseGoingAway, "")
 		return
 	}
+	var handle func([]byte)
+	if c.hub.opts.Accept != nil {
+		handle = c.hub.opts.Accept(c)
+	}
 	for {
 		kind, data, err := c.conn.ReadMessage()
 		if err != nil {
@@ -106,8 +110,8 @@ func (c *Client) readLoop() {
 			c.Close(websocket.CloseInvalidFramePayloadData, "invalid utf-8")
 			continue
 		}
-		if c.hub.opts.OnMessage != nil {
-			c.hub.opts.OnMessage(c, data)
+		if handle != nil {
+			handle(data)
 		}
 	}
 }

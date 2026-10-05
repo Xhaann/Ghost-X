@@ -58,6 +58,36 @@ export class Client {
     return this.#transport.send(encode(message, id)) ? id : null;
   }
 
+  request(
+    message: ClientMessage,
+    timeout = 5000,
+  ): Promise<ServerMessage | null> {
+    return new Promise((resolve) => {
+      const id = this.send(message);
+      if (!id) {
+        resolve(null);
+        return;
+      }
+      const finish = (result: ServerMessage | null) => {
+        clearTimeout(timer);
+        releaseMessages();
+        releaseStates();
+        resolve(result);
+      };
+      const releaseMessages = this.onMessage((reply) => {
+        if (reply.id === id) {
+          finish(reply);
+        }
+      });
+      const releaseStates = this.onState((state) => {
+        if (state !== "connected") {
+          finish(null);
+        }
+      });
+      const timer = setTimeout(() => finish(null), timeout);
+    });
+  }
+
   onState(listener: (state: TransportState) => void): () => void {
     return this.#states.add(listener);
   }

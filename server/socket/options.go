@@ -9,7 +9,7 @@ type Options struct {
 	WriteTimeout   time.Duration
 	PingInterval   time.Duration
 	PongTimeout    time.Duration
-	OnMessage      func(c *Client, data []byte)
+	Accept         func(c *Client) func(data []byte)
 }
 
 func DefaultOptions() Options {
