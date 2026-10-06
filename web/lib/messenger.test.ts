@@ -171,15 +171,14 @@ test("delivers end-to-end encrypted messages without plaintext on the wire", asy
   const b = await peer(port);
   const secret = "the server must never read this 🔒";
 
-  assert.deepEqual(
-    await a.messenger.send(b.keys.identity.identity, secret, "m1"),
-    { ok: true },
-  );
+  const result = await a.messenger.send(b.keys.identity.identity, secret, "m1");
+  assert.equal(result.ok, true);
   await until(() => b.inbox.length === 1, "delivery");
 
-  assert.deepEqual(b.inbox, [
-    { id: "m1", from: a.keys.identity.identity, body: secret },
-  ]);
+  assert.deepEqual(
+    b.inbox.map(({ id, from, body }) => ({ id, from, body })),
+    [{ id: "m1", from: a.keys.identity.identity, body: secret }],
+  );
   const encoded = encodeBase64Url(new TextEncoder().encode(secret));
   for (const frame of [...a.sent, ...b.received, ...a.received]) {
     assert.ok(!frame.includes(secret), "plaintext crossed the wire");
@@ -199,10 +198,33 @@ test("delivers end-to-end encrypted messages without plaintext on the wire", asy
   assert.equal(delivered.salt, sendFrame.payload.salt);
   assert.equal(delivered.iv, sendFrame.payload.iv);
   assert.equal(delivered.key, a.keys.exchange.publicKey);
+  assert.deepEqual(result.record, {
+    sealed: {
+      salt: sendFrame.payload.salt,
+      iv: sendFrame.payload.iv,
+      ciphertext: sendFrame.payload.ciphertext,
+    },
+    peer: await b.keys.exchange.bind(b.keys.identity),
+  });
+  assert.deepEqual(b.inbox[0].record, {
+    sealed: {
+      salt: delivered.salt,
+      iv: delivered.iv,
+      ciphertext: delivered.ciphertext,
+    },
+    peer: {
+      identity: a.keys.identity.identity,
+      key: delivered.key,
+      signature: delivered.signature,
+    },
+  });
+  for (const value of [result.record, b.inbox[0].record]) {
+    assert.ok(!JSON.stringify(value).includes(secret));
+  }
 
-  assert.deepEqual(
-    await b.messenger.send(a.keys.identity.identity, "reply", "r1"),
-    { ok: true },
+  assert.equal(
+    (await b.messenger.send(a.keys.identity.identity, "reply", "r1")).ok,
+    true,
   );
   await until(() => a.inbox.length === 1, "reply");
   assert.equal(a.inbox[0].body, "reply");
@@ -216,18 +238,17 @@ test("every session of the recipient identity decrypts once", async () => {
   const b1 = await peer(port, bKeys);
   const b2 = await peer(port, bKeys);
 
-  assert.deepEqual(
-    await a.messenger.send(bKeys.identity.identity, "both", "m1"),
-    {
-      ok: true,
-    },
+  assert.equal(
+    (await a.messenger.send(bKeys.identity.identity, "both", "m1")).ok,
+    true,
   );
   for (const b of [b1, b2]) {
     await until(() => b.inbox.length === 1, "delivery");
     await barrier(b);
-    assert.deepEqual(b.inbox, [
-      { id: "m1", from: a.keys.identity.identity, body: "both" },
-    ]);
+    assert.deepEqual(
+      b.inbox.map(({ id, from, body }) => ({ id, from, body })),
+      [{ id: "m1", from: a.keys.identity.identity, body: "both" }],
+    );
   }
 });
 
@@ -322,8 +343,8 @@ test("tampered or misdirected deliveries fail decryption", async () => {
   );
 
   assert.deepEqual(
-    b.inbox.slice(1).map((m) => m.body),
-    Object.keys(mutations).map(() => null),
+    b.inbox.slice(1).map((m) => [m.body, m.record]),
+    Object.keys(mutations).map(() => [null, undefined]),
   );
   inject(a, { ...forC, id: "x9" });
   await until(() => a.inbox.length === 1, "a processed");

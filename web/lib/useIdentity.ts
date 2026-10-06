@@ -1,40 +1,87 @@
-import { useEffect, useState } from "react";
-import { ExchangeKey } from "./encryption.ts";
-import { IdentityKey } from "./identity.ts";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { History } from "./history.ts";
+import { openIndexedStore } from "./storage.ts";
+import { type Keys, loadVault } from "./vault.ts";
 
-export type Keys = { identity: IdentityKey; exchange: ExchangeKey };
+export type LocalSession = { keys: Keys; history: History; created: boolean };
 
-export function useIdentity(): Keys | null {
-  const [keys, setKeys] = useState<Keys | null>(null);
+export type LocalState =
+  | { status: "loading" }
+  | { status: "unavailable" }
+  | { status: "corrupted" }
+  | ({ status: "ready" } & LocalSession);
+
+export function useIdentity(): { local: LocalState; reset: () => void } {
+  const [local, setLocal] = useState<LocalState>({ status: "loading" });
+  const [epoch, setEpoch] = useState(0);
+  const resetting = useRef(false);
+  const settled = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     let active = true;
-    let generated: Keys | null = null;
+    let ready: LocalSession | null = null;
+    let close: () => void = () => {};
+    const previous = settled.current;
 
-    Promise.all([IdentityKey.generate(), ExchangeKey.generate()]).then(
-      ([identity, exchange]) => {
-        generated = { identity, exchange };
+    const task = (async () => {
+      await previous;
+      if (!active) {
+        return;
+      }
+      const store = await openIndexedStore();
+      close = () => store.close();
+      if (resetting.current) {
+        resetting.current = false;
+        await store.clear();
+      }
+      if (!active) {
+        close();
+        return;
+      }
+      const vault = await loadVault(store);
+      if (vault.status === "corrupted") {
         if (active) {
-          setKeys(generated);
-        } else {
-          identity.release();
-          exchange.release();
+          setLocal(vault);
         }
-      },
-      () => {
-        if (active) {
-          setKeys(null);
-        }
-      },
-    );
+        return;
+      }
+      const history = await History.open(store, vault.keys, vault.integrity);
+      const session = { keys: vault.keys, history, created: vault.created };
+      if (active) {
+        ready = session;
+        setLocal({ status: "ready", ...session });
+        return;
+      }
+      await history.close();
+      vault.keys.identity.release();
+      vault.keys.exchange.release();
+      close();
+    })().catch(() => {
+      if (active) {
+        setLocal({ status: "unavailable" });
+      }
+    });
+    settled.current = task;
 
     return () => {
       active = false;
-      generated?.identity.release();
-      generated?.exchange.release();
-      setKeys(null);
+      const session = ready;
+      settled.current = task.then(async () => {
+        if (session) {
+          await session.history.close();
+          session.keys.identity.release();
+          session.keys.exchange.release();
+        }
+        close();
+      });
+      setLocal({ status: "loading" });
     };
+  }, [epoch]);
+
+  const reset = useCallback(() => {
+    resetting.current = true;
+    setEpoch((value) => value + 1);
   }, []);
 
-  return keys;
+  return { local, reset };
 }

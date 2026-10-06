@@ -10,7 +10,7 @@ import type {
 } from "@/lib/conversations.ts";
 import { bodySize, maxBodySize } from "@/lib/protocol.ts";
 import { useConversations } from "@/lib/useConversations.ts";
-import type { Keys } from "@/lib/useIdentity.ts";
+import type { LocalSession } from "@/lib/useIdentity.ts";
 
 const deliveryLabels: Record<DeliveryState, string> = {
   sending: "Sending",
@@ -71,16 +71,16 @@ function ConversationList({
 export default function Messages({
   client,
   authenticator,
-  keys,
+  session,
 }: {
   client: Client | null;
   authenticator: Authenticator | null;
-  keys: Keys | null;
+  session: LocalSession | null;
 }) {
-  const { state, open, close, send } = useConversations(
+  const { state, rejected, open, close, send } = useConversations(
     client,
     authenticator,
-    keys,
+    session,
   );
   const [recipient, setRecipient] = useState("");
   const [body, setBody] = useState("");
@@ -115,7 +115,7 @@ export default function Messages({
     setPending(false);
   };
 
-  if (!keys || !authenticator) {
+  if (!session || !authenticator) {
     return null;
   }
 
@@ -136,6 +136,13 @@ export default function Messages({
         active={state.active}
         onOpen={(identity) => open(identity)}
       />
+      {rejected > 0 && (
+        <p data-rejected={rejected}>
+          {rejected === 1
+            ? "1 stored message could not be restored"
+            : `${rejected} stored messages could not be restored`}
+        </p>
+      )}
       {notice && <output data-notice>{notice}</output>}
       {active ? (
         <article data-active={active.identity}>

@@ -1,6 +1,11 @@
 import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
-import type { Incoming, MessengerState, SendResult } from "./messenger.ts";
+import type {
+  Incoming,
+  MessengerState,
+  SealedRecord,
+  SendResult,
+} from "./messenger.ts";
 import { bodySize, createId, isValidBody, maxBodySize } from "./protocol.ts";
 
 export type DeliveryState = "sending" | "delivered" | "unavailable" | "failed";
@@ -51,6 +56,33 @@ export interface MessageSource {
   send(to: string, body: string, id: string): Promise<SendResult>;
 }
 
+export type SettledDelivery = Exclude<DeliveryState, "sending">;
+
+export type Restored = ConversationMessage & { read?: boolean };
+
+export interface HistoryPort {
+  received(entry: {
+    id: string;
+    peer: string;
+    sequence: number;
+    read: boolean;
+    record: SealedRecord;
+  }): void;
+  sent(entry: {
+    id: string;
+    peer: string;
+    sequence: number;
+    delivery: SettledDelivery;
+    record: SealedRecord;
+  }): void;
+  read(identity: string): void;
+}
+
+export type ConversationOptions = {
+  history?: HistoryPort;
+  restored?: readonly Restored[];
+};
+
 export const maxConversations = 100;
 export const maxMessages = 200;
 
@@ -60,7 +92,7 @@ const empty: ConversationsState = {
   conversations: [],
 };
 
-function deliveryOf(result: SendResult): DeliveryState {
+function deliveryOf(result: SendResult): SettledDelivery {
   if (result.ok) {
     return "delivered";
   }
@@ -70,6 +102,7 @@ function deliveryOf(result: SendResult): DeliveryState {
 export class Conversations {
   readonly #source: MessageSource;
   readonly #self: string;
+  readonly #history: HistoryPort | null;
   readonly #states = new Listeners<ConversationsState>();
   readonly #conversations = new Map<string, Conversation>();
   #active: string | null = null;
@@ -78,9 +111,15 @@ export class Conversations {
   #state: ConversationsState = empty;
   #detach: (() => void) | null = null;
 
-  constructor(source: MessageSource, self: string) {
+  constructor(
+    source: MessageSource,
+    self: string,
+    options: ConversationOptions = {},
+  ) {
     this.#source = source;
     this.#self = self;
+    this.#history = options.history ?? null;
+    this.#restore(options.restored ?? []);
   }
 
   get state(): ConversationsState {
@@ -121,6 +160,7 @@ export class Conversations {
     this.#active = identity;
     if (conversation.unread > 0) {
       this.#conversations.set(identity, { ...conversation, unread: 0 });
+      this.#history?.read(identity);
     }
     this.#publish();
     return true;
@@ -151,19 +191,33 @@ export class Conversations {
 
     const id = createId();
     const generation = this.#generation;
-    this.#append(this.#ensure(to), {
+    const target = this.#ensure(to);
+    const sequence = ++this.#sequence;
+    this.#append(target, {
       id,
       from: this.#self,
       to,
       body,
-      sequence: ++this.#sequence,
+      sequence,
       direction: "sent",
       delivery: "sending",
     });
     this.#publish();
 
     const delivery = this.#source.send(to, body, id).then(
-      (result) => this.#settle(generation, to, id, deliveryOf(result)),
+      (result) => {
+        const settled = deliveryOf(result);
+        if (result.record && generation === this.#generation) {
+          this.#history?.sent({
+            id,
+            peer: to,
+            sequence,
+            delivery: settled,
+            record: result.record,
+          });
+        }
+        return this.#settle(generation, to, id, settled);
+      },
       () => this.#settle(generation, to, id, "failed"),
     );
     return { accepted: true, id, delivery };
@@ -197,14 +251,25 @@ export class Conversations {
     if (existing?.messages.some((m) => m.id === message.id)) {
       return;
     }
-    const conversation = this.#append(this.#ensure(message.from), {
+    const target = this.#ensure(message.from);
+    const sequence = ++this.#sequence;
+    const conversation = this.#append(target, {
       id: message.id,
       from: message.from,
       to: this.#self,
       body: message.body,
-      sequence: ++this.#sequence,
+      sequence,
       direction: "received",
     });
+    if (message.record) {
+      this.#history?.received({
+        id: message.id,
+        peer: message.from,
+        sequence,
+        read: this.#active === message.from,
+        record: message.record,
+      });
+    }
     if (this.#active !== message.from) {
       this.#conversations.set(message.from, {
         ...conversation,
@@ -212,6 +277,27 @@ export class Conversations {
       });
     }
     this.#publish();
+  }
+
+  #restore(restored: readonly Restored[]): void {
+    const ordered = [...restored].sort((a, b) => a.sequence - b.sequence);
+    for (const entry of ordered) {
+      const peer = entry.direction === "sent" ? entry.to : entry.from;
+      if (
+        this.#conversations.get(peer)?.messages.some((m) => m.id === entry.id)
+      ) {
+        continue;
+      }
+      const { read, ...message } = entry;
+      this.#sequence = Math.max(this.#sequence, message.sequence);
+      const conversation = this.#append(this.#ensure(peer), message);
+      if (message.direction === "received" && read === false) {
+        this.#conversations.set(peer, {
+          ...conversation,
+          unread: conversation.unread + 1,
+        });
+      }
+    }
   }
 
   #ensure(identity: string): Conversation {

@@ -1,5 +1,10 @@
 import type { Client } from "./client.ts";
-import { type ExchangeKey, verifyBundle } from "./encryption.ts";
+import {
+  type ExchangeKey,
+  type KeyBundle,
+  type Sealed,
+  verifyBundle,
+} from "./encryption.ts";
 import { type IdentityKey, isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
 import type { AuthSource } from "./presence.ts";
@@ -13,11 +18,22 @@ import {
   maxBodySize,
 } from "./protocol.ts";
 
-export type SendResult =
-  | { ok: true }
-  | { ok: false; reason: ErrorCode | "not_sent" | "encryption_failed" };
+export type SealedRecord = { sealed: Sealed; peer: KeyBundle };
 
-export type Incoming = { id: string; from: string; body: string | null };
+export type SendResult =
+  | { ok: true; record?: SealedRecord }
+  | {
+      ok: false;
+      reason: ErrorCode | "not_sent" | "encryption_failed";
+      record?: SealedRecord;
+    };
+
+export type Incoming = {
+  id: string;
+  from: string;
+  body: string | null;
+  record?: SealedRecord;
+};
 
 export type MessengerState = { active: boolean };
 
@@ -138,8 +154,9 @@ export class Messenger {
     if (!sealed) {
       return { ok: false, reason: "encryption_failed" };
     }
+    const record: SealedRecord = { sealed, peer: bundle.payload };
     if (generation !== this.#generation) {
-      return { ok: false, reason: "not_sent" };
+      return { ok: false, reason: "not_sent", record };
     }
 
     const reply = await this.#client.request(
@@ -148,12 +165,12 @@ export class Messenger {
       id,
     );
     if (reply?.type === "sent") {
-      return { ok: true };
+      return { ok: true, record };
     }
     if (reply?.type === "error") {
-      return { ok: false, reason: reply.payload.code };
+      return { ok: false, reason: reply.payload.code, record };
     }
-    return { ok: false, reason: "not_sent" };
+    return { ok: false, reason: "not_sent", record };
   }
 
   #publish(): void {
@@ -192,25 +209,38 @@ export class Messenger {
     }
     this.#pending += 1;
     this.#queue = this.#queue.then(async () => {
-      const body = await this.#open(delivery);
+      const opened = await this.#open(delivery);
       this.#pending -= 1;
       if (generation === this.#generation) {
-        this.#messages.emit({ id: delivery.id, from: delivery.from, body });
+        this.#messages.emit({
+          id: delivery.id,
+          from: delivery.from,
+          body: opened?.body ?? null,
+          record: opened?.record,
+        });
       }
     });
   }
 
-  async #open(delivery: Delivery): Promise<string | null> {
+  async #open(
+    delivery: Delivery,
+  ): Promise<{ body: string; record: SealedRecord } | null> {
     try {
-      const fromKey = await verifyBundle({
+      const peer: KeyBundle = {
         identity: delivery.from,
         key: delivery.key,
         signature: delivery.signature,
-      });
+      };
+      const fromKey = await verifyBundle(peer);
       if (!fromKey) {
         return null;
       }
-      return await this.#exchange.open(
+      const sealed: Sealed = {
+        salt: delivery.salt,
+        iv: delivery.iv,
+        ciphertext: delivery.ciphertext,
+      };
+      const body = await this.#exchange.open(
         {
           id: delivery.id,
           from: delivery.from,
@@ -218,12 +248,9 @@ export class Messenger {
           fromKey,
           toKey: this.#exchange.publicRaw,
         },
-        {
-          salt: delivery.salt,
-          iv: delivery.iv,
-          ciphertext: delivery.ciphertext,
-        },
+        sealed,
       );
+      return body === null ? null : { body, record: { sealed, peer } };
     } catch {
       return null;
     }

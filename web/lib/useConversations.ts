@@ -7,7 +7,7 @@ import {
   type SendAttempt,
 } from "./conversations.ts";
 import { Messenger } from "./messenger.ts";
-import type { Keys } from "./useIdentity.ts";
+import type { LocalSession } from "./useIdentity.ts";
 
 const empty: ConversationsState = {
   connected: false,
@@ -18,42 +18,63 @@ const empty: ConversationsState = {
 export function useConversations(
   client: Client | null,
   authenticator: Authenticator | null,
-  keys: Keys | null,
+  session: LocalSession | null,
 ): {
   state: ConversationsState;
+  rejected: number;
   open: (identity: string) => boolean;
   close: () => void;
   send: (body: string) => SendAttempt;
 } {
   const [state, setState] = useState<ConversationsState>(empty);
+  const [rejected, setRejected] = useState(0);
   const store = useRef<Conversations | null>(null);
 
   useEffect(() => {
-    if (!client || !authenticator || !keys) {
+    if (!client || !authenticator || !session) {
       return;
     }
-    const messenger = new Messenger(
-      client,
-      authenticator,
-      keys.identity,
-      keys.exchange,
-    );
-    const conversations = new Conversations(messenger, keys.identity.identity);
-    store.current = conversations;
-    const unsubscribe = conversations.onState(setState);
-    messenger.start();
-    conversations.start();
+    let active = true;
+    let teardown: (() => void) | null = null;
+    const { keys, history } = session;
+
+    history.restore().then(({ restored, rejected }) => {
+      if (!active) {
+        return;
+      }
+      setRejected(rejected);
+      const messenger = new Messenger(
+        client,
+        authenticator,
+        keys.identity,
+        keys.exchange,
+      );
+      const conversations = new Conversations(
+        messenger,
+        keys.identity.identity,
+        { history, restored },
+      );
+      store.current = conversations;
+      const unsubscribe = conversations.onState(setState);
+      messenger.start();
+      conversations.start();
+      teardown = () => {
+        unsubscribe();
+        conversations.stop();
+        messenger.stop();
+        if (store.current === conversations) {
+          store.current = null;
+        }
+      };
+    });
 
     return () => {
-      unsubscribe();
-      conversations.stop();
-      messenger.stop();
-      if (store.current === conversations) {
-        store.current = null;
-      }
+      active = false;
+      teardown?.();
       setState(empty);
+      setRejected(0);
     };
-  }, [client, authenticator, keys]);
+  }, [client, authenticator, session]);
 
   const open = useCallback(
     (identity: string) => store.current?.open(identity) ?? false,
@@ -69,5 +90,5 @@ export function useConversations(
     [],
   );
 
-  return { state, open, close, send };
+  return { state, rejected, open, close, send };
 }

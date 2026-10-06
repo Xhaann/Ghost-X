@@ -110,13 +110,69 @@ export class ExchangeKey {
   }
 
   static async generate(): Promise<ExchangeKey> {
+    return (await ExchangeKey.create()).key;
+  }
+
+  static async create(): Promise<{
+    key: ExchangeKey;
+    privateKey: CryptoKey;
+  }> {
     const pair = (await crypto.subtle.generateKey(exchange, false, [
       "deriveBits",
     ])) as CryptoKeyPair;
     const raw = new Uint8Array(
       await crypto.subtle.exportKey("raw", pair.publicKey),
     );
-    return new ExchangeKey(raw, pair.privateKey);
+    return {
+      key: new ExchangeKey(raw, pair.privateKey),
+      privateKey: pair.privateKey,
+    };
+  }
+
+  static async restore(
+    publicKey: unknown,
+    privateKey: unknown,
+  ): Promise<ExchangeKey | null> {
+    const raw = decodeBase64Url(publicKey, exchangeKeySize);
+    if (
+      !raw ||
+      !(privateKey instanceof CryptoKey) ||
+      privateKey.type !== "private" ||
+      privateKey.extractable ||
+      privateKey.algorithm.name !== exchange.name ||
+      !privateKey.usages.includes("deriveBits")
+    ) {
+      return null;
+    }
+    try {
+      const probe = (await crypto.subtle.generateKey(exchange, false, [
+        "deriveBits",
+      ])) as CryptoKeyPair;
+      const own = await crypto.subtle.importKey(
+        "raw",
+        raw,
+        exchange,
+        false,
+        [],
+      );
+      const forward = new Uint8Array(
+        await crypto.subtle.deriveBits(
+          { name: "X25519", public: probe.publicKey },
+          privateKey,
+          256,
+        ),
+      );
+      const backward = new Uint8Array(
+        await crypto.subtle.deriveBits(
+          { name: "X25519", public: own },
+          probe.privateKey,
+          256,
+        ),
+      );
+      return same(forward, backward) ? new ExchangeKey(raw, privateKey) : null;
+    } catch {
+      return null;
+    }
   }
 
   get publicRaw(): Uint8Array<ArrayBuffer> {
@@ -176,6 +232,14 @@ export class ExchangeKey {
     if (!same(parties.toKey, this.#publicRaw)) {
       return null;
     }
+    return this.#decrypt(parties, parties.fromKey, sealed);
+  }
+
+  async #decrypt(
+    parties: Parties,
+    peer: Uint8Array<ArrayBuffer>,
+    sealed: Sealed,
+  ): Promise<string | null> {
     try {
       const salt = decodeBase64Url(sealed.salt, saltSize);
       const iv = decodeBase64Url(sealed.iv, ivSize);
@@ -188,12 +252,7 @@ export class ExchangeKey {
       if (!salt || !iv || !ciphertext || !additionalData) {
         return null;
       }
-      const key = await this.#messageKey(
-        parties,
-        parties.fromKey,
-        salt,
-        "decrypt",
-      );
+      const key = await this.#messageKey(parties, peer, salt, "decrypt");
       if (!key) {
         return null;
       }
@@ -206,6 +265,13 @@ export class ExchangeKey {
     } catch {
       return null;
     }
+  }
+
+  async openOwn(parties: Parties, sealed: Sealed): Promise<string | null> {
+    if (!same(parties.fromKey, this.#publicRaw)) {
+      return null;
+    }
+    return this.#decrypt(parties, parties.toKey, sealed);
   }
 
   async #messageKey(

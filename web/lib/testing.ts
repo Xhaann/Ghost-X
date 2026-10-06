@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before } from "node:test";
 import { fileURLToPath } from "node:url";
+import type { KeyValueStore, StoreName } from "./storage.ts";
 import type { TransportState } from "./transport.ts";
 
 const NativeWebSocket = globalThis.WebSocket;
@@ -143,4 +144,54 @@ export function openSockets(): WebSocket[] {
 
 export function pingFrame(id: string, sentAt: number): string {
   return JSON.stringify({ type: "ping", id, payload: { sentAt } });
+}
+
+export function memoryStore(): KeyValueStore & {
+  data: Map<string, unknown>;
+  writes: number;
+} {
+  const data = new Map<string, unknown>();
+  const key = (store: StoreName, name: string) => `${store}:${name}`;
+  const store = {
+    data,
+    writes: 0,
+    async get(name: StoreName, k: string) {
+      await Promise.resolve();
+      const value = data.get(key(name, k));
+      return value === undefined ? undefined : structuredClone(value);
+    },
+    async getAll(name: StoreName) {
+      await Promise.resolve();
+      return [...data.entries()]
+        .filter(([k]) => k.startsWith(`${name}:`))
+        .map(([k, value]) => ({
+          key: k.slice(name.length + 1),
+          value: structuredClone(value),
+        }));
+    },
+    async put(name: StoreName, k: string, value: unknown) {
+      await Promise.resolve();
+      store.writes += 1;
+      data.set(key(name, k), structuredClone(value));
+    },
+    async add(name: StoreName, k: string, value: unknown) {
+      await Promise.resolve();
+      if (data.has(key(name, k))) {
+        return false;
+      }
+      store.writes += 1;
+      data.set(key(name, k), structuredClone(value));
+      return true;
+    },
+    async delete(name: StoreName, keys: readonly string[]) {
+      await Promise.resolve();
+      keys.forEach((k) => data.delete(key(name, k)));
+    },
+    async clear() {
+      await Promise.resolve();
+      data.clear();
+    },
+    close() {},
+  };
+  return store;
 }

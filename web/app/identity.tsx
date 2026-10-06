@@ -4,9 +4,10 @@ import type { AuthState } from "@/lib/auth.ts";
 import type { Client } from "@/lib/client.ts";
 import type { PresenceState } from "@/lib/presence.ts";
 import { useAuth } from "@/lib/useAuth.ts";
-import { useIdentity } from "@/lib/useIdentity.ts";
+import { type LocalState, useIdentity } from "@/lib/useIdentity.ts";
 import { usePresence } from "@/lib/usePresence.ts";
 import { useWhoami } from "@/lib/useWhoami.ts";
+import { useState } from "react";
 import Messages from "./messages";
 
 const labels: Record<AuthState, string> = {
@@ -30,9 +31,44 @@ function presenceLabel(presence: PresenceState, self: string | undefined) {
   return "Presence not established";
 }
 
+const localLabels: Record<Exclude<LocalState["status"], "ready">, string> = {
+  loading: "Loading",
+  unavailable: "Local storage unavailable",
+  corrupted: "Stored identity could not be restored",
+};
+
+function Reset({ onReset }: { onReset: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+  if (!confirming) {
+    return (
+      <button type="button" onClick={() => setConfirming(true)}>
+        Reset local data
+      </button>
+    );
+  }
+  return (
+    <p data-reset>
+      Delete this identity, its keys, and its message history from this browser?{" "}
+      <button
+        type="button"
+        onClick={() => {
+          setConfirming(false);
+          onReset();
+        }}
+      >
+        Delete
+      </button>{" "}
+      <button type="button" onClick={() => setConfirming(false)}>
+        Cancel
+      </button>
+    </p>
+  );
+}
+
 export default function Identity({ client }: { client: Client | null }) {
-  const keys = useIdentity();
-  const key = keys?.identity ?? null;
+  const { local, reset } = useIdentity();
+  const session = local.status === "ready" ? local : null;
+  const key = session?.keys.identity ?? null;
   const { state, authenticator } = useAuth(client, key);
   const presence = usePresence(client, authenticator);
   const { query, result } = useWhoami(client, state);
@@ -40,9 +76,19 @@ export default function Identity({ client }: { client: Client | null }) {
 
   return (
     <section>
-      <p>
-        Identity <code>{key ? key.identity : "Generating"}</code>
-      </p>
+      {session ? (
+        <p>
+          Identity <code>{session.keys.identity.identity}</code>{" "}
+          <span data-origin={session.created ? "created" : "restored"}>
+            {session.created ? "New identity" : "Restored identity"}
+          </span>
+        </p>
+      ) : (
+        <p data-local={local.status}>
+          {localLabels[local.status as keyof typeof localLabels]}
+        </p>
+      )}
+      {(session || local.status === "corrupted") && <Reset onReset={reset} />}
       <p data-auth={state}>{labels[state]}</p>
       <button
         type="button"
@@ -79,7 +125,11 @@ export default function Identity({ client }: { client: Client | null }) {
             ))}
         </>
       )}
-      <Messages client={client} authenticator={authenticator} keys={keys} />
+      <Messages
+        client={client}
+        authenticator={authenticator}
+        session={session}
+      />
     </section>
   );
 }
