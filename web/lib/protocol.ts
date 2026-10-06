@@ -33,7 +33,7 @@ export type ServerMessage =
   | {
       type: "message";
       id?: undefined;
-      payload: { from: string; body: string };
+      payload: { id: string; from: string; body: string };
     }
   | {
       type: "present" | "absent";
@@ -92,7 +92,7 @@ function isTimestamp(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
-function isValidId(value: unknown): value is string {
+export function isValidId(value: unknown): value is string {
   return typeof value === "string" && idPattern.test(value);
 }
 
@@ -189,11 +189,15 @@ export function parse(data: unknown): ServerMessage | null {
   if (type === "message") {
     if (
       hasOnly(value, ["type", "payload"]) &&
-      hasOnly(payload, ["from", "body"]) &&
+      hasOnly(payload, ["id", "from", "body"]) &&
+      isValidId(payload.id) &&
       isIdentity(payload.from) &&
       isValidBody(payload.body)
     ) {
-      return { type, payload: { from: payload.from, body: payload.body } };
+      return {
+        type,
+        payload: { id: payload.id, from: payload.from, body: payload.body },
+      };
     }
     return null;
   }

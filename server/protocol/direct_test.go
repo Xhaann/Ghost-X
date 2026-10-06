@@ -72,8 +72,8 @@ func sendRequest(id, to, body string) []byte {
 	return fmt.Appendf(nil, `{"type":"send","id":%q,"payload":%s}`, id, payload)
 }
 
-func delivered(from, body string) string {
-	return string(EncodeMessage(direct.Message{From: from, Body: body}))
+func delivered(id, from, body string) string {
+	return string(EncodeMessage(direct.Message{ID: id, From: from, Body: body}))
 }
 
 func TestSendDeliversWithSessionIdentity(t *testing.T) {
@@ -87,7 +87,7 @@ func TestSendDeliversWithSessionIdentity(t *testing.T) {
 	if resp.Type != "sent" || resp.ID != "m1" || string(resp.Payload) != `{}` {
 		t.Fatalf("response = %+v %s", resp, resp.Payload)
 	}
-	if got := box.all(); len(got) != 1 || got[0] != delivered(a.identity, "hello") {
+	if got := box.all(); len(got) != 1 || got[0] != delivered("m1", a.identity, "hello") {
 		t.Fatalf("recipient got %v", got)
 	}
 	if len(senderBox.all()) != 0 {
@@ -96,7 +96,7 @@ func TestSendDeliversWithSessionIdentity(t *testing.T) {
 }
 
 func TestSendEncodingIsExact(t *testing.T) {
-	data := EncodeMessage(direct.Message{From: "A", Body: "line\n\"q\" <b>"})
+	data := EncodeMessage(direct.Message{ID: "m1", From: "A", Body: "line\n\"q\" <b>"})
 
 	var decoded map[string]json.RawMessage
 	if err := json.Unmarshal(data, &decoded); err != nil {
@@ -112,7 +112,7 @@ func TestSendEncodingIsExact(t *testing.T) {
 	if err := json.Unmarshal(decoded["payload"], &payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload) != 2 || payload["from"] != "A" || payload["body"] != "line\n\"q\" <b>" {
+	if len(payload) != 3 || payload["id"] != "m1" || payload["from"] != "A" || payload["body"] != "line\n\"q\" <b>" {
 		t.Fatalf("payload = %v", payload)
 	}
 }
@@ -155,7 +155,7 @@ func TestSendRejectsForgedSender(t *testing.T) {
 	}
 
 	sender.Handle(sendRequest("m2", b.identity, "real"))
-	if got := box.all(); len(got) != 1 || got[0] != delivered(a.identity, "real") {
+	if got := box.all(); len(got) != 1 || got[0] != delivered("m2", a.identity, "real") {
 		t.Fatalf("delivered %v, want sender %s", got, a.identity)
 	}
 }
@@ -320,4 +320,28 @@ func FuzzSendPayload(f *testing.F) {
 			t.Fatalf("rejected request delivered %v", after[before:])
 		}
 	})
+}
+
+func TestDeliveredMessageCarriesSenderRequestID(t *testing.T) {
+	f := newDirectFixture()
+	a, b, c := newSigner(t), newSigner(t), newSigner(t)
+	senderA, _, _ := f.authenticatedConn(t, a)
+	senderC, _, _ := f.authenticatedConn(t, c)
+	_, _, box := f.authenticatedConn(t, b)
+
+	senderA.Handle(sendRequest("a1", b.identity, "first"))
+	senderC.Handle(sendRequest("c1", b.identity, "other"))
+	senderA.Handle(sendRequest("a2", b.identity, "second"))
+	senderA.Handle([]byte(`{"type":"ping","id":"p9","payload":{"sentAt":1}}`))
+	senderA.Handle(sendRequest("a3", b.identity, "third"))
+
+	want := []string{
+		delivered("a1", a.identity, "first"),
+		delivered("c1", c.identity, "other"),
+		delivered("a2", a.identity, "second"),
+		delivered("a3", a.identity, "third"),
+	}
+	if got := box.all(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("delivered %v, want %v", got, want)
+	}
 }

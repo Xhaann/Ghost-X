@@ -21,6 +21,7 @@ type Conn struct {
 	router  *Router
 	session *auth.Session
 	push    func([]byte)
+	request string
 }
 
 func NewRouter(public map[string]Handler, protected map[string]ProtectedHandler) *Router {
@@ -42,6 +43,7 @@ func (c *Conn) Handle(data []byte) []byte {
 		return encodeError(req.ID, codeOf(err))
 	}
 
+	c.request = req.ID
 	reply, err := c.dispatch(req)
 	if err != nil {
 		return encodeError(req.ID, codeOf(err))

@@ -53,18 +53,18 @@ export class Client {
     this.#transport.retry?.();
   }
 
-  send(message: ClientMessage): string | null {
-    const id = createId();
+  send(message: ClientMessage, id: string = createId()): string | null {
     return this.#transport.send(encode(message, id)) ? id : null;
   }
 
   request(
     message: ClientMessage,
     timeout = 5000,
+    id?: string,
   ): Promise<ServerMessage | null> {
     return new Promise((resolve) => {
-      const id = this.send(message);
-      if (!id) {
+      const sent = this.send(message, id);
+      if (!sent) {
         resolve(null);
         return;
       }
@@ -75,7 +75,7 @@ export class Client {
         resolve(result);
       };
       const releaseMessages = this.onMessage((reply) => {
-        if (reply.id === id) {
+        if (reply.id === sent) {
           finish(reply);
         }
       });

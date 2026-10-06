@@ -79,10 +79,15 @@ func (p *peer) expectError(t *testing.T, id, code string) {
 
 func (p *peer) expectMessage(t *testing.T, from, body string) {
 	t.Helper()
+	p.expectMessageID(t, "", from, body)
+}
+
+func (p *peer) expectMessageID(t *testing.T, id, from, body string) {
+	t.Helper()
 	msg := p.next(t)
 	var payload map[string]string
 	json.Unmarshal(msg.Payload, &payload)
-	if msg.Type != "message" || msg.ID != "" || len(payload) != 2 || payload["from"] != from || payload["body"] != body {
+	if msg.Type != "message" || msg.ID != "" || len(payload) != 3 || payload["from"] != from || payload["body"] != body || (id != "" && payload["id"] != id) {
 		t.Fatalf("delivery = %+v %s, want from %s body %q", msg, msg.Payload, from, body)
 	}
 }
@@ -104,11 +109,11 @@ func TestDirectMessageDelivered(t *testing.T) {
 
 	a.send(t, "m1", b.key.identity, "hello from a")
 	a.expectSent(t, "m1")
-	b.expectMessage(t, a.key.identity, "hello from a")
+	b.expectMessageID(t, "m1", a.key.identity, "hello from a")
 
 	b.send(t, "m2", a.key.identity, "hello from b")
 	b.expectSent(t, "m2")
-	a.expectMessage(t, b.key.identity, "hello from b")
+	a.expectMessageID(t, "m2", b.key.identity, "hello from b")
 }
 
 func TestDirectMessageReachesEveryRecipientSessionOnce(t *testing.T) {

@@ -114,11 +114,11 @@ func TestDeliversWithSessionSender(t *testing.T) {
 	sender, _ := f.authenticated(t, a)
 	_, box := f.authenticated(t, b)
 
-	if err := f.direct.Send(sender, b.identity, "hello"); err != nil {
+	if err := f.direct.Send(sender, b.identity, "m1", "hello"); err != nil {
 		t.Fatalf("Send() = %v", err)
 	}
 
-	expectMessages(t, box, Message{From: a.identity.String(), Body: "hello"})
+	expectMessages(t, box, Message{ID: "m1", From: a.identity.String(), Body: "hello"})
 }
 
 func TestUnauthenticatedSenderRejected(t *testing.T) {
@@ -128,7 +128,7 @@ func TestUnauthenticatedSenderRejected(t *testing.T) {
 
 	pending, _ := f.open(t)
 	pending.Challenge()
-	if err := f.direct.Send(pending, b.identity, "x"); !errors.Is(err, ErrUnauthenticated) {
+	if err := f.direct.Send(pending, b.identity, "m1", "x"); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("Send() = %v, want %v", err, ErrUnauthenticated)
 	}
 
@@ -138,7 +138,7 @@ func TestUnauthenticatedSenderRejected(t *testing.T) {
 		nonce, _ := failed.Challenge()
 		failed.Authenticate(b.identity.String(), base64.RawURLEncoding.EncodeToString(ed25519.Sign(other.private, auth.Message(nonce))))
 	}
-	if err := f.direct.Send(failed, b.identity, "x"); !errors.Is(err, ErrUnauthenticated) {
+	if err := f.direct.Send(failed, b.identity, "m1", "x"); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("Send() from failed session = %v, want %v", err, ErrUnauthenticated)
 	}
 
@@ -154,11 +154,11 @@ func TestDeliversOnceToEverySessionOfRecipient(t *testing.T) {
 	_, second := f.authenticated(t, b)
 	_, third := f.authenticated(t, b)
 
-	if err := f.direct.Send(sender, b.identity, "fan out"); err != nil {
+	if err := f.direct.Send(sender, b.identity, "m1", "fan out"); err != nil {
 		t.Fatal(err)
 	}
 
-	want := Message{From: a.identity.String(), Body: "fan out"}
+	want := Message{ID: "m1", From: a.identity.String(), Body: "fan out"}
 	for _, box := range []*inbox{first, second, third} {
 		expectMessages(t, box, want)
 	}
@@ -174,11 +174,11 @@ func TestNoCrossIdentityLeakage(t *testing.T) {
 	_, cBox := f.authenticated(t, c)
 	_, unauthenticatedBox := f.open(t)
 
-	if err := f.direct.Send(sender, b.identity, "only b"); err != nil {
+	if err := f.direct.Send(sender, b.identity, "m1", "only b"); err != nil {
 		t.Fatal(err)
 	}
 
-	expectMessages(t, bBox, Message{From: a.identity.String(), Body: "only b"})
+	expectMessages(t, bBox, Message{ID: "m1", From: a.identity.String(), Body: "only b"})
 	expectMessages(t, cBox)
 	expectMessages(t, unauthenticatedBox)
 }
@@ -188,19 +188,19 @@ func TestRecipientUnavailable(t *testing.T) {
 	a, b := newKey(t), newKey(t)
 	sender, _ := f.authenticated(t, a)
 
-	if err := f.direct.Send(sender, b.identity, "x"); !errors.Is(err, ErrUnavailable) {
+	if err := f.direct.Send(sender, b.identity, "m1", "x"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Send() to absent identity = %v", err)
 	}
 
 	recipient, box := f.authenticated(t, b)
 	recipient.Close()
-	if err := f.direct.Send(sender, b.identity, "x"); !errors.Is(err, ErrUnavailable) {
+	if err := f.direct.Send(sender, b.identity, "m1", "x"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Send() after recipient close = %v", err)
 	}
 
 	detached, detachedBox := f.authenticated(t, b)
 	f.direct.Detach(detached)
-	if err := f.direct.Send(sender, b.identity, "x"); !errors.Is(err, ErrUnavailable) {
+	if err := f.direct.Send(sender, b.identity, "m1", "x"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Send() to detached recipient = %v", err)
 	}
 
@@ -215,15 +215,15 @@ func TestFailedDeliveriesAreUnavailable(t *testing.T) {
 	_, slow := f.authenticated(t, b)
 	slow.accept = false
 
-	if err := f.direct.Send(sender, b.identity, "x"); !errors.Is(err, ErrUnavailable) {
+	if err := f.direct.Send(sender, b.identity, "m1", "x"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Send() = %v, want %v", err, ErrUnavailable)
 	}
 
 	_, healthy := f.authenticated(t, b)
-	if err := f.direct.Send(sender, b.identity, "y"); err != nil {
+	if err := f.direct.Send(sender, b.identity, "m1", "y"); err != nil {
 		t.Fatalf("Send() with one healthy session = %v", err)
 	}
-	expectMessages(t, healthy, Message{From: a.identity.String(), Body: "y"})
+	expectMessages(t, healthy, Message{ID: "m1", From: a.identity.String(), Body: "y"})
 }
 
 func TestClosedSenderCannotSend(t *testing.T) {
@@ -234,7 +234,7 @@ func TestClosedSenderCannotSend(t *testing.T) {
 
 	sender.Close()
 
-	if err := f.direct.Send(sender, b.identity, "x"); !errors.Is(err, ErrUnauthenticated) {
+	if err := f.direct.Send(sender, b.identity, "m1", "x"); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("Send() = %v, want %v", err, ErrUnauthenticated)
 	}
 	expectMessages(t, box)
@@ -247,7 +247,7 @@ func TestRepeatedLifecycleEventsAreHarmless(t *testing.T) {
 	recipient, box := f.authenticated(t, b)
 
 	f.direct.Authenticated(recipient, b.identity)
-	if err := f.direct.Send(sender, b.identity, "once"); err != nil {
+	if err := f.direct.Send(sender, b.identity, "m1", "once"); err != nil {
 		t.Fatal(err)
 	}
 	recipient.Close()
@@ -256,7 +256,7 @@ func TestRepeatedLifecycleEventsAreHarmless(t *testing.T) {
 	f.direct.Detach(recipient)
 	f.direct.Detach(recipient)
 
-	expectMessages(t, box, Message{From: a.identity.String(), Body: "once"})
+	expectMessages(t, box, Message{ID: "m1", From: a.identity.String(), Body: "once"})
 	if len(f.direct.recipients) != 1 || len(f.direct.identities) != 1 {
 		t.Fatalf("registry retained state: %d recipients, %d identities", len(f.direct.recipients), len(f.direct.identities))
 	}
@@ -298,7 +298,7 @@ func TestConcurrentMessaging(t *testing.T) {
 			}
 			wg.Go(func() {
 				for range perPair {
-					if err := f.direct.Send(senders[i], keys[j].identity, "m"); err != nil {
+					if err := f.direct.Send(senders[i], keys[j].identity, "m1", "m"); err != nil {
 						t.Error(err)
 						return
 					}
@@ -335,7 +335,7 @@ func TestSendRacingClose(t *testing.T) {
 		var delivered atomic.Bool
 		var wg sync.WaitGroup
 		wg.Go(func() {
-			if f.direct.Send(sender, b.identity, "race") == nil {
+			if f.direct.Send(sender, b.identity, "m1", "race") == nil {
 				delivered.Store(true)
 			}
 		})
@@ -361,7 +361,7 @@ func TestSenderClosingDuringFanOut(t *testing.T) {
 		_, box := f.authenticated(t, b)
 		var wg sync.WaitGroup
 		var err error
-		wg.Go(func() { err = f.direct.Send(sender, b.identity, "x") })
+		wg.Go(func() { err = f.direct.Send(sender, b.identity, "m1", "x") })
 		wg.Go(sender.Close)
 		wg.Wait()
 		if got := len(box.all()); (err == nil) != (got == 1) || got > 1 {

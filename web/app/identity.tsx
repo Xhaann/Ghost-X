@@ -78,7 +78,11 @@ export default function Identity({ client }: { client: Client | null }) {
             ))}
         </>
       )}
-      <Messages client={client} authenticator={authenticator} />
+      <Messages
+        client={client}
+        authenticator={authenticator}
+        self={key?.identity ?? null}
+      />
     </section>
   );
 }

@@ -1,0 +1,270 @@
+import { isIdentity } from "./identity.ts";
+import { Listeners } from "./listeners.ts";
+import type { Incoming, MessengerState, SendResult } from "./messenger.ts";
+import { bodySize, createId, isValidBody, maxBodySize } from "./protocol.ts";
+
+export type DeliveryState = "sending" | "delivered" | "unavailable" | "failed";
+
+type MessageBase = {
+  id: string;
+  from: string;
+  to: string;
+  body: string;
+  sequence: number;
+};
+
+export type ConversationMessage =
+  | (MessageBase & { direction: "sent"; delivery: DeliveryState })
+  | (MessageBase & { direction: "received" });
+
+export type Conversation = {
+  identity: string;
+  messages: readonly ConversationMessage[];
+  unread: number;
+  updated: number;
+};
+
+export type ConversationsState = {
+  connected: boolean;
+  active: string | null;
+  conversations: readonly Conversation[];
+};
+
+export type SendAttempt =
+  | { accepted: true; id: string; delivery: Promise<DeliveryState> }
+  | {
+      accepted: false;
+      reason:
+        | "no_conversation"
+        | "authentication_required"
+        | "invalid_payload"
+        | "message_too_large";
+    };
+
+export interface MessageSource {
+  readonly state: MessengerState;
+  onState(listener: (state: MessengerState) => void): () => void;
+  onMessage(listener: (message: Incoming) => void): () => void;
+  send(to: string, body: string, id: string): Promise<SendResult>;
+}
+
+export const maxConversations = 100;
+export const maxMessages = 200;
+
+const empty: ConversationsState = {
+  connected: false,
+  active: null,
+  conversations: [],
+};
+
+function deliveryOf(result: SendResult): DeliveryState {
+  if (result.ok) {
+    return "delivered";
+  }
+  return result.reason === "recipient_unavailable" ? "unavailable" : "failed";
+}
+
+export class Conversations {
+  readonly #source: MessageSource;
+  readonly #self: string;
+  readonly #states = new Listeners<ConversationsState>();
+  readonly #conversations = new Map<string, Conversation>();
+  #active: string | null = null;
+  #sequence = 0;
+  #generation = 0;
+  #state: ConversationsState = empty;
+  #detach: (() => void) | null = null;
+
+  constructor(source: MessageSource, self: string) {
+    this.#source = source;
+    this.#self = self;
+  }
+
+  get state(): ConversationsState {
+    return this.#state;
+  }
+
+  onState(listener: (state: ConversationsState) => void): () => void {
+    return this.#states.add(listener);
+  }
+
+  start(): void {
+    if (this.#detach) {
+      return;
+    }
+    const detach = [
+      this.#source.onMessage((message) => this.#receive(message)),
+      this.#source.onState(() => this.#publish()),
+    ];
+    this.#detach = () => detach.forEach((release) => release());
+    this.#publish();
+  }
+
+  stop(): void {
+    this.#detach?.();
+    this.#detach = null;
+    this.#generation += 1;
+    this.#conversations.clear();
+    this.#active = null;
+    this.#state = empty;
+    this.#states.emit(this.#state);
+  }
+
+  open(identity: string): boolean {
+    if (!this.#detach || !isIdentity(identity)) {
+      return false;
+    }
+    const conversation = this.#ensure(identity);
+    this.#active = identity;
+    if (conversation.unread > 0) {
+      this.#conversations.set(identity, { ...conversation, unread: 0 });
+    }
+    this.#publish();
+    return true;
+  }
+
+  close(): void {
+    if (this.#active === null) {
+      return;
+    }
+    this.#active = null;
+    this.#publish();
+  }
+
+  send(body: string): SendAttempt {
+    const to = this.#active;
+    if (!this.#detach || to === null) {
+      return { accepted: false, reason: "no_conversation" };
+    }
+    if (!this.#source.state.active) {
+      return { accepted: false, reason: "authentication_required" };
+    }
+    if (bodySize(body) > maxBodySize) {
+      return { accepted: false, reason: "message_too_large" };
+    }
+    if (!isValidBody(body)) {
+      return { accepted: false, reason: "invalid_payload" };
+    }
+
+    const id = createId();
+    const generation = this.#generation;
+    this.#append(this.#ensure(to), {
+      id,
+      from: this.#self,
+      to,
+      body,
+      sequence: ++this.#sequence,
+      direction: "sent",
+      delivery: "sending",
+    });
+    this.#publish();
+
+    const delivery = this.#source.send(to, body, id).then(
+      (result) => this.#settle(generation, to, id, deliveryOf(result)),
+      () => this.#settle(generation, to, id, "failed"),
+    );
+    return { accepted: true, id, delivery };
+  }
+
+  #settle(
+    generation: number,
+    identity: string,
+    id: string,
+    delivery: DeliveryState,
+  ): DeliveryState {
+    const conversation = this.#conversations.get(identity);
+    if (generation !== this.#generation || !conversation) {
+      return delivery;
+    }
+    const messages = conversation.messages.map((message) =>
+      message.id === id && message.direction === "sent"
+        ? { ...message, delivery }
+        : message,
+    );
+    this.#conversations.set(identity, { ...conversation, messages });
+    this.#publish();
+    return delivery;
+  }
+
+  #receive(message: Incoming): void {
+    if (!this.#detach) {
+      return;
+    }
+    const existing = this.#conversations.get(message.from);
+    if (existing?.messages.some((m) => m.id === message.id)) {
+      return;
+    }
+    const conversation = this.#append(this.#ensure(message.from), {
+      id: message.id,
+      from: message.from,
+      to: this.#self,
+      body: message.body,
+      sequence: ++this.#sequence,
+      direction: "received",
+    });
+    if (this.#active !== message.from) {
+      this.#conversations.set(message.from, {
+        ...conversation,
+        unread: conversation.unread + 1,
+      });
+    }
+    this.#publish();
+  }
+
+  #ensure(identity: string): Conversation {
+    const existing = this.#conversations.get(identity);
+    if (existing) {
+      return existing;
+    }
+    if (this.#conversations.size >= maxConversations) {
+      this.#evict();
+    }
+    const conversation: Conversation = {
+      identity,
+      messages: [],
+      unread: 0,
+      updated: ++this.#sequence,
+    };
+    this.#conversations.set(identity, conversation);
+    return conversation;
+  }
+
+  #evict(): void {
+    let oldest: Conversation | null = null;
+    for (const conversation of this.#conversations.values()) {
+      if (
+        conversation.identity !== this.#active &&
+        (!oldest || conversation.updated < oldest.updated)
+      ) {
+        oldest = conversation;
+      }
+    }
+    if (oldest) {
+      this.#conversations.delete(oldest.identity);
+    }
+  }
+
+  #append(
+    conversation: Conversation,
+    message: ConversationMessage,
+  ): Conversation {
+    const next: Conversation = {
+      ...conversation,
+      messages: [...conversation.messages, message].slice(-maxMessages),
+      updated: message.sequence,
+    };
+    this.#conversations.set(conversation.identity, next);
+    return next;
+  }
+
+  #publish(): void {
+    this.#state = {
+      connected: this.#source.state.active,
+      active: this.#active,
+      conversations: [...this.#conversations.values()].sort(
+        (a, b) => b.updated - a.updated,
+      ),
+    };
+    this.#states.emit(this.#state);
+  }
+}

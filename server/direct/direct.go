@@ -14,6 +14,7 @@ var (
 )
 
 type Message struct {
+	ID   string
 	From string
 	Body string
 }
@@ -68,7 +69,7 @@ func (r *Registry) Closed(s *auth.Session, _ identity.Identity) {
 	r.forget(s)
 }
 
-func (r *Registry) Send(from *auth.Session, to identity.Identity, body string) error {
+func (r *Registry) Send(from *auth.Session, to identity.Identity, id, body string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	sender, ok := r.identities[from]
@@ -76,7 +77,7 @@ func (r *Registry) Send(from *auth.Session, to identity.Identity, body string) e
 		return ErrUnauthenticated
 	}
 	delivered := 0
-	msg := Message{From: sender, Body: body}
+	msg := Message{ID: id, From: sender, Body: body}
 	for s := range r.recipients[to.String()] {
 		if deliver, ok := r.endpoints[s]; ok && deliver(msg) {
 			delivered++

@@ -12,6 +12,7 @@ const MaxBodySize = 4096
 const maxRawBody = MaxBodySize*6 + 2
 
 type messagePayload struct {
+	ID   string `json:"id"`
 	From string `json:"from"`
 	Body string `json:"body"`
 }
@@ -44,7 +45,7 @@ func Send(registry *direct.Registry) ProtectedHandler {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
 
-		switch err := registry.Send(c.session, recipient, body); {
+		switch err := registry.Send(c.session, recipient, c.request, body); {
 		case errors.Is(err, direct.ErrUnauthenticated):
 			return Reply{}, &Error{Code: CodeAuthRequired}
 		case errors.Is(err, direct.ErrUnavailable):
@@ -57,7 +58,7 @@ func Send(registry *direct.Registry) ProtectedHandler {
 }
 
 func EncodeMessage(m direct.Message) []byte {
-	return encode("message", "", messagePayload{From: m.From, Body: m.Body})
+	return encode("message", "", messagePayload{ID: m.ID, From: m.From, Body: m.Body})
 }
 
 func validBody(body string) bool {

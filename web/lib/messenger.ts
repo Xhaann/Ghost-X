@@ -5,30 +5,25 @@ import type { AuthSource } from "./presence.ts";
 import {
   type ErrorCode,
   bodySize,
+  createId,
   isValidBody,
+  isValidId,
   maxBodySize,
 } from "./protocol.ts";
 
 export type SendResult =
   { ok: true } | { ok: false; reason: ErrorCode | "not_sent" };
 
-export type Received = { from: string; body: string; sequence: number };
+export type Incoming = { id: string; from: string; body: string };
 
-export type MessengerState = {
-  active: boolean;
-  received: readonly Received[];
-};
-
-export const maxReceived = 100;
-
-const inactive: MessengerState = { active: false, received: [] };
+export type MessengerState = { active: boolean };
 
 export class Messenger {
   readonly #client: Client;
   readonly #auth: AuthSource;
   readonly #states = new Listeners<MessengerState>();
-  #state: MessengerState = inactive;
-  #sequence = 0;
+  readonly #messages = new Listeners<Incoming>();
+  #state: MessengerState = { active: false };
   #detach: (() => void) | null = null;
 
   constructor(client: Client, auth: AuthSource) {
@@ -44,6 +39,10 @@ export class Messenger {
     return this.#states.add(listener);
   }
 
+  onMessage(listener: (message: Incoming) => void): () => void {
+    return this.#messages.add(listener);
+  }
+
   start(): void {
     if (this.#detach) {
       return;
@@ -51,7 +50,7 @@ export class Messenger {
     const detach = [
       this.#client.onMessage((message) => {
         if (message.type === "message" && this.#state.active) {
-          this.#receive(message.payload.from, message.payload.body);
+          this.#messages.emit({ ...message.payload });
         }
       }),
       this.#auth.onState((state) => this.#activate(state === "authenticated")),
@@ -66,11 +65,15 @@ export class Messenger {
     this.#activate(false);
   }
 
-  async send(to: string, body: string): Promise<SendResult> {
+  async send(
+    to: string,
+    body: string,
+    id: string = createId(),
+  ): Promise<SendResult> {
     if (!this.#state.active) {
       return { ok: false, reason: "authentication_required" };
     }
-    if (!isIdentity(to)) {
+    if (!isIdentity(to) || !isValidId(id)) {
       return { ok: false, reason: "invalid_payload" };
     }
     if (bodySize(body) > maxBodySize) {
@@ -79,10 +82,11 @@ export class Messenger {
     if (!isValidBody(body)) {
       return { ok: false, reason: "invalid_payload" };
     }
-    const reply = await this.#client.request({
-      type: "send",
-      payload: { to, body },
-    });
+    const reply = await this.#client.request(
+      { type: "send", payload: { to, body } },
+      5000,
+      id,
+    );
     if (reply?.type === "sent") {
       return { ok: true };
     }
@@ -93,20 +97,10 @@ export class Messenger {
   }
 
   #activate(active: boolean): void {
-    if (this.#state.active === active && this.#state.received.length === 0) {
+    if (this.#state.active === active) {
       return;
     }
-    this.#state = { active, received: [] };
-    this.#states.emit(this.#state);
-  }
-
-  #receive(from: string, body: string): void {
-    this.#sequence += 1;
-    const received = [
-      ...this.#state.received,
-      { from, body, sequence: this.#sequence },
-    ].slice(-maxReceived);
-    this.#state = { active: true, received };
+    this.#state = { active };
     this.#states.emit(this.#state);
   }
 }

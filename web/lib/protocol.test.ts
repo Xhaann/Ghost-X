@@ -190,8 +190,13 @@ test("parses messaging replies and deliveries", () => {
     payload: {},
   });
   assert.deepEqual(
-    parse(JSON.stringify({ type: "message", payload: { from, body: "hi\n" } })),
-    { type: "message", payload: { from, body: "hi\n" } },
+    parse(
+      JSON.stringify({
+        type: "message",
+        payload: { id: "m1", from, body: "hi\n" },
+      }),
+    ),
+    { type: "message", payload: { id: "m1", from, body: "hi\n" } },
   );
   for (const code of ["recipient_unavailable", "message_too_large"]) {
     assert.deepEqual(
@@ -206,15 +211,23 @@ test("rejects malformed messaging frames", () => {
   for (const message of [
     { type: "sent", payload: {} },
     { type: "sent", id: "m1", payload: { to: from } },
-    { type: "message", id: "m1", payload: { from, body: "x" } },
-    { type: "message", payload: { body: "x" } },
-    { type: "message", payload: { from, body: "" } },
-    { type: "message", payload: { from, body: 1 } },
-    { type: "message", payload: { from: "short", body: "x" } },
-    { type: "message", payload: { from, body: "x", to: from } },
-    { type: "message", payload: { from, body: "a\u0000b" } },
-    { type: "message", payload: { from, body: "a".repeat(maxBodySize + 1) } },
-    { type: "message", payload: { from, body: "x" }, extra: 1 },
+    { type: "message", id: "m1", payload: { id: "m1", from, body: "x" } },
+    { type: "message", payload: { from, body: "x" } },
+    { type: "message", payload: { id: "", from, body: "x" } },
+    { type: "message", payload: { id: "bad id", from, body: "x" } },
+    { type: "message", payload: { id: "a".repeat(65), from, body: "x" } },
+    { type: "message", payload: { id: 1, from, body: "x" } },
+    { type: "message", payload: { id: "m1", body: "x" } },
+    { type: "message", payload: { id: "m1", from, body: "" } },
+    { type: "message", payload: { id: "m1", from, body: 1 } },
+    { type: "message", payload: { id: "m1", from: "short", body: "x" } },
+    { type: "message", payload: { id: "m1", from, body: "x", to: from } },
+    { type: "message", payload: { id: "m1", from, body: "a\u0000b" } },
+    {
+      type: "message",
+      payload: { id: "m1", from, body: "a".repeat(maxBodySize + 1) },
+    },
+    { type: "message", payload: { id: "m1", from, body: "x" }, extra: 1 },
   ]) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
   }

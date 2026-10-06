@@ -3,13 +3,12 @@ import { test } from "node:test";
 import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
 import { IdentityKey } from "./identity.ts";
-import { Messenger, type MessengerState, maxReceived } from "./messenger.ts";
+import { type Incoming, Messenger, type MessengerState } from "./messenger.ts";
 import { maxBodySize } from "./protocol.ts";
 import { WebSocketTransport } from "./socket.ts";
 import {
   created,
   freePort,
-  openSockets,
   startServer,
   stopServer,
   track,
@@ -22,9 +21,9 @@ useServer();
 type Peer = {
   client: Client;
   key: IdentityKey;
-  auth: Authenticator;
   messenger: Messenger;
-  log: MessengerState[];
+  inbox: Incoming[];
+  states: MessengerState[];
   socket: WebSocket;
 };
 
@@ -52,8 +51,10 @@ async function peer(port: number, key?: IdentityKey): Promise<Peer> {
   const messenger = new Messenger(client, auth);
   track({ close: () => messenger.stop() });
   track({ close: () => auth.stop() });
-  const log: MessengerState[] = [];
-  messenger.onState((state) => log.push(state));
+  const inbox: Incoming[] = [];
+  const states: MessengerState[] = [];
+  messenger.onMessage((message) => inbox.push(message));
+  messenger.onState((state) => states.push(state));
   auth.start();
   messenger.start();
   client.open();
@@ -61,15 +62,11 @@ async function peer(port: number, key?: IdentityKey): Promise<Peer> {
   return {
     client,
     key: identity,
-    auth,
     messenger,
-    log,
+    inbox,
+    states,
     socket: created[before],
   };
-}
-
-function bodies(p: Peer): string[] {
-  return p.messenger.state.received.map((message) => message.body);
 }
 
 async function barrier(p: Peer): Promise<void> {
@@ -78,16 +75,6 @@ async function barrier(p: Peer): Promise<void> {
     payload: { sentAt: 1 },
   });
   assert.equal(reply?.type, "pong");
-}
-
-function sentFrames(p: Peer): string[] {
-  const frames: string[] = [];
-  const send = p.socket.send.bind(p.socket);
-  p.socket.send = (data: string) => {
-    frames.push(data);
-    send(data);
-  };
-  return frames;
 }
 
 test("refuses to send before authentication", async () => {
@@ -100,28 +87,30 @@ test("refuses to send before authentication", async () => {
   track({ close: () => messenger.stop() });
   messenger.start();
 
-  const result = await messenger.send("B".repeat(42) + "A", "x");
-
-  assert.deepEqual(result, { ok: false, reason: "authentication_required" });
-  assert.deepEqual(messenger.state, { active: false, received: [] });
+  assert.deepEqual(await messenger.send("B".repeat(42) + "A", "x"), {
+    ok: false,
+    reason: "authentication_required",
+  });
+  assert.deepEqual(messenger.state, { active: false });
   assert.equal(created.length, 0);
 });
 
-test("delivers a message from the authenticated sender", async () => {
+test("delivers a message with the caller's id and the session sender", async () => {
   const port = await freePort();
   await startServer(port);
   const a = await peer(port);
   const b = await peer(port);
 
-  assert.deepEqual(await a.messenger.send(b.key.identity, "hello"), {
+  assert.deepEqual(await a.messenger.send(b.key.identity, "hello", "m1"), {
     ok: true,
   });
-  await until(() => b.messenger.state.received.length === 1, "delivery");
+  await until(() => b.inbox.length === 1, "delivery");
 
-  assert.equal(b.messenger.state.received[0].from, a.key.identity);
-  assert.equal(b.messenger.state.received[0].body, "hello");
+  assert.deepEqual(b.inbox, [
+    { id: "m1", from: a.key.identity, body: "hello" },
+  ]);
   await barrier(a);
-  assert.equal(a.messenger.state.received.length, 0);
+  assert.deepEqual(a.inbox, []);
 });
 
 test("delivers once to each session of the recipient", async () => {
@@ -134,20 +123,18 @@ test("delivers once to each session of the recipient", async () => {
   const b1 = await peer(port, bKey);
   const b2 = await peer(port, bKey);
 
-  assert.deepEqual(await a.messenger.send(bKey.identity, "one"), { ok: true });
-  assert.deepEqual(await a.messenger.send(bKey.identity, "two"), { ok: true });
+  await a.messenger.send(bKey.identity, "one", "m1");
+  await a.messenger.send(bKey.identity, "two", "m2");
   for (const b of [b1, b2]) {
-    await until(() => b.messenger.state.received.length >= 2, "deliveries");
+    await until(() => b.inbox.length >= 2, "deliveries");
     await barrier(b);
     assert.deepEqual(
-      b.messenger.state.received.map((m) => m.body),
-      ["one", "two"],
+      b.inbox.map((m) => m.id),
+      ["m1", "m2"],
     );
   }
   await barrier(aOther);
-  await barrier(a);
-  assert.equal(a.messenger.state.received.length, 0);
-  assert.equal(aOther.messenger.state.received.length, 0);
+  assert.deepEqual(aOther.inbox, []);
 });
 
 test("reports an unavailable recipient", async () => {
@@ -167,25 +154,74 @@ test("rejects invalid input without sending a frame", async () => {
   await startServer(port);
   const a = await peer(port);
   const b = await peer(port);
-  const frames = sentFrames(a);
+  const frames: string[] = [];
+  const send = a.socket.send.bind(a.socket);
+  a.socket.send = (data: string) => {
+    frames.push(data);
+    send(data);
+  };
 
-  assert.deepEqual(await a.messenger.send("not-an-identity", "x"), {
-    ok: false,
-    reason: "invalid_payload",
-  });
-  assert.deepEqual(await a.messenger.send(b.key.identity, ""), {
-    ok: false,
-    reason: "invalid_payload",
-  });
-  assert.deepEqual(await a.messenger.send(b.key.identity, "a\u0000b"), {
-    ok: false,
-    reason: "invalid_payload",
-  });
-  assert.deepEqual(
-    await a.messenger.send(b.key.identity, "a".repeat(maxBodySize + 1)),
-    { ok: false, reason: "message_too_large" },
-  );
+  for (const [to, body, id, reason] of [
+    ["not-an-identity", "x", "m1", "invalid_payload"],
+    [b.key.identity, "", "m1", "invalid_payload"],
+    [b.key.identity, "a\u0000b", "m1", "invalid_payload"],
+    [b.key.identity, "x", "bad id", "invalid_payload"],
+    [b.key.identity, "a".repeat(maxBodySize + 1), "m1", "message_too_large"],
+  ] as const) {
+    assert.deepEqual(await a.messenger.send(to, body, id), {
+      ok: false,
+      reason,
+    });
+  }
   assert.deepEqual(frames, []);
+});
+
+test("emits nothing while inactive and nothing after stop", async () => {
+  const port = await freePort();
+  const server = await startServer(port);
+  const a = await peer(port);
+  const b = await peer(port);
+
+  await stopServer(server);
+  await until(() => !b.messenger.state.active, "inactive");
+  b.socket.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "message",
+        payload: { id: "m9", from: a.key.identity, body: "stale" },
+      }),
+    }),
+  );
+  assert.deepEqual(b.inbox, []);
+
+  await startServer(port);
+  await until(
+    () => a.messenger.state.active && b.messenger.state.active,
+    "re-authenticated",
+  );
+  b.messenger.stop();
+  b.messenger.stop();
+  assert.deepEqual(await a.messenger.send(b.key.identity, "after stop"), {
+    ok: true,
+  });
+  await barrier(b);
+  assert.deepEqual(b.inbox, []);
+  assert.deepEqual(b.states.at(-1), { active: false });
+});
+
+test("starts only once", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const a = await peer(port);
+  const b = await peer(port);
+  b.messenger.start();
+  b.messenger.start();
+
+  await a.messenger.send(b.key.identity, "once", "m1");
+  await until(() => b.inbox.length === 1, "delivery");
+  await barrier(b);
+
+  assert.equal(b.inbox.length, 1);
 });
 
 test("server rejects unauthenticated and forged sends", async () => {
@@ -205,9 +241,7 @@ test("server rejects unauthenticated and forged sends", async () => {
   });
   assert.deepEqual(
     unauthenticated?.type === "error" && unauthenticated.payload,
-    {
-      code: "authentication_required",
-    },
+    { code: "authentication_required" },
   );
 
   const a = await peer(port);
@@ -232,109 +266,5 @@ test("server rejects unauthenticated and forged sends", async () => {
     payload: { code: "invalid_payload" },
   });
   await barrier(b);
-  assert.equal(b.messenger.state.received.length, 0);
-});
-
-test("ignores malformed and unexpected delivery frames", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const a = await peer(port);
-  const count = a.log.length;
-  const inject = (data: unknown) =>
-    a.socket.dispatchEvent(
-      new MessageEvent("message", { data: JSON.stringify(data) }),
-    );
-
-  inject({ type: "message", payload: { from: "short", body: "x" } });
-  inject({
-    type: "message",
-    id: "m1",
-    payload: { from: a.key.identity, body: "x" },
-  });
-  inject({ type: "message", payload: { from: a.key.identity, body: "" } });
-  inject({ type: "message", payload: { from: a.key.identity } });
-  a.socket.dispatchEvent(new MessageEvent("message", { data: "not json" }));
-
-  assert.equal(a.log.length, count);
-  assert.deepEqual(a.messenger.state.received, []);
-});
-
-test("clears state on disconnect and ignores stale deliveries", async () => {
-  const port = await freePort();
-  const server = await startServer(port);
-  const a = await peer(port);
-  const b = await peer(port);
-  await a.messenger.send(b.key.identity, "before");
-  await until(() => b.messenger.state.received.length === 1, "delivery");
-
-  await stopServer(server);
-  await until(() => !b.messenger.state.active, "inactive");
-  assert.deepEqual(b.messenger.state.received, []);
-  b.socket.dispatchEvent(
-    new MessageEvent("message", {
-      data: JSON.stringify({
-        type: "message",
-        payload: { from: a.key.identity, body: "stale" },
-      }),
-    }),
-  );
-  assert.deepEqual(b.messenger.state, { active: false, received: [] });
-  assert.deepEqual(await b.messenger.send(a.key.identity, "x"), {
-    ok: false,
-    reason: "authentication_required",
-  });
-
-  await startServer(port);
-  await until(() => a.messenger.state.active, "a re-authenticated");
-  await until(() => b.messenger.state.active, "b re-authenticated");
-  assert.deepEqual(await a.messenger.send(b.key.identity, "after"), {
-    ok: true,
-  });
-  await until(() => b.messenger.state.received.length === 1, "redelivery");
-  assert.deepEqual(bodies(b), ["after"]);
-  assert.equal(openSockets().length, 2);
-});
-
-test("stop releases listeners and starts only once", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const a = await peer(port);
-  const b = await peer(port);
-  b.messenger.start();
-  b.messenger.start();
-
-  await a.messenger.send(b.key.identity, "once");
-  await until(() => b.messenger.state.received.length === 1, "delivery");
-  await barrier(b);
-  assert.equal(b.messenger.state.received.length, 1);
-
-  b.messenger.stop();
-  assert.deepEqual(b.messenger.state, { active: false, received: [] });
-  const count = b.log.length;
-  assert.deepEqual(await a.messenger.send(b.key.identity, "after stop"), {
-    ok: true,
-  });
-  await barrier(b);
-  assert.equal(b.log.length, count);
-  assert.deepEqual(b.messenger.state, { active: false, received: [] });
-});
-
-test("bounds the received list", async () => {
-  const port = await freePort();
-  await startServer(port);
-  const a = await peer(port);
-  const b = await peer(port);
-
-  for (let i = 0; i < maxReceived + 5; i++) {
-    assert.deepEqual(await a.messenger.send(b.key.identity, `m${i}`), {
-      ok: true,
-    });
-  }
-  await until(
-    () => b.messenger.state.received.at(-1)?.body === `m${maxReceived + 4}`,
-    "last delivery",
-  );
-
-  assert.equal(b.messenger.state.received.length, maxReceived);
-  assert.equal(b.messenger.state.received[0].body, "m5");
+  assert.deepEqual(b.inbox, []);
 });
