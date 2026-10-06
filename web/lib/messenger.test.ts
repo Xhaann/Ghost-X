@@ -1,43 +1,26 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Authenticator } from "./auth.ts";
 import { decodeBase64Url, encodeBase64Url } from "./base64.ts";
-import { Client } from "./client.ts";
+import type { Client } from "./client.ts";
 import { ExchangeKey, type KeyBundle } from "./encryption.ts";
 import { IdentityKey } from "./identity.ts";
-import {
-  type Incoming,
-  Messenger,
-  type MessengerOptions,
-  type MessengerState,
-  maxPendingDecryptions,
-} from "./messenger.ts";
+import { type MessengerOptions, maxPendingDecryptions } from "./messenger.ts";
 import { maxBodySize, sessionIdSize } from "./protocol.ts";
-import { WebSocketTransport } from "./socket.ts";
 import {
+  type MemoryStore,
+  type SecureDevice,
   freePort,
+  memoryStore,
+  secureDevice,
   startServer,
   stopServer,
-  track,
   useServer,
-  waitFor,
 } from "./testing.ts";
+import { loadVault } from "./vault.ts";
 
 useServer();
 
-type Keys = { identity: IdentityKey; exchange: ExchangeKey };
-
-type Peer = {
-  client: Client;
-  keys: Keys;
-  messenger: Messenger;
-  inbox: Incoming[];
-  states: MessengerState[];
-  sent: string[];
-  received: string[];
-  deliver: (data: string) => void;
-  hold: (held: boolean) => void;
-};
+type Peer = SecureDevice;
 
 type Json = Record<string, unknown>;
 
@@ -51,77 +34,44 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
   }
 }
 
-async function keys(): Promise<Keys> {
-  const [identity, exchange] = await Promise.all([
-    IdentityKey.generate(),
-    ExchangeKey.generate(),
-  ]);
-  return { identity, exchange };
+async function stranger(): Promise<string> {
+  return (await IdentityKey.generate()).identity;
+}
+
+async function identityStore(): Promise<MemoryStore> {
+  const store = memoryStore();
+  assert.equal((await loadVault(store)).status, "ready");
+  return store;
+}
+
+function deviceOf(source: MemoryStore): MemoryStore {
+  const store = memoryStore();
+  store.data.set("vault:keys", source.data.get("vault:keys"));
+  return store;
+}
+
+async function conflictingDevice(source: MemoryStore): Promise<MemoryStore> {
+  const store = memoryStore();
+  const fresh = await ExchangeKey.create();
+  store.data.set("vault:keys", {
+    ...(source.data.get("vault:keys") as Json),
+    exchangeKey: fresh.key.publicKey,
+    exchange: fresh.privateKey,
+  });
+  return store;
 }
 
 async function peer(
   port: number,
-  own?: Keys,
+  identity?: MemoryStore,
   options: MessengerOptions & { wait?: boolean } = {},
 ): Promise<Peer> {
-  const transport = track(
-    new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
-  );
-  const sent: string[] = [];
-  const received: string[] = [];
-  const listeners: ((data: string) => void)[] = [];
-  let held = false;
-  const send = transport.send.bind(transport);
-  transport.send = (data: string) => {
-    sent.push(data);
-    return send(data);
-  };
-  transport.onData((data) => received.push(data));
-  const onData = transport.onData.bind(transport);
-  transport.onData = (listener: (data: string) => void) => {
-    listeners.push(listener);
-    return onData((data) => {
-      if (!(held && data.includes('"type":"message"'))) {
-        listener(data);
-      }
-    });
-  };
-  const client = track(new Client(transport));
-  const k = own ?? (await keys());
-  const auth = new Authenticator(client, k.identity);
-  const messenger = new Messenger(
-    client,
-    auth,
-    k.identity,
-    k.exchange,
-    options,
-  );
-  track({ close: () => messenger.stop() });
-  track({ close: () => auth.stop() });
-  const inbox: Incoming[] = [];
-  const states: MessengerState[] = [];
-  messenger.onMessage((message) => inbox.push(message));
-  messenger.onState((state) => states.push(state));
-  auth.start();
-  messenger.start();
-  client.open();
-  await waitFor(client, "connected");
-  if (options.wait !== false) {
-    await until(() => messenger.state.active, "messenger active");
-  }
-  return {
-    client,
-    keys: k,
+  const { wait, ...messenger } = options;
+  return secureDevice(port, {
+    store: identity ? deviceOf(identity) : memoryStore(),
     messenger,
-    inbox,
-    states,
-    sent,
-    received,
-    deliver: (data) => listeners.forEach((listener) => listener(data)),
-    hold: (value) => {
-      held = value;
-    },
-  };
+    wait,
+  });
 }
 
 async function barrier(p: Peer): Promise<void> {
@@ -175,7 +125,13 @@ test("activates only after publishing the static key and establishing a session"
   const a = await peer(port);
 
   const types = a.sent.map((raw) => JSON.parse(raw).type);
-  assert.deepEqual(types.slice(-3), ["authenticate", "publish", "session"]);
+  const order = ["authenticate", "publish", "session", "prekeys"].map((t) =>
+    types.indexOf(t),
+  );
+  assert.ok(
+    order.every((index, i) => index >= 0 && (i === 0 || index > order[i - 1])),
+    types.join(),
+  );
   const offer = frames(a.sent, "session")[0].payload as Json;
   assert.deepEqual(Object.keys(offer).sort(), [
     "epoch",
@@ -199,10 +155,9 @@ test("activates only after publishing the static key and establishing a session"
 test("refuses to send before a session is established", async () => {
   const port = await freePort();
   await startServer(port);
-  const k = await keys();
-  const a = await peer(port, k, { wait: false });
+  const a = await peer(port, undefined, { wait: false });
   a.messenger.stop();
-  assert.deepEqual(await a.messenger.send(k.identity.identity, "x"), {
+  assert.deepEqual(await a.messenger.send(await stranger(), "x"), {
     ok: false,
     reason: "authentication_required",
   });
@@ -260,54 +215,51 @@ test("delivers end-to-end encrypted messages with only ephemeral session keys on
   assert.equal(a.inbox[0].body, "reply");
 });
 
-test("each session of the recipient identity gets its own independently keyed envelope", async () => {
+test("only the device holding the ratchet session can read messages to its identity", async () => {
   const port = await freePort();
   await startServer(port);
-  const bKeys = await keys();
+  const bIdentity = await identityStore();
   const a = await peer(port);
-  const b1 = await peer(port, bKeys);
-  const b2 = await peer(port, bKeys);
+  const b1 = await peer(port, bIdentity);
+  const b2 = await peer(port, bIdentity);
+  assert.equal(b1.id, b2.id);
   assert.notEqual(b1.messenger.session?.session, b2.messenger.session?.session);
 
+  assert.deepEqual(await a.messenger.send(b1.id, "both", "m1"), { ok: true });
+  await until(() => b1.inbox.length === 1 && b2.inbox.length === 1, "fanout");
   assert.deepEqual(
-    await a.messenger.send(bKeys.identity.identity, "both", "m1"),
-    { ok: true },
+    [b1.inbox[0].body, b2.inbox[0].body].sort(),
+    ["both", null].sort(),
   );
-  for (const b of [b1, b2]) {
-    await until(() => b.inbox.length === 1, "delivery");
-    await barrier(b);
-    assert.deepEqual(bodies(b), ["both"]);
-  }
   const envelopes = (frames(a.sent, "send")[0].payload as Json)
     .envelopes as Json[];
   assert.equal(envelopes.length, 2);
   assert.notEqual(envelopes[0].ciphertext, envelopes[1].ciphertext);
-  assert.notEqual(envelopes[0].salt, envelopes[1].salt);
 
-  const forB1 = lastDelivery(b1);
-  inject(b2, { ...forB1, id: "x1" });
-  inject(b2, {
-    ...forB1,
+  const reader = b1.inbox[0].body === "both" ? b1 : b2;
+  const other = reader === b1 ? b2 : b1;
+  const delivered = lastDelivery(reader);
+  inject(other, {
+    ...delivered,
     id: "x2",
     envelope: {
-      ...(forB1.envelope as Json),
-      session: b2.messenger.session?.session,
+      ...(delivered.envelope as Json),
+      session: other.messenger.session?.session,
     },
   });
-  await until(() => b2.inbox.length === 2, "cross-session processed");
-  assert.deepEqual(bodies(b2), ["both", null]);
+  await until(() => other.inbox.length === 2, "cross-device processed");
+  assert.equal(other.inbox[1].body, null);
 });
 
 test("a second session cannot bind a different static key", async () => {
   const port = await freePort();
   await startServer(port);
-  const first = await keys();
+  const first = await identityStore();
   await peer(port, first);
-  const conflicting = await peer(
-    port,
-    { identity: first.identity, exchange: await ExchangeKey.generate() },
-    { wait: false },
-  );
+  const conflicting = await secureDevice(port, {
+    store: await conflictingDevice(first),
+    wait: false,
+  });
   await barrier(conflicting);
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(conflicting.messenger.state.active, false);
@@ -319,22 +271,19 @@ test("reports unavailable recipients and invalid input without sending", async (
   const port = await freePort();
   await startServer(port);
   const a = await peer(port);
-  const absent = await keys();
+  const absent = await stranger();
   const frameCount = frames(a.sent, "send").length;
 
-  assert.deepEqual(await a.messenger.send(absent.identity.identity, "x"), {
+  assert.deepEqual(await a.messenger.send(absent, "x"), {
     ok: false,
     reason: "recipient_unavailable",
   });
   for (const [to, body, reason] of [
     ["bad", "x", "invalid_payload"],
-    [absent.identity.identity, "", "invalid_payload"],
-    [absent.identity.identity, "a\u0000", "invalid_payload"],
-    [
-      absent.identity.identity,
-      "a".repeat(maxBodySize + 1),
-      "message_too_large",
-    ],
+    [a.id, "to myself", "invalid_payload"],
+    [absent, "", "invalid_payload"],
+    [absent, "a\u0000", "invalid_payload"],
+    [absent, "a".repeat(maxBodySize + 1), "message_too_large"],
   ] as const) {
     assert.deepEqual(await a.messenger.send(to, body), { ok: false, reason });
   }
@@ -829,8 +778,7 @@ test("reports only verified static key bundles from lookups, sends, and deliveri
 
   assert.equal(await a.messenger.lookup(b.keys.identity.identity), true);
   assert.equal(await a.messenger.lookup("not-an-identity"), false);
-  const absent = await keys();
-  assert.equal(await a.messenger.lookup(absent.identity.identity), false);
+  assert.equal(await a.messenger.lookup(await stranger()), false);
   assert.deepEqual(
     await a.messenger.send(c.keys.identity.identity, "x", "s1"),
     { ok: true },
@@ -846,102 +794,52 @@ test("reports only verified static key bundles from lookups, sends, and deliveri
   assert.equal(seen.length, 3);
 });
 
-test("two sessions per identity stay isolated through rotation and reconnect", async () => {
+test("the ratchet continues across outer-session rotation and reconnect", async () => {
   const port = await freePort();
   await startServer(port);
-  const aKeys = await keys();
-  const bKeys = await keys();
   const options = { rotationLimit: 1000 };
-  const a1 = await peer(port, aKeys, options);
-  const a2 = await peer(port, aKeys, options);
-  const b1 = await peer(port, bKeys, options);
-  const b2 = await peer(port, bKeys, options);
-  const idA = aKeys.identity.identity;
-  const idB = bKeys.identity.identity;
-  const sessions = [a1, a2, b1, b2].map((p) => p.messenger.session?.session);
-  assert.equal(new Set(sessions).size, 4);
+  const a = await peer(port, undefined, options);
+  const b = await peer(port, undefined, options);
 
-  assert.deepEqual(await a1.messenger.send(idB, "a1 to b", "x1"), { ok: true });
-  await until(() => b1.inbox.length === 1 && b2.inbox.length === 1, "fanout");
-  const toB1 = lastDelivery(b1);
-  const toB2 = lastDelivery(b2);
-  assert.notEqual(
-    (toB1.envelope as Json).ciphertext,
-    (toB2.envelope as Json).ciphertext,
-  );
+  assert.deepEqual(await a.messenger.send(b.id, "first", "x1"), { ok: true });
+  await until(() => b.inbox.length === 1, "first");
+  const reader = b;
+  assert.equal(reader.inbox[0].body, "first");
+  const old = lastDelivery(reader);
 
-  assert.equal(await a1.messenger.rotate(), true);
-  assert.equal(await b1.messenger.rotate(), true);
-  assert.deepEqual(a2.messenger.session?.epochs, [0]);
-  assert.deepEqual(b2.messenger.session?.epochs, [0]);
-  assert.deepEqual(await a2.messenger.send(idB, "a2 to b", "x2"), { ok: true });
-  assert.deepEqual(await a1.messenger.send(idB, "a1 rotated", "x3"), {
+  assert.equal(await a.messenger.rotate(), true);
+  assert.equal(await reader.messenger.rotate(), true);
+  assert.deepEqual(await a.messenger.send(b.id, "after rotation", "x2"), {
     ok: true,
   });
-  await until(
-    () => b1.inbox.length === 3 && b2.inbox.length === 3,
-    "after rotation",
-  );
-  assert.deepEqual(bodies(b1), ["a1 to b", "a2 to b", "a1 rotated"]);
-  assert.deepEqual(bodies(b2), ["a1 to b", "a2 to b", "a1 rotated"]);
-  assert.equal(await a2.messenger.rotate(), true);
-  assert.equal(await b2.messenger.rotate(), true);
-  assert.deepEqual(await b2.messenger.send(idA, "b2 to a", "y1"), { ok: true });
-  await until(() => a1.inbox.length === 1 && a2.inbox.length === 1, "back");
-  assert.deepEqual([bodies(a1), bodies(a2)], [["b2 to a"], ["b2 to a"]]);
-
-  const crossSession = {
-    ...toB1,
-    id: "z1",
-    envelope: {
-      ...(toB1.envelope as Json),
-      session: b2.messenger.session?.session,
-    },
-  };
-  inject(b2, crossSession);
-  inject(b2, toB2);
-  const toA = lastDelivery(a1);
-  inject(b1, {
-    ...toA,
-    id: "z2",
-    envelope: {
-      ...(toA.envelope as Json),
-      session: b1.messenger.session?.session,
-    },
-  });
-  await until(() => b2.inbox.length === 4 && b1.inbox.length === 4, "cross");
-  assert.equal(b2.inbox.at(-1)?.body, null);
-  assert.equal(b1.inbox.at(-1)?.body, null);
-
-  const oldB1 = b1.messenger.session?.session;
-  b1.messenger.stop();
-  b1.messenger.start();
-  await until(() => b1.messenger.state.active, "b1 fresh");
-  assert.notEqual(b1.messenger.session?.session, oldB1);
-  assert.deepEqual(b1.messenger.session?.epochs, [0]);
-  assert.deepEqual(b2.messenger.session?.epochs, [0, 1]);
-  inject(b1, {
-    ...toB1,
-    id: "z3",
-    envelope: {
-      ...(toB1.envelope as Json),
-      session: b1.messenger.session?.session,
-    },
-  });
-  assert.deepEqual(await a2.messenger.send(idB, "after reconnect", "x4"), {
+  await until(() => reader.inbox.length === 2, "after rotation");
+  assert.equal(reader.inbox[1].body, "after rotation");
+  assert.deepEqual(await reader.messenger.send(a.id, "reply", "y1"), {
     ok: true,
   });
-  await until(
-    () => b1.inbox.length === 6 && b2.inbox.length === 5,
-    "reconnected",
-  );
-  assert.equal(b1.inbox[4].body, null);
-  assert.equal(b1.inbox[5].body, "after reconnect");
-  assert.equal(b2.inbox[4].body, "after reconnect");
-  assert.equal(
-    frames(a2.sent, "send")
-      .map((f) => ((f.payload as Json).envelopes as Json[]).length)
-      .at(-1),
-    2,
+  await until(() => a.inbox.length === 1, "reply");
+  assert.equal(a.inbox[0].body, "reply");
+
+  const outer = reader.messenger.session?.session;
+  reader.messenger.stop();
+  reader.messenger.start();
+  await until(() => reader.messenger.state.active, "fresh outer session");
+  assert.notEqual(reader.messenger.session?.session, outer);
+  inject(reader, old);
+  inject(reader, {
+    ...old,
+    envelope: {
+      ...(old.envelope as Json),
+      session: reader.messenger.session?.session,
+    },
+  });
+  assert.deepEqual(await a.messenger.send(b.id, "after reconnect", "x3"), {
+    ok: true,
+  });
+  await until(() => reader.inbox.length === 3, "after reconnect");
+  assert.equal(reader.inbox.at(-1)?.body, "after reconnect");
+  assert.deepEqual(
+    reader.inbox.map((m) => m.body),
+    ["first", "after rotation", "after reconnect"],
   );
 });

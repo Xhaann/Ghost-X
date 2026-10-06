@@ -3,6 +3,11 @@ import type { ExchangeKey } from "./encryption.ts";
 import { isCanonicalExchangeKey } from "./fingerprint.ts";
 import { type IdentityKey, parseIdentity, verify } from "./identity.ts";
 import {
+  type Generate,
+  type RatchetKeyPair,
+  generateRatchetKey,
+} from "./ratchet.ts";
+import {
   confirmSize,
   deviceIdSize,
   exchangeKeySize,
@@ -11,20 +16,20 @@ import {
 
 export { confirmSize, deviceIdSize };
 
-export const handshakeVersion = 1;
+export const handshakeVersion = 2;
 export const initiationIdSize = 16;
 
 const exchange = { name: "X25519" };
 const encoder = new TextEncoder();
 const signedContext = encoder.encode("ghostx/prekey/signed/v1\0");
 const onetimeContext = encoder.encode("ghostx/prekey/onetime/v1\0");
-const transcriptContext = encoder.encode("ghostx/x3dh/v1\0");
-const proofContext = encoder.encode("ghostx/x3dh/initiate/v1\0");
+const transcriptContext = encoder.encode("ghostx/x3dh/v2\0");
+const proofContext = encoder.encode("ghostx/x3dh/initiate/v2\0");
 const curvePrefix = new Uint8Array(32).fill(0xff);
 const labels = {
-  root: encoder.encode("ghostx/x3dh/v1/root\0"),
-  initiator: encoder.encode("ghostx/x3dh/v1/confirm/initiator\0"),
-  responder: encoder.encode("ghostx/x3dh/v1/confirm/responder\0"),
+  root: encoder.encode("ghostx/x3dh/v2/root\0"),
+  initiator: encoder.encode("ghostx/x3dh/v2/confirm/initiator\0"),
+  responder: encoder.encode("ghostx/x3dh/v2/confirm/responder\0"),
 };
 
 export type Prekey = { id: number; key: string; signature: string };
@@ -40,6 +45,7 @@ export type Transcript = {
   signed: { id: number; key: Uint8Array<ArrayBuffer> };
   onetime: { id: number; key: Uint8Array<ArrayBuffer> } | null;
   ephemeral: Uint8Array<ArrayBuffer>;
+  ratchet: Uint8Array<ArrayBuffer>;
 };
 
 export type Initiation = {
@@ -47,18 +53,24 @@ export type Initiation = {
   signed: number;
   onetime: number | null;
   ephemeral: string;
+  ratchet: string;
   proof: string;
   confirm: string;
 };
 
 export type Pending = {
   id: string;
-  root: CryptoKey;
+  secret: Uint8Array<ArrayBuffer>;
   responder: CryptoKey;
   transcript: Uint8Array<ArrayBuffer>;
+  ratchet: RatchetKeyPair;
 };
 
-export type Established = { id: string; root: CryptoKey; accept: string };
+export type Established = {
+  id: string;
+  secret: Uint8Array<ArrayBuffer>;
+  accept: string;
+};
 
 function concat(...parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));
@@ -170,6 +182,7 @@ export function transcriptBytes(t: Transcript): Uint8Array<ArrayBuffer> | null {
     t.responderStatic,
     t.signed.key,
     t.ephemeral,
+    t.ratchet,
     ...(t.onetime ? [t.onetime.key] : []),
   ];
   if (
@@ -195,6 +208,7 @@ export function transcriptBytes(t: Transcript): Uint8Array<ArrayBuffer> | null {
       ? [Uint8Array.of(1), u32(t.onetime.id), t.onetime.key]
       : [Uint8Array.of(0)]),
     t.ephemeral,
+    t.ratchet,
   );
 }
 
@@ -228,7 +242,7 @@ export async function derive(
   transcript: Uint8Array<ArrayBuffer>,
 ): Promise<{
   id: string;
-  root: CryptoKey;
+  secret: Uint8Array<ArrayBuffer>;
   initiator: CryptoKey;
   responder: CryptoKey;
 }> {
@@ -237,26 +251,32 @@ export async function derive(
     concat(curvePrefix, ...secrets),
     "HKDF",
     false,
-    ["deriveKey"],
+    ["deriveKey", "deriveBits"],
   );
   const salt = new Uint8Array(32);
-  const key = (label: Uint8Array, usages: KeyUsage[]) =>
+  const params = (label: Uint8Array) => ({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt,
+    info: concat(label, transcript),
+  });
+  const key = (label: Uint8Array) =>
     crypto.subtle.deriveKey(
-      { name: "HKDF", hash: "SHA-256", salt, info: concat(label, transcript) },
+      params(label),
       material,
       { name: "HMAC", hash: "SHA-256", length: 256 },
       false,
-      usages,
+      ["sign", "verify"],
     );
-  const [root, initiator, responder, digest] = await Promise.all([
-    key(labels.root, ["sign"]),
-    key(labels.initiator, ["sign", "verify"]),
-    key(labels.responder, ["sign", "verify"]),
+  const [secret, initiator, responder, digest] = await Promise.all([
+    crypto.subtle.deriveBits(params(labels.root), material, 256),
+    key(labels.initiator),
+    key(labels.responder),
     crypto.subtle.digest("SHA-256", transcript),
   ]);
   return {
     id: encodeBase64Url(new Uint8Array(digest).slice(0, initiationIdSize)),
-    root,
+    secret: new Uint8Array(secret),
     initiator,
     responder,
   };
@@ -273,8 +293,10 @@ export type VerifiedBundle = {
 export async function initiate(
   own: { identity: IdentityKey; exchange: ExchangeKey },
   peer: VerifiedBundle,
+  generate: Generate = generateRatchetKey,
 ): Promise<{ initiation: Initiation; pending: Pending } | null> {
   try {
+    const ratchet = await generate();
     const pair = (await crypto.subtle.generateKey(exchange, false, [
       "deriveBits",
     ])) as CryptoKeyPair;
@@ -290,6 +312,7 @@ export async function initiate(
       signed: peer.signed,
       onetime: peer.onetime,
       ephemeral,
+      ratchet: ratchet.publicKey,
     };
     const transcript = transcriptBytes(t);
     const proofInput = proofMessage(t);
@@ -317,14 +340,16 @@ export async function initiate(
         signed: peer.signed.id,
         onetime: peer.onetime?.id ?? null,
         ephemeral: encodeBase64Url(ephemeral),
+        ratchet: encodeBase64Url(ratchet.publicKey),
         proof,
         confirm: encodeBase64Url(new Uint8Array(confirm)),
       },
       pending: {
         id: derived.id,
-        root: derived.root,
+        secret: derived.secret,
         responder: derived.responder,
         transcript,
+        ratchet,
       },
     };
   } catch {
@@ -349,14 +374,22 @@ export async function respond(
     fromStatic: Uint8Array<ArrayBuffer>;
     device: string;
     ephemeral: string;
+    ratchet: string;
     proof: string;
     confirm: string;
   },
 ): Promise<Established | null> {
   try {
     const ephemeral = decodeBase64Url(initiation.ephemeral, exchangeKeySize);
+    const ratchet = decodeBase64Url(initiation.ratchet, exchangeKeySize);
     const confirm = decodeBase64Url(initiation.confirm, confirmSize);
-    if (!ephemeral || !confirm || !isCanonicalExchangeKey(ephemeral)) {
+    if (
+      !ephemeral ||
+      !ratchet ||
+      !confirm ||
+      !isCanonicalExchangeKey(ephemeral) ||
+      !isCanonicalExchangeKey(ratchet)
+    ) {
       return null;
     }
     const t: Transcript = {
@@ -370,6 +403,7 @@ export async function respond(
         ? { id: keys.onetime.id, key: keys.onetime.key }
         : null,
       ephemeral,
+      ratchet,
     };
     const transcript = transcriptBytes(t);
     const proofInput = proofMessage(t);
@@ -410,7 +444,7 @@ export async function respond(
     );
     return {
       id: derived.id,
-      root: derived.root,
+      secret: derived.secret,
       accept: encodeBase64Url(new Uint8Array(accept)),
     };
   } catch {
@@ -419,7 +453,8 @@ export async function respond(
 }
 
 export async function confirmAcceptance(
-  pending: Pending,
+  responder: CryptoKey,
+  transcript: Uint8Array<ArrayBuffer>,
   accept: string,
 ): Promise<boolean> {
   const tag = decodeBase64Url(accept, confirmSize);
@@ -427,12 +462,7 @@ export async function confirmAcceptance(
     return false;
   }
   try {
-    return await crypto.subtle.verify(
-      "HMAC",
-      pending.responder,
-      tag,
-      pending.transcript,
-    );
+    return await crypto.subtle.verify("HMAC", responder, tag, transcript);
   } catch {
     return false;
   }

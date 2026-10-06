@@ -19,7 +19,8 @@ const (
 	SaltSize      = 32
 	IVSize        = 12
 	TagSize       = 16
-	MaxCiphertext = MaxBodySize + TagSize
+	RatchetHeader = 1 + 16 + 32 + 4 + 4
+	MaxCiphertext = MaxBodySize + RatchetHeader + TagSize + TagSize
 	MinCiphertext = 1 + TagSize
 )
 

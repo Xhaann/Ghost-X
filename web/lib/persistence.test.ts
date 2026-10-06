@@ -1,34 +1,23 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Authenticator } from "./auth.ts";
-import { Client } from "./client.ts";
 import { Conversations } from "./conversations.ts";
-import { History } from "./history.ts";
-import { Messenger } from "./messenger.ts";
-import { WebSocketTransport } from "./socket.ts";
 import {
-  created,
+  type SecureDevice,
   freePort,
   memoryStore,
+  secureDevice,
   startServer,
   stopServer,
-  track,
   useServer,
 } from "./testing.ts";
-import { type Unlocked, loadVault } from "./vault.ts";
 
 useServer();
 
 type Store = ReturnType<typeof memoryStore>;
 
-type Device = Unlocked & {
-  store: Store;
-  history: History;
+type Device = SecureDevice & {
   rejected: number;
-  client: Client;
   conversations: Conversations;
-  socket: WebSocket;
-  frames: string[];
   shutdown: () => Promise<void>;
 };
 
@@ -43,69 +32,22 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
 }
 
 async function boot(port: number, store: Store): Promise<Device> {
-  const vault = await loadVault(store);
-  assert.equal(vault.status, "ready");
-  const unlocked = vault as Unlocked;
-  const history = await History.open(
-    store,
-    unlocked.keys,
-    unlocked.integrity,
-    unlocked.storage,
-  );
-  const { restored, rejected } = await history.restore();
-
-  const before = created.length;
-  const frames: string[] = [];
-  const transport = track(
-    new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
-  );
-  const transmit = transport.send.bind(transport);
-  transport.send = (data: string) => {
-    frames.push(data);
-    return transmit(data);
-  };
-  transport.onData((data) => frames.push(data));
-  const client = track(new Client(transport));
-  const auth = new Authenticator(client, unlocked.keys.identity);
-  const messenger = new Messenger(
-    client,
-    auth,
-    unlocked.keys.identity,
-    unlocked.keys.exchange,
-  );
-  const conversations = new Conversations(
-    messenger,
-    unlocked.keys.identity.identity,
-    { history, restored },
-  );
-  let stopped = false;
-  const shutdown = async () => {
-    if (stopped) {
-      return;
-    }
-    stopped = true;
-    conversations.stop();
-    messenger.stop();
-    auth.stop();
-    client.close();
-    await history.close();
-  };
-  track({ close: () => void shutdown() });
-  auth.start();
-  messenger.start();
+  const device = await secureDevice(port, { store });
+  const { restored, rejected } = await device.history.restore();
+  const conversations = new Conversations(device.messenger, device.id, {
+    history: device.history,
+    restored,
+  });
   conversations.start();
-  client.open();
   await until(() => conversations.state.connected, "connected");
   return {
-    ...unlocked,
-    store,
-    history,
+    ...device,
     rejected,
-    client,
     conversations,
-    socket: created[before],
-    frames,
-    shutdown,
+    shutdown: async () => {
+      conversations.stop();
+      await device.shutdown();
+    },
   };
 }
 
@@ -155,10 +97,6 @@ test("a reloaded device keeps its identity, keys, and encrypted history", async 
   const idB = b.keys.identity.identity;
   assert.equal(a.created, true);
 
-  const captured: string[] = [];
-  b.socket.addEventListener("message", (event) =>
-    captured.push(String(event.data)),
-  );
   a.conversations.open(idB);
   const first = send(a, "before reload");
   assert.equal(await first.delivery, "delivered");
@@ -167,7 +105,7 @@ test("a reloaded device keeps its identity, keys, and encrypted history", async 
   assert.equal(await send(b, "reply before reload").delivery, "delivered");
   await until(() => thread(a, idB).length === 2, "a receives reply");
   await b.history.flush();
-  const frame = captured.find((data) => data.includes(first.id));
+  const frame = b.received.find((data) => data.includes(first.id));
   assert.ok(frame);
 
   await b.shutdown();
@@ -185,8 +123,8 @@ test("a reloaded device keeps its identity, keys, and encrypted history", async 
   ]);
   assert.equal(unread(b, idA), 0);
 
-  b.socket.dispatchEvent(new MessageEvent("message", { data: frame }));
-  b.socket.dispatchEvent(new MessageEvent("message", { data: frame }));
+  b.deliver(frame);
+  b.deliver(frame);
   assert.equal(await send(a, "after reload").delivery, "delivered");
   await until(() => thread(b, idA).length === 3, "b receives after reload");
   await new Promise((resolve) => setTimeout(resolve, 50));
@@ -283,9 +221,11 @@ test("an undelivered message is persisted encrypted as not delivered", async () 
 
   a.conversations.open(idB);
   const deadline = Date.now() + 5000;
-  while ((await send(a, "probe").delivery) !== "unavailable") {
+  while (await a.messenger.lookup(idB)) {
     assert.ok(Date.now() < deadline);
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
+  assert.equal(await send(a, "probe").delivery, "unavailable");
   assert.equal(await send(a, "undelivered secret").delivery, "unavailable");
   await a.history.flush();
   assertSealedAtRest(storeA, ["undelivered secret", "probe"]);

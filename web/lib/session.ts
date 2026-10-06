@@ -21,7 +21,6 @@ import {
 
 const exchange = { name: "X25519" };
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
 const sessionContext = encoder.encode("ghostx/session/v1\0");
 const messageContext = encoder.encode("ghostx/message/v2\0");
 
@@ -311,7 +310,10 @@ export class SessionKeys {
       : null;
   }
 
-  async seal(t: Transcript, body: string): Promise<Sealed | null> {
+  async seal(
+    t: Transcript,
+    plaintext: Uint8Array<ArrayBuffer>,
+  ): Promise<Sealed | null> {
     const own = [this.#current, this.#previous].find(
       (key) => key !== null && key.epoch === t.from.epoch,
     );
@@ -340,7 +342,7 @@ export class SessionKeys {
       const ciphertext = await crypto.subtle.encrypt(
         { name: "AES-GCM", iv, additionalData },
         key,
-        encoder.encode(body),
+        plaintext,
       );
       return {
         salt: encodeBase64Url(salt),
@@ -352,7 +354,10 @@ export class SessionKeys {
     }
   }
 
-  async open(t: Transcript, sealed: Sealed): Promise<string | null> {
+  async open(
+    t: Transcript,
+    sealed: Sealed,
+  ): Promise<Uint8Array<ArrayBuffer> | null> {
     const own = [this.#current, this.#previous].find(
       (key) => key !== null && key.epoch === t.to.epoch,
     );
@@ -388,7 +393,7 @@ export class SessionKeys {
         key,
         ciphertext,
       );
-      return decoder.decode(plaintext);
+      return new Uint8Array(plaintext);
     } catch {
       return null;
     }

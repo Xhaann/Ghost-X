@@ -59,7 +59,12 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
         History.open(store, vault.keys, vault.integrity, vault.storage),
         Trust.open(store, vault.integrity),
         PrekeyStore.open(store, vault.keys, vault.integrity),
-        Pairs.open(store, vault.integrity),
+        Pairs.open(
+          store,
+          vault.integrity,
+          vault.storage,
+          vault.keys.identity.identity,
+        ),
       ]);
       const session = {
         keys: vault.keys,

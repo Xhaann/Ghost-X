@@ -43,17 +43,18 @@ func TestAsynchronousInitiationWaitsForTheRecipient(t *testing.T) {
 		t.Fatalf("bundle = %+v %s", bundle, bundle.Payload)
 	}
 	ephemeral := exchangeRaw(t)
+	ratchet := exchangeRaw(t)
 	id := uint32(5)
 	tr := protocol.Transcript{
 		Initiator: decoded(aKey.identity), Responder: decoded(bKey.identity),
 		InitiatorStatic: a.staticRaw, ResponderStatic: b.staticRaw,
 		Device: decoded(deviceID), Signed: 1, SignedKey: signedRaw,
-		Onetime: &id, OnetimeKey: onetimeRaw, Ephemeral: ephemeral,
+		Onetime: &id, OnetimeKey: onetimeRaw, Ephemeral: ephemeral, Ratchet: ratchet,
 	}
 	proof := base64.RawURLEncoding.EncodeToString(ed25519.Sign(aKey.private, protocol.ProofMessage(tr)))
 	eph := base64.RawURLEncoding.EncodeToString(ephemeral)
 	confirm := randomText(protocol.ConfirmSize)
-	initiate := fmt.Sprintf(`{"type":"initiate","id":"i1","payload":{"version":1,"to":%q,"device":%q,"signed":1,"onetime":5,"ephemeral":%q,"proof":%q,"confirm":%q}}`, bKey.identity, deviceID, eph, proof, confirm)
+	initiate := fmt.Sprintf(`{"type":"initiate","id":"i1","payload":{"version":2,"to":%q,"device":%q,"signed":1,"onetime":5,"ephemeral":%q,"ratchet":%q,"proof":%q,"confirm":%q}}`, bKey.identity, deviceID, eph, base64.RawURLEncoding.EncodeToString(ratchet), proof, confirm)
 	a.write(t, initiate)
 	if msg := a.next(t); msg.Type != "initiated" {
 		t.Fatalf("initiate = %+v %s", msg, msg.Payload)

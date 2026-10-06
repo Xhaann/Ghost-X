@@ -35,6 +35,19 @@ async function party(identity?: IdentityKey, exchange?: ExchangeKey) {
   };
 }
 
+function bytes(text: string): Uint8Array<ArrayBuffer> {
+  return new TextEncoder().encode(text);
+}
+
+async function openText(
+  session: SessionKeys,
+  t: Transcript,
+  sealed: Sealed,
+): Promise<string | null> {
+  const plaintext = await session.open(t, sealed);
+  return plaintext ? new TextDecoder().decode(plaintext) : null;
+}
+
 function side(p: Party, epoch?: number): Side {
   const current = p.session.current;
   assert.ok(current);
@@ -55,7 +68,7 @@ function transcript(from: Party, to: Party, id = "m1"): Transcript {
 }
 
 async function seal(t: Transcript, from: Party, body: string): Promise<Sealed> {
-  const sealed = await from.session.seal(t, body);
+  const sealed = await from.session.seal(t, bytes(body));
   assert.ok(sealed);
   return sealed;
 }
@@ -205,16 +218,20 @@ test("both peers derive the same message keys in each direction", async () => {
   const b = await party();
   const body = "hello 🌍 \n\t multi-line";
   const ab = transcript(a, b);
-  assert.equal(await b.session.open(ab, await seal(ab, a, body)), body);
+  assert.equal(await openText(b.session, ab, await seal(ab, a, body)), body);
   const ba = transcript(b, a, "r1");
-  assert.equal(await a.session.open(ba, await seal(ba, b, "reply")), "reply");
-  const max = "a".repeat(maxBodySize);
+  assert.equal(
+    await openText(a.session, ba, await seal(ba, b, "reply")),
+    "reply",
+  );
+  const max = "a".repeat(maxCiphertextSize - 16);
+  assert.ok(max.length > maxBodySize);
   const big = await seal(ab, a, max);
   assert.equal(
     decodeBase64Url(big.ciphertext, maxCiphertextSize)?.length,
     maxCiphertextSize,
   );
-  assert.equal(await b.session.open(ab, big), max);
+  assert.equal(await openText(b.session, ab, big), max);
 });
 
 test("binds every transcript field into derivation and authenticated data", async () => {
@@ -252,14 +269,14 @@ test("binds every transcript field into derivation and authenticated data", asyn
     encodeBase64Url(derivationInfo(t) ?? new Uint8Array()),
   ]);
   for (const [name, variant] of Object.entries(variants)) {
-    assert.equal(await b.session.open(variant, sealed), null, name);
+    assert.equal(await openText(b.session, variant, sealed), null, name);
     infos.add(
       encodeBase64Url(derivationInfo(variant) ?? new Uint8Array()) +
         encodeBase64Url(associatedData(variant) ?? new Uint8Array()),
     );
   }
   assert.equal(infos.size, Object.keys(variants).length + 1);
-  assert.equal(await b.session.open(t, sealed), "bound");
+  assert.equal(await openText(b.session, t, sealed), "bound");
 
   const info = derivationInfo(t);
   const aad = associatedData(t);
@@ -361,18 +378,21 @@ test("enforces sender and recipient roles", async () => {
   const t = transcript(a, b);
   const sealed = await seal(t, a, "for b");
 
-  assert.equal(await a.session.open(t, sealed), null);
-  assert.equal(await c.session.open(t, sealed), null);
-  assert.equal(await c.session.open({ ...t, to: side(c) }, sealed), null);
-  assert.equal(await b.session.seal(t, "wrong sender"), null);
+  assert.equal(await openText(a.session, t, sealed), null);
+  assert.equal(await openText(c.session, t, sealed), null);
+  assert.equal(await openText(c.session, { ...t, to: side(c) }, sealed), null);
+  assert.equal(await b.session.seal(t, bytes("wrong sender")), null);
   assert.equal(
-    await a.session.seal({ ...t, from: { ...t.from, epoch: 3 } }, "no key"),
+    await a.session.seal(
+      { ...t, from: { ...t.from, epoch: 3 } },
+      bytes("no key"),
+    ),
     null,
   );
   assert.equal(
     await a.session.seal(
       { ...t, from: { ...t.from, ephemeral: side(c).ephemeral } },
-      "foreign key",
+      bytes("foreign key"),
     ),
     null,
   );
@@ -394,7 +414,7 @@ test("rejects tampered or malformed envelopes and uses fresh randomness", async 
     { ...sealed, ciphertext: "not base64!" },
     { ...sealed, ciphertext: encodeBase64Url(new Uint8Array(16)) },
   ]) {
-    assert.equal(await b.session.open(t, bad), null);
+    assert.equal(await openText(b.session, t, bad), null);
   }
   const many = await Promise.all(
     Array.from({ length: 50 }, () => seal(t, a, "same")),
@@ -409,21 +429,22 @@ test("forward secrecy: discarded epochs cannot be recovered from remaining state
   const b = await party();
   const t0 = transcript(a, b, "m0");
   const m0 = await seal(t0, a, "protected by epoch 0");
-  assert.equal(await b.session.open(t0, m0), "protected by epoch 0");
+  assert.equal(await openText(b.session, t0, m0), "protected by epoch 0");
   const keyB0 = b.session.current?.key;
   const keyA0 = a.session.current?.key;
 
   assert.equal(await rotate(b), 1);
   assert.deepEqual(b.session.epochs, [0, 1]);
   assert.notDeepEqual(b.session.current?.key, keyB0);
-  assert.equal(await b.session.open(t0, m0), "protected by epoch 0");
+  assert.equal(await openText(b.session, t0, m0), "protected by epoch 0");
 
   const t1 = transcript(a, b, "m1");
   assert.equal(t1.to.epoch, 1);
   const m1 = await seal(t1, a, "protected by epoch 1");
-  assert.equal(await b.session.open(t1, m1), "protected by epoch 1");
+  assert.equal(await openText(b.session, t1, m1), "protected by epoch 1");
   assert.equal(
-    await b.session.open(
+    await openText(
+      b.session,
       {
         ...t1,
         to: { ...t1.to, epoch: 0, ephemeral: keyB0 ?? new Uint8Array() },
@@ -442,13 +463,13 @@ test("forward secrecy: discarded epochs cannot be recovered from remaining state
   assert.equal(a.session.publicKeyOf(0), null);
   assert.notDeepEqual(a.session.current?.key, keyA0);
 
-  assert.equal(await b.session.open(t0, m0), null);
+  assert.equal(await openText(b.session, t0, m0), null);
   const reboundToCurrent: Transcript = { ...t0, to: side(b) };
-  assert.equal(await b.session.open(reboundToCurrent, m0), null);
+  assert.equal(await openText(b.session, reboundToCurrent, m0), null);
   const reboundBoth: Transcript = { ...t0, from: side(a), to: side(b) };
-  assert.equal(await b.session.open(reboundBoth, m0), null);
-  assert.equal(await a.session.open(t0, m0), null);
-  assert.equal(await a.session.open({ ...t0, to: side(a) }, m0), null);
+  assert.equal(await openText(b.session, reboundBoth, m0), null);
+  assert.equal(await openText(a.session, t0, m0), null);
+  assert.equal(await openText(a.session, { ...t0, to: side(a) }, m0), null);
   for (const holder of [a, b]) {
     assert.equal(
       await holder.exchange.openLegacy(
@@ -466,16 +487,21 @@ test("forward secrecy: discarded epochs cannot be recovered from remaining state
   }
   const fresh = await SessionKeys.create();
   assert.equal(
-    await fresh.open({ ...t0, to: { ...t0.to, session: fresh.session } }, m0),
+    await openText(
+      fresh,
+      { ...t0, to: { ...t0.to, session: fresh.session } },
+      m0,
+    ),
     null,
   );
 
   const t2 = transcript(a, b, "m2");
   assert.equal(t2.from.epoch, 2);
   const m2 = await seal(t2, a, "after rotation");
-  assert.equal(await b.session.open(t2, m2), "after rotation");
+  assert.equal(await openText(b.session, t2, m2), "after rotation");
   assert.equal(
-    await b.session.open(
+    await openText(
+      b.session,
       {
         ...t2,
         from: { ...t2.from, epoch: 0, ephemeral: keyA0 ?? new Uint8Array() },
@@ -514,10 +540,10 @@ test("epoch transitions are strict and destruction is final", async () => {
   assert.equal(a.session.current, null);
   assert.equal(a.session.publicKeyOf(2), null);
   assert.equal(await a.session.prepare(), null);
-  assert.equal(await a.session.seal(t, "after destroy"), null);
-  assert.equal(await a.session.open(reply, back), null);
+  assert.equal(await a.session.seal(t, bytes("after destroy")), null);
+  assert.equal(await openText(a.session, reply, back), null);
   assert.equal(await a.session.bind(a.identity, a.exchange, "current"), null);
-  assert.equal(await b.session.open(t, sealed), "x");
+  assert.equal(await openText(b.session, t, sealed), "x");
 });
 
 test("sessions of the same identity are cryptographically isolated", async () => {
@@ -530,11 +556,15 @@ test("sessions of the same identity are cryptographically isolated", async () =>
 
   const toA1 = transcript(b, a1);
   const sealed = await seal(toA1, b, "only a1");
-  assert.equal(await a1.session.open(toA1, sealed), "only a1");
-  assert.equal(await a2.session.open(toA1, sealed), null);
-  assert.equal(await a2.session.open({ ...toA1, to: side(a2) }, sealed), null);
+  assert.equal(await openText(a1.session, toA1, sealed), "only a1");
+  assert.equal(await openText(a2.session, toA1, sealed), null);
   assert.equal(
-    await a2.session.open(
+    await openText(a2.session, { ...toA1, to: side(a2) }, sealed),
+    null,
+  );
+  assert.equal(
+    await openText(
+      a2.session,
       { ...toA1, to: { ...side(a2), session: a1.session.session } },
       sealed,
     ),
@@ -544,10 +574,10 @@ test("sessions of the same identity are cryptographically isolated", async () =>
   const toA2 = transcript(b, a2, "m2");
   const other = await seal(toA2, b, "only a2");
   assert.notEqual(other.ciphertext, sealed.ciphertext);
-  assert.equal(await a1.session.open(toA2, other), null);
-  assert.equal(await a2.session.open(toA2, other), "only a2");
+  assert.equal(await openText(a1.session, toA2, other), null);
+  assert.equal(await openText(a2.session, toA2, other), "only a2");
   await rotate(a1);
-  assert.equal(await a2.session.open(toA2, other), "only a2");
+  assert.equal(await openText(a2.session, toA2, other), "only a2");
   assert.deepEqual(a2.session.epochs, [0]);
 });
 

@@ -53,6 +53,7 @@ type Initiation struct {
 	Signed    uint32
 	Onetime   *uint32
 	Ephemeral string
+	Ratchet   string
 	Proof     string
 	Confirm   string
 }

@@ -13,14 +13,14 @@ import (
 const (
 	DeviceIDSize     = 16
 	ConfirmSize      = 32
-	HandshakeVersion = 1
+	HandshakeVersion = 2
 )
 
 const (
 	signedContext     = "ghostx/prekey/signed/v1\x00"
 	onetimeContext    = "ghostx/prekey/onetime/v1\x00"
-	transcriptContext = "ghostx/x3dh/v1\x00"
-	proofContext      = "ghostx/x3dh/initiate/v1\x00"
+	transcriptContext = "ghostx/x3dh/v2\x00"
+	proofContext      = "ghostx/x3dh/initiate/v2\x00"
 )
 
 type prekeyPayload struct {
@@ -52,6 +52,7 @@ type initiationPayload struct {
 	Signed    uint32  `json:"signed"`
 	Onetime   *uint32 `json:"onetime"`
 	Ephemeral string  `json:"ephemeral"`
+	Ratchet   string  `json:"ratchet"`
 	Proof     string  `json:"proof"`
 	Confirm   string  `json:"confirm"`
 }
@@ -89,6 +90,7 @@ type Transcript struct {
 	Onetime                          *uint32
 	OnetimeKey                       []byte
 	Ephemeral                        []byte
+	Ratchet                          []byte
 }
 
 func (t Transcript) Bytes() []byte {
@@ -106,7 +108,8 @@ func (t Transcript) Bytes() []byte {
 	} else {
 		out = append(out, 0)
 	}
-	return append(out, t.Ephemeral...)
+	out = append(out, t.Ephemeral...)
+	return append(out, t.Ratchet...)
 }
 
 func ProofMessage(t Transcript) []byte {
@@ -243,8 +246,8 @@ func decodeOptionalID(raw json.RawMessage) (*uint32, error) {
 
 func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHandler {
 	return func(c *Conn, id identity.Identity, payload []byte) (Reply, error) {
-		fields, err := decodeObject(payload, "version", "to", "device", "signed", "onetime", "ephemeral", "proof", "confirm")
-		if err != nil || string(fields["version"]) != "1" {
+		fields, err := decodeObject(payload, "version", "to", "device", "signed", "onetime", "ephemeral", "ratchet", "proof", "confirm")
+		if err != nil || string(fields["version"]) != "2" {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
 		encoded, err := decodeString(fields["to"])
@@ -269,6 +272,10 @@ func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHand
 		}
 		ephemeral, ephemeralRaw, err := decodeFixed(fields["ephemeral"], KeySize)
 		if err != nil || !CanonicalExchangeKey(ephemeralRaw) {
+			return Reply{}, &Error{Code: CodeInvalidPayload}
+		}
+		ratchet, ratchetRaw, err := decodeFixed(fields["ratchet"], KeySize)
+		if err != nil || !CanonicalExchangeKey(ratchetRaw) {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
 		proof, err := decodeString(fields["proof"])
@@ -304,6 +311,7 @@ func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHand
 			SignedKey:       decodedText(spk.Key),
 			Onetime:         onetime,
 			Ephemeral:       ephemeralRaw,
+			Ratchet:         ratchetRaw,
 		}
 		if onetime != nil {
 			key, ok := prekeys.Onetime(to, device, *onetime)
@@ -321,6 +329,7 @@ func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHand
 			Signed:    signed,
 			Onetime:   onetime,
 			Ephemeral: ephemeral,
+			Ratchet:   ratchet,
 			Proof:     proof,
 			Confirm:   confirm,
 		}
@@ -400,6 +409,7 @@ func EncodeEvent(e prekey.Event) []byte {
 		Signed:    i.Signed,
 		Onetime:   i.Onetime,
 		Ephemeral: i.Ephemeral,
+		Ratchet:   i.Ratchet,
 		Proof:     i.Proof,
 		Confirm:   i.Confirm,
 	})

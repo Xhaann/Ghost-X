@@ -9,7 +9,6 @@ import {
   verifyPrekey,
 } from "./handshake.ts";
 import { IdentityKey } from "./identity.ts";
-import { type PairState, Pairs, parsePair } from "./pairs.ts";
 import {
   PrekeyStore,
   consumedLimit,
@@ -276,61 +275,6 @@ test("corrupted prekey state fails closed without touching the identity", async 
       name,
     );
     assert.equal(b.store.data.get("vault:prekeys"), value, name);
-  }
-});
-
-test("pair state persists, verifies acceptance, and fails closed when corrupted", async () => {
-  const store = memoryStore();
-  const vault = (await loadVault(store)) as Unlocked;
-  const b = await owner();
-  const pairs = await Pairs.open(store, vault.integrity);
-  const { a, started, run } = await initiation(b);
-  void a;
-  const peer = b.keys.identity.identity;
-  assert.equal(pairs.state(peer), "none");
-  assert.equal(
-    await pairs.savePending(
-      peer,
-      started.initiation.ephemeral,
-      started.pending,
-    ),
-    true,
-  );
-  assert.equal(pairs.state(peer), "pending");
-  const outcome = await b.prekeys.consume(
-    started.initiation.signed,
-    started.initiation.onetime,
-    run,
-  );
-  assert.equal(outcome.status, "consumed");
-  const accept = outcome.status === "consumed" ? outcome.value.accept : "";
-  assert.equal(await pairs.accept(peer, flipped(accept), accept), false);
-  assert.equal(
-    await pairs.accept(peer, started.initiation.ephemeral, flipped(accept)),
-    false,
-  );
-  assert.equal(pairs.state(peer), "pending");
-  assert.equal(
-    await pairs.accept(peer, started.initiation.ephemeral, accept),
-    true,
-  );
-  const reopened = await Pairs.open(store, vault.integrity);
-  const states: PairState[] = [reopened.state(peer)];
-  assert.deepEqual(states, ["established"]);
-  const stored = store.data.get(`pairs:${peer}`) as Record<string, unknown>;
-  assert.ok(parsePair(peer, stored));
-  assert.equal((stored.root as CryptoKey).extractable, false);
-  assert.equal(stored.transcript, null);
-  for (const [name, value] of Object.entries({
-    "state promoted": { ...stored, mac: encodeBase64Url(new Uint8Array(32)) },
-    moved: stored,
-  })) {
-    const key =
-      name === "moved" ? (await IdentityKey.generate()).identity : peer;
-    store.data.set(`pairs:${key}`, value);
-    const check = await Pairs.open(store, vault.integrity);
-    assert.equal(check.state(key), "none", name);
-    assert.ok(check.rejected >= 1, name);
   }
 });
 

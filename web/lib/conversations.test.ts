@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Authenticator } from "./auth.ts";
-import { Client } from "./client.ts";
-import { ExchangeKey } from "./encryption.ts";
+import type { Client } from "./client.ts";
 import {
   type ConversationsState,
   Conversations,
@@ -13,12 +11,12 @@ import {
 import { IdentityKey } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
 import type { Incoming, MessengerState, SendResult } from "./messenger.ts";
-import { Messenger } from "./messenger.ts";
+import type { Messenger } from "./messenger.ts";
 import { maxBodySize } from "./protocol.ts";
-import { WebSocketTransport } from "./socket.ts";
 import {
-  created,
+  type SecureDevice,
   freePort,
+  secureDevice,
   startServer,
   stopServer,
   track,
@@ -496,7 +494,7 @@ type Peer = {
   client: Client;
   messenger: Messenger;
   store: Conversations;
-  socket: WebSocket;
+  device: SecureDevice;
 };
 
 async function until(predicate: () => boolean, what: string): Promise<void> {
@@ -510,30 +508,18 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
 }
 
 async function peer(port: number): Promise<Peer> {
-  const before = created.length;
-  const [key, exchange] = await Promise.all([
-    IdentityKey.generate(),
-    ExchangeKey.generate(),
-  ]);
-  const client = track(
-    new Client(
-      track(
-        new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
-      ),
-    ),
-  );
-  const auth = new Authenticator(client, key);
-  const messenger = new Messenger(client, auth, key, exchange);
-  const store = new Conversations(messenger, key.identity);
+  const device = await secureDevice(port);
+  const store = new Conversations(device.messenger, device.id);
   track({ close: () => store.stop() });
-  track({ close: () => messenger.stop() });
-  track({ close: () => auth.stop() });
-  auth.start();
-  messenger.start();
   store.start();
-  client.open();
   await until(() => store.state.connected, "connected store");
-  return { key, client, messenger, store, socket: created[before] };
+  return {
+    key: device.keys.identity,
+    client: device.client,
+    messenger: device.messenger,
+    store,
+    device,
+  };
 }
 
 async function barrier(p: Peer): Promise<void> {
@@ -588,18 +574,14 @@ test("real duplicate frames and reconnects do not duplicate messages", async () 
   const a = await peer(port);
   const b = await peer(port);
 
-  const captured: string[] = [];
-  b.socket.addEventListener("message", (event) =>
-    captured.push(String(event.data)),
-  );
   a.store.open(b.key.identity);
   const sent = accepted(a.store, "once");
   await sent.delivery;
   await until(() => bodies(b.store, a.key.identity).length === 1, "delivery");
-  const frame = captured.find((data) => data.includes(sent.id));
+  const frame = b.device.received.find((data) => data.includes(sent.id));
   assert.ok(frame);
-  b.socket.dispatchEvent(new MessageEvent("message", { data: frame }));
-  b.socket.dispatchEvent(new MessageEvent("message", { data: frame }));
+  b.device.deliver(frame);
+  b.device.deliver(frame);
   await barrier(b);
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual(bodies(b.store, a.key.identity), ["once"]);

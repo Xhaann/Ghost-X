@@ -55,7 +55,17 @@ async function recipient(withOnetime = true) {
   return { owner, bundle, keys };
 }
 
-async function same(a: CryptoKey, b: CryptoKey): Promise<boolean> {
+async function same(
+  a: CryptoKey | Uint8Array,
+  b: CryptoKey | Uint8Array,
+): Promise<boolean> {
+  if (a instanceof Uint8Array || b instanceof Uint8Array) {
+    return (
+      a instanceof Uint8Array &&
+      b instanceof Uint8Array &&
+      encodeBase64Url(a) === encodeBase64Url(b)
+    );
+  }
   const data = new TextEncoder().encode("probe");
   const [x, y] = await Promise.all([
     crypto.subtle.sign("HMAC", a, data),
@@ -180,10 +190,21 @@ test("initiator and responder derive the same root with and without a one-time p
     });
     assert.ok(done);
     assert.equal(done.id, started.pending.id);
-    assert.ok(await same(done.root, started.pending.root));
-    assert.equal(await confirmAcceptance(started.pending, done.accept), true);
-    assert.equal(done.root.extractable, false);
-    assert.equal(started.pending.root.extractable, false);
+    assert.ok(await same(done.secret, started.pending.secret));
+    assert.equal(
+      await confirmAcceptance(
+        started.pending.responder,
+        started.pending.transcript,
+        done.accept,
+      ),
+      true,
+    );
+    assert.equal(done.secret.length, 32);
+    assert.equal(
+      started.initiation.ratchet,
+      encodeBase64Url(started.pending.ratchet.publicKey),
+    );
+    assert.equal(started.pending.ratchet.privateKey.extractable, false);
   }
 });
 
@@ -195,7 +216,7 @@ test("every key-agreement input changes the derived root", async () => {
   assert.ok(base && again);
   assert.notEqual(base.initiation.ephemeral, again.initiation.ephemeral);
   assert.notEqual(base.pending.id, again.pending.id);
-  assert.equal(await same(base.pending.root, again.pending.root), false);
+  assert.equal(await same(base.pending.secret, again.pending.secret), false);
   const variants: VerifiedBundle[] = [
     { ...b.bundle, signed: { id: 7, key: (await slot(7)).key } },
     { ...b.bundle, onetime: { id: 42, key: (await slot(42)).key } },
@@ -206,12 +227,12 @@ test("every key-agreement input changes the derived root", async () => {
   for (const variant of variants) {
     const other = await initiate(a, variant);
     assert.ok(other);
-    assert.equal(await same(other.pending.root, base.pending.root), false);
+    assert.equal(await same(other.pending.secret, base.pending.secret), false);
   }
   const otherInitiator = await initiate(await party(), b.bundle);
   assert.ok(otherInitiator);
   assert.equal(
-    await same(otherInitiator.pending.root, base.pending.root),
+    await same(otherInitiator.pending.secret, base.pending.secret),
     false,
   );
 });
@@ -281,6 +302,7 @@ test("the responder rejects any modified transcript, proof, or confirmation", as
       signed: { id: 7, key: b.keys.signed.key },
       onetime: b.keys.onetime && { id: 42, key: b.keys.onetime.key },
       ephemeral: decodeBase64Url(valid.ephemeral, 32) ?? new Uint8Array(),
+      ratchet: decodeBase64Url(valid.ratchet, 32) ?? new Uint8Array(),
     }) ?? new Uint8Array(),
   );
   assert.equal(
@@ -304,14 +326,22 @@ test("roles and derivation domains are separated", async () => {
   });
   assert.ok(done);
   assert.equal(
-    await confirmAcceptance(started.pending, started.initiation.confirm),
+    await confirmAcceptance(
+      started.pending.responder,
+      started.pending.transcript,
+      started.initiation.confirm,
+    ),
     false,
   );
   assert.equal(
-    await confirmAcceptance(started.pending, flip(done.accept)),
+    await confirmAcceptance(
+      started.pending.responder,
+      started.pending.transcript,
+      flip(done.accept),
+    ),
     false,
   );
-  assert.equal(await same(done.root, started.pending.responder), false);
+  assert.equal(await same(done.secret, started.pending.responder), false);
   const reversed = await respond(a, b.keys, {
     from: b.owner.identity.identity,
     fromStatic: b.owner.exchange.publicRaw,
@@ -332,24 +362,26 @@ test("transcripts are canonical and fixed-length", async () => {
     signed: { id: 7, key: b.keys.signed.key },
     onetime: { id: 42, key: b.keys.onetime?.key ?? new Uint8Array(32) },
     ephemeral: (await slot(1)).key,
+    ratchet: (await slot(3)).key,
   };
   const full = transcriptBytes(t);
   const short = transcriptBytes({ ...t, onetime: null });
   assert.ok(full && short);
-  assert.equal(full.length, 15 + 32 * 4 + 16 + 4 + 32 + 1 + 4 + 32 + 32);
+  assert.equal(full.length, 15 + 32 * 4 + 16 + 4 + 32 + 1 + 4 + 32 + 32 + 32);
   assert.equal(short.length, full.length - 36);
-  assert.equal(new TextDecoder().decode(full.slice(0, 15)), "ghostx/x3dh/v1\0");
+  assert.equal(new TextDecoder().decode(full.slice(0, 15)), "ghostx/x3dh/v2\0");
   const proof = proofMessage(t);
   assert.ok(proof);
   assert.equal(
     new TextDecoder().decode(proof.slice(0, 24)),
-    "ghostx/x3dh/initiate/v1\0",
+    "ghostx/x3dh/initiate/v2\0",
   );
   for (const bad of [
     { ...t, initiator: "x" },
     { ...t, device: "AAAA" },
     { ...t, signed: { id: -1, key: t.signed.key } },
     { ...t, ephemeral: new Uint8Array(31) },
+    { ...t, ratchet: new Uint8Array(31) },
   ]) {
     assert.equal(transcriptBytes(bad), null);
   }
@@ -413,6 +445,7 @@ test("the root, identifier, and confirmations bind the entire transcript", async
     signed: { id: 7, key: b.keys.signed.key },
     onetime: { id: 42, key: b.keys.onetime?.key ?? new Uint8Array(32) },
     ephemeral: (await slot(1)).key,
+    ratchet: (await slot(3)).key,
   };
   const variants: Record<string, Transcript> = {
     device: { ...base, device: encodeBase64Url(new Uint8Array(16)) },
@@ -425,19 +458,20 @@ test("the root, identifier, and confirmations bind the entire transcript", async
     initiator: { ...base, initiator: b.owner.identity.identity },
     responder: { ...base, responder: a.identity.identity },
     ephemeral: { ...base, ephemeral: (await slot(2)).key },
+    ratchet: { ...base, ratchet: (await slot(4)).key },
   };
   const bytes = transcriptBytes(base);
   assert.ok(bytes);
   const reference = await derive(secrets, bytes);
   const again = await derive(secrets, bytes);
   assert.equal(again.id, reference.id);
-  assert.ok(await same(again.root, reference.root));
+  assert.ok(await same(again.secret, reference.secret));
   for (const [name, variant] of Object.entries(variants)) {
     const other = transcriptBytes(variant);
     assert.ok(other, name);
     const derived = await derive(secrets, other);
     assert.notEqual(derived.id, reference.id, name);
-    assert.equal(await same(derived.root, reference.root), false, name);
+    assert.equal(await same(derived.secret, reference.secret), false, name);
     assert.equal(
       await same(derived.initiator, reference.initiator),
       false,
@@ -449,7 +483,6 @@ test("the root, identifier, and confirmations bind the entire transcript", async
       name,
     );
   }
-  assert.equal(await same(reference.root, reference.initiator), false);
-  assert.equal(await same(reference.root, reference.responder), false);
   assert.equal(await same(reference.initiator, reference.responder), false);
+  assert.equal(reference.secret.length, 32);
 });

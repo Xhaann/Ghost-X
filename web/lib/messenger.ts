@@ -17,11 +17,15 @@ import {
   isValidId,
   maxBodySize,
 } from "./protocol.ts";
+import type { Channel } from "./pairing.ts";
 import { SessionKeys, type Transcript, verifySession } from "./session.ts";
 
 export type SendResult =
   | { ok: true }
-  | { ok: false; reason: ErrorCode | "not_sent" | "encryption_failed" };
+  | {
+      ok: false;
+      reason: ErrorCode | "not_sent" | "encryption_failed" | "session_pending";
+    };
 
 export type Incoming = { id: string; from: string; body: string | null };
 
@@ -46,6 +50,7 @@ export class Messenger {
   readonly #auth: AuthSource;
   readonly #identity: IdentityKey;
   readonly #exchange: ExchangeKey;
+  readonly #channel: Channel;
   readonly #rotationLimit: number;
   readonly #previousLimit: number;
   readonly #states = new Listeners<MessengerState>();
@@ -67,12 +72,14 @@ export class Messenger {
     auth: AuthSource,
     identity: IdentityKey,
     exchange: ExchangeKey,
+    channel: Channel,
     options: MessengerOptions = {},
   ) {
     this.#client = client;
     this.#auth = auth;
     this.#identity = identity;
     this.#exchange = exchange;
+    this.#channel = channel;
     this.#rotationLimit = options.rotationLimit ?? rotationLimit;
     this.#previousLimit = options.previousLimit ?? previousLimit;
   }
@@ -203,7 +210,7 @@ export class Messenger {
     if (!this.#state.active || !session || session.destroyed) {
       return { ok: false, reason: "authentication_required" };
     }
-    if (!isIdentity(to) || !isValidId(id)) {
+    if (!isIdentity(to) || !isValidId(id) || to === this.#identity.identity) {
       return { ok: false, reason: "invalid_payload" };
     }
     if (bodySize(body) > maxBodySize) {
@@ -240,16 +247,33 @@ export class Messenger {
       return { ok: false, reason: "recipient_unavailable" };
     }
 
-    const current = session.current;
-    if (!current) {
-      return { ok: false, reason: "not_sent" };
-    }
-    const envelopes: WireEnvelope[] = [];
+    const targets: {
+      target: (typeof reply.payload.sessions)[number];
+      ephemeral: Uint8Array<ArrayBuffer>;
+    }[] = [];
     for (const target of reply.payload.sessions) {
       const ephemeral = await verifySession(to, toStatic, target);
       if (!ephemeral) {
         return { ok: false, reason: "encryption_failed" };
       }
+      targets.push({ target, ephemeral });
+    }
+    if (!(await this.#channel.establish(to))) {
+      return { ok: false, reason: "session_pending" };
+    }
+    if (generation !== this.#generation || this.#session !== session) {
+      return { ok: false, reason: "not_sent" };
+    }
+    const inner = await this.#channel.seal(to, body);
+    if (!inner) {
+      return { ok: false, reason: "encryption_failed" };
+    }
+    const current = session.current;
+    if (!current) {
+      return { ok: false, reason: "not_sent" };
+    }
+    const envelopes: WireEnvelope[] = [];
+    for (const { target, ephemeral } of targets) {
       const transcript: Transcript = {
         id,
         from: {
@@ -267,7 +291,7 @@ export class Messenger {
           ephemeral,
         },
       };
-      const sealed = await session.seal(transcript, body);
+      const sealed = await session.seal(transcript, inner);
       if (!sealed) {
         return { ok: false, reason: "encryption_failed" };
       }
@@ -399,10 +423,10 @@ export class Messenger {
       if (generation !== this.#generation || this.#session !== session) {
         return;
       }
+      if (this.#seen.has(replay)) {
+        return;
+      }
       if (body !== null) {
-        if (this.#seen.has(replay)) {
-          return;
-        }
         this.#remember(replay);
         this.#used();
       }
@@ -434,7 +458,7 @@ export class Messenger {
       if (!fromEphemeral || !toEphemeral) {
         return null;
       }
-      return await session.open(
+      const inner = await session.open(
         {
           id: delivery.id,
           from: {
@@ -458,6 +482,7 @@ export class Messenger {
           ciphertext: delivery.envelope.ciphertext,
         },
       );
+      return inner ? await this.#channel.open(delivery.from, inner) : null;
     } catch {
       return null;
     }

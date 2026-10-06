@@ -7,6 +7,7 @@ import {
   encode,
   isValidBody,
   maxBodySize,
+  maxCiphertextSize,
   maxSessions,
   parse,
 } from "./protocol.ts";
@@ -345,7 +346,7 @@ test("rejects malformed key bundles and deliveries", () => {
     { type: "message", payload: delivery({}, {}, { ciphertext: b64(16) }) },
     {
       type: "message",
-      payload: delivery({}, {}, { ciphertext: b64(maxBodySize + 17) }),
+      payload: delivery({}, {}, { ciphertext: b64(maxCiphertextSize + 1) }),
     },
     { type: "message", payload: delivery({}, {}, { ciphertext: 7 }) },
     { type: "message", payload: delivery({}, {}, { body: "plaintext" }) },
@@ -353,7 +354,7 @@ test("rejects malformed key bundles and deliveries", () => {
   ]) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
   }
-  for (const ciphertext of [b64(17), b64(maxBodySize + 16)]) {
+  for (const ciphertext of [b64(17), b64(maxCiphertextSize)]) {
     assert.ok(
       parse(
         JSON.stringify({
@@ -425,7 +426,7 @@ function deviceBundle(overrides: Record<string, unknown> = {}) {
 
 function initiationPayload(overrides: Record<string, unknown> = {}) {
   return {
-    version: 1,
+    version: 2,
     from: "B".repeat(42) + "A",
     key: b64(32),
     signature: b64(64),
@@ -433,6 +434,7 @@ function initiationPayload(overrides: Record<string, unknown> = {}) {
     signed: 7,
     onetime: 9,
     ephemeral: b64(32),
+    ratchet: b64(32),
     proof: b64(64),
     confirm: b64(32),
     ...overrides,
@@ -442,7 +444,7 @@ function initiationPayload(overrides: Record<string, unknown> = {}) {
 test("parses prekey bundles, handshake pushes, and replies", () => {
   const identity = "B".repeat(42) + "A";
   const bundle = {
-    version: 1,
+    version: 2,
     identity,
     key: b64(32),
     signature: b64(64),
@@ -494,7 +496,7 @@ test("parses prekey bundles, handshake pushes, and replies", () => {
 test("rejects malformed prekey bundles and handshake messages", () => {
   const identity = "B".repeat(42) + "A";
   const bundle = {
-    version: 1,
+    version: 2,
     identity,
     key: b64(32),
     signature: b64(64),
@@ -503,7 +505,7 @@ test("rejects malformed prekey bundles and handshake messages", () => {
   const twin = deviceBundle();
   for (const message of [
     { type: "bundle", payload: bundle },
-    { type: "bundle", id: "b", payload: { ...bundle, version: 2 } },
+    { type: "bundle", id: "b", payload: { ...bundle, version: 1 } },
     { type: "bundle", id: "b", payload: { ...bundle, version: "1" } },
     { type: "bundle", id: "b", payload: { ...bundle, bundles: [] } },
     { type: "bundle", id: "b", payload: { ...bundle, bundles: [twin, twin] } },
@@ -540,7 +542,9 @@ test("rejects malformed prekey bundles and handshake messages", () => {
     { type: "initiated", payload: {} },
     { type: "initiation", id: "x", payload: initiationPayload() },
     ...[
-      { version: 2 },
+      { version: 1 },
+      { ratchet: b64(31) },
+      { ratchet: undefined },
       { from: "x" },
       { key: b64(31) },
       { device: b64(17) },

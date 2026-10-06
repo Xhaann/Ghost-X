@@ -137,6 +137,7 @@ type initiationRequest struct {
 	Signed    uint32  `json:"signed"`
 	Onetime   *uint32 `json:"onetime"`
 	Ephemeral string  `json:"ephemeral"`
+	Ratchet   string  `json:"ratchet"`
 	Proof     string  `json:"proof"`
 	Confirm   string  `json:"confirm"`
 }
@@ -147,6 +148,10 @@ func (r initiationRequest) frame(id string) []byte {
 }
 
 func buildInitiation(from party, to *device, onetime *prekeyPayload, signedOverride *prekeyPayload) initiationRequest {
+	return buildInitiationWith(from, to, onetime, signedOverride, freshKey())
+}
+
+func buildInitiationWith(from party, to *device, onetime *prekeyPayload, signedOverride *prekeyPayload, ratchet []byte) initiationRequest {
 	ephemeral := freshKey()
 	signed := to.signed
 	if signedOverride != nil {
@@ -161,8 +166,9 @@ func buildInitiation(from party, to *device, onetime *prekeyPayload, signedOverr
 		Signed:          signed.ID,
 		SignedKey:       decoded(signed.Key),
 		Ephemeral:       ephemeral,
+		Ratchet:         ratchet,
 	}
-	r := initiationRequest{Version: 1, To: to.identity, Device: to.id, Signed: signed.ID, Ephemeral: base64.RawURLEncoding.EncodeToString(ephemeral), Confirm: randomText(ConfirmSize)}
+	r := initiationRequest{Version: 2, To: to.identity, Device: to.id, Signed: signed.ID, Ephemeral: base64.RawURLEncoding.EncodeToString(ephemeral), Ratchet: base64.RawURLEncoding.EncodeToString(ratchet), Confirm: randomText(ConfirmSize)}
 	if onetime != nil {
 		id := onetime.ID
 		t.Onetime = &id
@@ -260,7 +266,7 @@ func TestBundleReservesAndReturnsSignedMaterial(t *testing.T) {
 	conn, _, _ := f.conn(t, a)
 	for i, want := range []*prekeyPayload{&bob.onetime[0], &bob.onetime[1], nil} {
 		got := f.bundle(t, conn, b.identity)
-		if got.Version != 1 || got.Identity != b.identity || got.Key != b.key || got.Signature != b.signature || len(got.Bundles) != 1 {
+		if got.Version != 2 || got.Identity != b.identity || got.Key != b.key || got.Signature != b.signature || len(got.Bundles) != 1 {
 			t.Fatalf("bundle %d = %+v", i, got)
 		}
 		d := got.Bundles[0]
@@ -293,11 +299,14 @@ func TestInitiationRequiresAValidProofAndFreshPrekeys(t *testing.T) {
 	otherEphemeral := r
 	otherEphemeral.Ephemeral = base64.RawURLEncoding.EncodeToString(exchangeRaw(t))
 	bad["proof over another ephemeral"] = otherEphemeral.frame("i2")
+	otherRatchet := r
+	otherRatchet.Ratchet = base64.RawURLEncoding.EncodeToString(freshKey())
+	bad["proof over another ratchet key"] = otherRatchet.frame("i2b")
 	otherDevice := r
 	otherDevice.Device = randomText(DeviceIDSize)
 	bad["unknown device"] = otherDevice.frame("i3")
 	versioned := r
-	versioned.Version = 2
+	versioned.Version = 1
 	bad["unsupported version"] = versioned.frame("i4")
 	missingOnetime := r
 	missingOnetime.Onetime = nil
@@ -305,6 +314,7 @@ func TestInitiationRequiresAValidProofAndFreshPrekeys(t *testing.T) {
 	codes := map[string]Code{
 		"proof by another identity":      CodeInvalidPayload,
 		"proof over another ephemeral":   CodeInvalidPayload,
+		"proof over another ratchet key": CodeInvalidPayload,
 		"unknown device":                 CodeUnavailable,
 		"unsupported version":            CodeInvalidPayload,
 		"one-time removed after signing": CodeInvalidPayload,
@@ -312,6 +322,9 @@ func TestInitiationRequiresAValidProofAndFreshPrekeys(t *testing.T) {
 	for name, input := range bad {
 		expectCode(t, alice.Handle(input), codes[name])
 	}
+	high := freshKey()
+	high[31] |= 0x80
+	expectCode(t, alice.Handle(buildInitiationWith(a, bob, nil, nil, high).frame("i5b")), CodeInvalidPayload)
 	unreserved := bob.onetime[2]
 	expectCode(t, alice.Handle(buildInitiation(a, bob, &unreserved, nil).frame("i6")), CodeStaleSession)
 	stale := prekeyPayload{ID: 99, Key: bob.signed.Key, Signature: bob.signed.Signature}
@@ -325,7 +338,7 @@ func TestInitiationRequiresAValidProofAndFreshPrekeys(t *testing.T) {
 		t.Fatalf("initiate = %+v %s", resp, resp.Payload)
 	}
 	got := bob.events.take()
-	want := fmt.Sprintf(`{"type":"initiation","payload":{"version":1,"from":%q,"key":%q,"signature":%q,"device":%q,"signed":1,"onetime":%d,"ephemeral":%q,"proof":%q,"confirm":%q}}`, a.identity, a.key, a.signature, bob.id, reserved.ID, r.Ephemeral, r.Proof, r.Confirm)
+	want := fmt.Sprintf(`{"type":"initiation","payload":{"version":2,"from":%q,"key":%q,"signature":%q,"device":%q,"signed":1,"onetime":%d,"ephemeral":%q,"ratchet":%q,"proof":%q,"confirm":%q}}`, a.identity, a.key, a.signature, bob.id, reserved.ID, r.Ephemeral, r.Ratchet, r.Proof, r.Confirm)
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("delivered %v, want %s", got, want)
 	}
@@ -424,9 +437,9 @@ func FuzzInitiatePayload(f *testing.F) {
 	valid := buildInitiation(a, bob, nil, nil)
 	payload, _ := json.Marshal(valid)
 	f.Add(string(payload))
-	f.Add(strings.Replace(string(payload), `"version":1`, `"version":2`, 1))
+	f.Add(strings.Replace(string(payload), `"version":2`, `"version":1`, 1))
 	f.Add(strings.Replace(string(payload), `"onetime":null`, `"onetime":0`, 1))
-	f.Add(`{"version":1,"to":"","device":"","signed":0,"onetime":null,"ephemeral":"","proof":"","confirm":""}`)
+	f.Add(`{"version":2,"to":"","device":"","signed":0,"onetime":null,"ephemeral":"","ratchet":"","proof":"","confirm":""}`)
 	f.Fuzz(func(t *testing.T, body string) {
 		s := fx.sessions.Open()
 		defer fx.prekeys.Detach(s)
@@ -448,7 +461,7 @@ func FuzzInitiatePayload(f *testing.F) {
 		if err := json.Unmarshal([]byte(body), &got); err != nil || len(delivered) != 1 {
 			t.Fatalf("accepted %q delivered %v", body, delivered)
 		}
-		tr := Transcript{Initiator: decoded(a.identity), Responder: decoded(b.identity), InitiatorStatic: a.keyRaw, ResponderStatic: b.keyRaw, Device: decoded(bob.id), Signed: got.Signed, SignedKey: decoded(bob.signed.Key), Ephemeral: decoded(got.Ephemeral)}
+		tr := Transcript{Initiator: decoded(a.identity), Responder: decoded(b.identity), InitiatorStatic: a.keyRaw, ResponderStatic: b.keyRaw, Device: decoded(bob.id), Signed: got.Signed, SignedKey: decoded(bob.signed.Key), Ephemeral: decoded(got.Ephemeral), Ratchet: decoded(got.Ratchet)}
 		if got.Onetime != nil || got.Signed != 1 || mustIdentity(t, a.identity).Verify(ProofMessage(tr), got.Proof) != nil {
 			t.Fatalf("accepted unauthenticated initiation %q", body)
 		}

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { encodeBase64Url } from "./base64.ts";
 import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
 import { Messenger } from "./messenger.ts";
@@ -10,9 +11,9 @@ import { WebSocketTransport } from "./socket.ts";
 import {
   freePort,
   memoryStore,
+  secureDevice,
   startServer,
   stopServer,
-  track,
   useServer,
 } from "./testing.ts";
 import { Trust } from "./trust.ts";
@@ -34,77 +35,7 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
 }
 
 async function device(port: number, store: Store = memoryStore()) {
-  const vault = await loadVault(store);
-  assert.equal(vault.status, "ready");
-  const { keys, integrity } = vault as Unlocked;
-  const prekeys = await PrekeyStore.open(store, keys, integrity);
-  assert.ok(prekeys);
-  const [pairs, trust] = await Promise.all([
-    Pairs.open(store, integrity),
-    Trust.open(store, integrity),
-  ]);
-  const frames: string[] = [];
-  const listeners: ((data: string) => void)[] = [];
-  const transport = track(
-    new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
-  );
-  const transmit = transport.send.bind(transport);
-  transport.send = (data: string) => {
-    frames.push(data);
-    return transmit(data);
-  };
-  transport.onData((data) => frames.push(data));
-  const onData = transport.onData.bind(transport);
-  transport.onData = (listener: (data: string) => void) => {
-    listeners.push(listener);
-    return onData(listener);
-  };
-  const client = track(new Client(transport));
-  const auth = new Authenticator(client, keys.identity);
-  const messenger = new Messenger(client, auth, keys.identity, keys.exchange);
-  const pairing = new Pairing(
-    client,
-    messenger,
-    keys.identity,
-    keys.exchange,
-    prekeys,
-    pairs,
-  );
-  pairing.onKey((bundle) => void trust.observe(bundle));
-  messenger.onKey((bundle) => void trust.observe(bundle));
-  let stopped = false;
-  const shutdown = async () => {
-    if (stopped) {
-      return;
-    }
-    stopped = true;
-    pairing.stop();
-    messenger.stop();
-    auth.stop();
-    client.close();
-    await Promise.all([pairs.close(), trust.close()]);
-  };
-  track({ close: () => void shutdown() });
-  auth.start();
-  messenger.start();
-  pairing.start();
-  client.open();
-  await until(() => messenger.state.active && pairing.published, "published");
-  return {
-    store,
-    keys,
-    integrity,
-    prekeys,
-    pairs,
-    trust,
-    client,
-    messenger,
-    pairing,
-    frames,
-    deliver: (data: string) => listeners.forEach((l) => l(data)),
-    shutdown,
-    id: keys.identity.identity,
-  };
+  return secureDevice(port, { store });
 }
 
 function frames(list: string[], type: string): Json[] {
@@ -133,6 +64,7 @@ test("establishes a session with an offline recipient that completes on reconnec
     "ephemeral",
     "onetime",
     "proof",
+    "ratchet",
     "signed",
     "to",
     "version",
@@ -525,4 +457,47 @@ test("a stripped one-time prekey or a stale replayed bundle is handled safely", 
   assert.equal(c.pairs.state(b.id), "none");
   const error = frames(c.frames, "error").at(-1)?.payload as Json;
   assert.equal(error.code, "stale_session");
+});
+
+test("only a missing session triggers recovery; pending or established sessions never re-key on input", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const { encodeHeader, generateRatchetKey } = await import("./ratchet.ts");
+  const probe = async () => {
+    const header = encodeHeader({
+      session: encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))),
+      ratchet: (await generateRatchetKey()).publicKey,
+      previous: 0,
+      n: 0,
+    });
+    assert.ok(header);
+    return new Uint8Array([...header, ...new Uint8Array(17)]);
+  };
+  const initiations = (d: { frames: string[] }) =>
+    frames(d.frames, "initiate").filter((f) => (f.payload as Json).to).length;
+
+  const storeB = memoryStore();
+  let b = await device(port, storeB);
+  const idB = b.id;
+  await b.shutdown();
+  const a = await device(port);
+  assert.equal(await a.pairing.initiate(idB), "pending");
+  const pendingCount = initiations(a);
+  assert.equal(await a.pairing.open(idB, await probe()), null);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(initiations(a), pendingCount);
+  assert.equal(a.pairs.state(idB), "pending");
+
+  b = await device(port, storeB);
+  await until(() => a.pairs.state(idB) === "established", "established");
+  const session = a.pairs.id(idB);
+  assert.equal(await a.pairing.open(idB, await probe()), null);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(initiations(a), pendingCount);
+  assert.equal(a.pairs.id(idB), session);
+
+  const c = await device(port);
+  assert.equal(await c.pairing.open(idB, await probe()), null);
+  await until(() => initiations(c) === 1, "recovery initiation");
+  await until(() => c.pairs.state(idB) === "established", "recovered");
 });

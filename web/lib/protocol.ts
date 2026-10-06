@@ -51,6 +51,7 @@ export type ClientMessage =
         signed: number;
         onetime: number | null;
         ephemeral: string;
+        ratchet: string;
         proof: string;
         confirm: string;
       };
@@ -122,6 +123,7 @@ export type ServerMessage =
         signed: number;
         onetime: number | null;
         ephemeral: string;
+        ratchet: string;
         proof: string;
         confirm: string;
       };
@@ -175,7 +177,9 @@ export const maxSessions = 4;
 export const deviceIdSize = 16;
 export const confirmSize = 32;
 export const maxOnetimePublish = 100;
-export const maxCiphertextSize = maxBodySize + tagSize;
+export const ratchetHeaderSize = 1 + 16 + 32 + 4 + 4;
+export const maxCiphertextSize =
+  maxBodySize + ratchetHeaderSize + tagSize + tagSize;
 
 const encoder = new TextEncoder();
 
@@ -523,7 +527,7 @@ export function parse(data: unknown): ServerMessage | null {
         "signature",
         "bundles",
       ]) &&
-      payload.version === 1 &&
+      payload.version === 2 &&
       isIdentity(payload.identity) &&
       isFixed(payload.key, exchangeKeySize) &&
       isFixed(payload.signature, signatureSize) &&
@@ -542,7 +546,7 @@ export function parse(data: unknown): ServerMessage | null {
         type,
         id,
         payload: {
-          version: 1,
+          version: 2,
           identity: payload.identity,
           key: payload.key,
           signature: payload.signature,
@@ -565,10 +569,11 @@ export function parse(data: unknown): ServerMessage | null {
         "signed",
         "onetime",
         "ephemeral",
+        "ratchet",
         "proof",
         "confirm",
       ]) &&
-      payload.version === 1 &&
+      payload.version === 2 &&
       isIdentity(payload.from) &&
       isFixed(payload.key, exchangeKeySize) &&
       isFixed(payload.signature, signatureSize) &&
@@ -576,13 +581,14 @@ export function parse(data: unknown): ServerMessage | null {
       isEpoch(payload.signed) &&
       (payload.onetime === null || isEpoch(payload.onetime)) &&
       isFixed(payload.ephemeral, exchangeKeySize) &&
+      isFixed(payload.ratchet, exchangeKeySize) &&
       isFixed(payload.proof, signatureSize) &&
       isFixed(payload.confirm, confirmSize)
     ) {
       return {
         type,
         payload: {
-          version: 1,
+          version: 2,
           from: payload.from,
           key: payload.key,
           signature: payload.signature,
@@ -590,6 +596,7 @@ export function parse(data: unknown): ServerMessage | null {
           signed: payload.signed,
           onetime: payload.onetime as number | null,
           ephemeral: payload.ephemeral,
+          ratchet: payload.ratchet,
           proof: payload.proof,
           confirm: payload.confirm,
         },

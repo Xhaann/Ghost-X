@@ -17,6 +17,21 @@ import {
 import { IdentityKey, parseIdentity } from "./identity.ts";
 import type { KeyValueStore, StoreName } from "./storage.ts";
 import type { TransportState } from "./transport.ts";
+import { Authenticator } from "./auth.ts";
+import { Client } from "./client.ts";
+import { History } from "./history.ts";
+import {
+  type Incoming,
+  Messenger,
+  type MessengerOptions,
+  type MessengerState,
+} from "./messenger.ts";
+import { Pairing } from "./pairing.ts";
+import { Pairs } from "./pairs.ts";
+import { PrekeyStore } from "./prekeys.ts";
+import { WebSocketTransport } from "./socket.ts";
+import { Trust } from "./trust.ts";
+import { type Unlocked, loadVault } from "./vault.ts";
 
 const NativeWebSocket = globalThis.WebSocket;
 export const created: WebSocket[] = [];
@@ -305,3 +320,129 @@ export async function legacySeal(
     ciphertext: encodeBase64Url(new Uint8Array(ciphertext)),
   };
 }
+
+export type MemoryStore = ReturnType<typeof memoryStore>;
+
+export async function secureDevice(
+  port: number,
+  options: {
+    store?: MemoryStore;
+    messenger?: MessengerOptions;
+    wait?: boolean;
+  } = {},
+) {
+  const store = options.store ?? memoryStore();
+  const vault = await loadVault(store);
+  assert.equal(vault.status, "ready");
+  const { keys, integrity, storage } = vault as Unlocked;
+  const prekeys = await PrekeyStore.open(store, keys, integrity);
+  assert.ok(prekeys);
+  const [pairs, trust, history] = await Promise.all([
+    Pairs.open(store, integrity, storage, keys.identity.identity),
+    Trust.open(store, integrity),
+    History.open(store, keys, integrity, storage),
+  ]);
+  const transport = track(
+    new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
+  );
+  const sent: string[] = [];
+  const received: string[] = [];
+  const frames: string[] = [];
+  const listeners: ((data: string) => void)[] = [];
+  let held = false;
+  const transmit = transport.send.bind(transport);
+  transport.send = (data: string) => {
+    sent.push(data);
+    frames.push(data);
+    return transmit(data);
+  };
+  transport.onData((data) => {
+    received.push(data);
+    frames.push(data);
+  });
+  const onData = transport.onData.bind(transport);
+  transport.onData = (listener: (data: string) => void) => {
+    listeners.push(listener);
+    return onData((data) => {
+      if (!(held && data.includes('"type":"message"'))) {
+        listener(data);
+      }
+    });
+  };
+  const client = track(new Client(transport));
+  const auth = new Authenticator(client, keys.identity);
+  const pairing = new Pairing(
+    client,
+    keys.identity,
+    keys.exchange,
+    prekeys,
+    pairs,
+  );
+  const messenger = new Messenger(
+    client,
+    auth,
+    keys.identity,
+    keys.exchange,
+    pairing,
+    options.messenger,
+  );
+  const inbox: Incoming[] = [];
+  const states: MessengerState[] = [];
+  messenger.onMessage((message) => inbox.push(message));
+  messenger.onState((state) => states.push(state));
+  pairing.onKey((bundle) => void trust.observe(bundle));
+  messenger.onKey((bundle) => void trust.observe(bundle));
+  let stopped = false;
+  const shutdown = async () => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    pairing.stop();
+    messenger.stop();
+    auth.stop();
+    client.close();
+    await Promise.all([pairs.close(), trust.close(), history.close()]);
+  };
+  track({ close: () => void shutdown() });
+  auth.start();
+  messenger.start();
+  pairing.start(messenger);
+  client.open();
+  await waitFor(client, "connected");
+  if (options.wait !== false) {
+    const deadline = Date.now() + 5000;
+    while (!(messenger.state.active && pairing.published)) {
+      assert.ok(Date.now() < deadline, "device never became ready");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  return {
+    id: keys.identity.identity,
+    created: (vault as Unlocked).created,
+    store,
+    keys,
+    integrity,
+    storage,
+    prekeys,
+    pairs,
+    trust,
+    history,
+    client,
+    auth,
+    pairing,
+    messenger,
+    inbox,
+    states,
+    sent,
+    received,
+    frames,
+    deliver: (data: string) => listeners.forEach((listener) => listener(data)),
+    hold: (value: boolean) => {
+      held = value;
+    },
+    shutdown,
+  };
+}
+
+export type SecureDevice = Awaited<ReturnType<typeof secureDevice>>;

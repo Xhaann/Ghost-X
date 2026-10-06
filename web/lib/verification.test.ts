@@ -1,24 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Authenticator } from "./auth.ts";
-import { Client } from "./client.ts";
 import { Conversations } from "./conversations.ts";
 import { ExchangeKey } from "./encryption.ts";
 import { fingerprint } from "./fingerprint.ts";
-import { History } from "./history.ts";
-import { IdentityKey } from "./identity.ts";
-import { Messenger, type MessengerOptions } from "./messenger.ts";
-import { WebSocketTransport } from "./socket.ts";
+import type { MessengerOptions } from "./messenger.ts";
 import {
   freePort,
   memoryStore,
+  secureDevice,
   startServer,
   stopServer,
-  track,
   useServer,
 } from "./testing.ts";
-import { Trust } from "./trust.ts";
-import { type Keys, type Unlocked, loadVault } from "./vault.ts";
+import { type Keys, loadVault } from "./vault.ts";
 
 useServer();
 
@@ -34,78 +28,44 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
   }
 }
 
-async function connect(
+async function device(
   port: number,
-  keys: Keys,
-  trust?: Trust,
-  history?: History,
+  store: Store,
   options: MessengerOptions = {},
 ) {
-  const frames: string[] = [];
-  const transport = track(
-    new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
-  );
-  const transmit = transport.send.bind(transport);
-  transport.send = (data: string) => {
-    frames.push(data);
-    return transmit(data);
-  };
-  transport.onData((data) => frames.push(data));
-  const client = track(new Client(transport));
-  const auth = new Authenticator(client, keys.identity);
-  const messenger = new Messenger(
-    client,
-    auth,
-    keys.identity,
-    keys.exchange,
-    options,
-  );
-  const restored = history ? (await history.restore()).restored : [];
-  const conversations = new Conversations(messenger, keys.identity.identity, {
-    history,
+  const secure = await secureDevice(port, { store, messenger: options });
+  const { restored } = await secure.history.restore();
+  const conversations = new Conversations(secure.messenger, secure.id, {
+    history: secure.history,
     restored,
   });
-  const unkey = trust
-    ? messenger.onKey((bundle) => void trust.observe(bundle))
-    : () => {};
-  let stopped = false;
-  const shutdown = async () => {
-    if (stopped) {
-      return;
-    }
-    stopped = true;
-    unkey();
-    conversations.stop();
-    messenger.stop();
-    auth.stop();
-    client.close();
-    await Promise.all([history?.close(), trust?.close()]);
-  };
-  track({ close: () => void shutdown() });
-  auth.start();
-  messenger.start();
   conversations.start();
-  client.open();
   await until(() => conversations.state.connected, "connected");
-  return { keys, client, messenger, conversations, frames, shutdown };
-}
-
-async function device(port: number, store: Store) {
-  const vault = await loadVault(store);
-  assert.equal(vault.status, "ready");
-  const { keys, integrity, storage } = vault as Unlocked;
-  const [history, trust] = await Promise.all([
-    History.open(store, keys, integrity, storage),
-    Trust.open(store, integrity),
-  ]);
-  return { ...(await connect(port, keys, trust, history)), trust };
-}
-
-async function keysWith(identity?: IdentityKey): Promise<Keys> {
   return {
-    identity: identity ?? (await IdentityKey.generate()),
-    exchange: await ExchangeKey.generate(),
+    ...secure,
+    conversations,
+    shutdown: async () => {
+      conversations.stop();
+      await secure.shutdown();
+    },
   };
+}
+
+async function identityStore(): Promise<Store> {
+  const store = memoryStore();
+  assert.equal((await loadVault(store)).status, "ready");
+  return store;
+}
+
+async function withNewKey(source: Store): Promise<Store> {
+  const store = memoryStore();
+  const fresh = await ExchangeKey.create();
+  store.data.set("vault:keys", {
+    ...(source.data.get("vault:keys") as Record<string, unknown>),
+    exchangeKey: fresh.key.publicKey,
+    exchange: fresh.privateKey,
+  });
+  return store;
 }
 
 async function own(keys: Keys) {
@@ -130,8 +90,9 @@ test("verify, detect a key change, and re-verify with a real server", async () =
   const server = await startServer(port);
   const storeA = memoryStore();
   let a = await device(port, storeA);
-  const bKeys = await keysWith();
-  let b = await connect(port, bKeys);
+  const bStore = await identityStore();
+  let b = await device(port, bStore);
+  const bKeys = b.keys;
   const idB = bKeys.identity.identity;
   const idA = a.keys.identity.identity;
 
@@ -178,9 +139,8 @@ test("verify, detect a key change, and re-verify with a real server", async () =
   assert.equal(a.trust.view(idB).state, "verified");
 
   await b.shutdown();
-  const rotatedKeys = await keysWith(bKeys.identity);
-  b = await connect(port, rotatedKeys);
-  const rotated = await own(rotatedKeys);
+  b = await device(port, await withNewKey(bStore));
+  const rotated = await own(b.keys);
   assert.notEqual(rotated.value, bPrint.value);
 
   b.conversations.open(idA);
@@ -247,9 +207,10 @@ test("verification is independent of sessions, connections, and presence", async
   await startServer(port);
   const storeA = memoryStore();
   const a = await device(port, storeA);
-  const bKeys = await keysWith();
-  const b1 = await connect(port, bKeys);
-  const b2 = await connect(port, bKeys);
+  const bStore = await identityStore();
+  const b1 = await device(port, bStore);
+  const b2 = await device(port, bStore);
+  const bKeys = b1.keys;
   const idB = bKeys.identity.identity;
 
   await a.messenger.lookup(idB);
@@ -264,7 +225,7 @@ test("verification is independent of sessions, connections, and presence", async
     assert.ok(Date.now() < deadline);
   }
   assert.equal(a.trust.view(idB).state, "verified");
-  const b3 = await connect(port, bKeys);
+  const b3 = await device(port, bStore);
   assert.equal(await a.messenger.lookup(idB), true);
   assert.equal(a.trust.view(idB).state, "verified");
   await b3.shutdown();
@@ -275,8 +236,8 @@ test("another client's verification never changes local trust", async () => {
   await startServer(port);
   const a = await device(port, memoryStore());
   const c = await device(port, memoryStore());
-  const bKeys = await keysWith();
-  await connect(port, bKeys);
+  const bStore = await identityStore();
+  const bKeys = (await device(port, bStore)).keys;
   const idB = bKeys.identity.identity;
   const bPrint = await own(bKeys);
 
@@ -297,9 +258,10 @@ test("verification survives ephemeral rotation and fresh sessions but not a key 
   const port = await freePort();
   await startServer(port);
   const a = await device(port, memoryStore());
-  const bKeys = await keysWith();
+  const bStore = await identityStore();
   const options = { rotationLimit: 2, previousLimit: 1 };
-  let b = await connect(port, bKeys, undefined, undefined, options);
+  let b = await device(port, bStore, options);
+  const bKeys = b.keys;
   const idA = a.keys.identity.identity;
   const idB = bKeys.identity.identity;
   await a.messenger.lookup(idB);
@@ -326,7 +288,7 @@ test("verification survives ephemeral rotation and fresh sessions but not a key 
 
   const firstSession = offers[0].session;
   await b.shutdown();
-  b = await connect(port, bKeys, undefined, undefined, options);
+  b = await device(port, bStore, options);
   const fresh = b.frames
     .map((f) => JSON.parse(f))
     .filter((f) => f.type === "session")
@@ -341,10 +303,89 @@ test("verification survives ephemeral rotation and fresh sessions but not a key 
   assert.equal(a.trust.view(idB).state, "verified");
 
   await b.shutdown();
-  const changed = await keysWith(bKeys.identity);
-  b = await connect(port, changed, undefined, undefined, options);
+  b = await device(port, await withNewKey(bStore), options);
+  const changed = b.keys;
   await a.messenger.lookup(idB);
   await until(() => a.trust.view(idB).state === "changed", "changed");
   assert.equal(await a.trust.verify(idB, (await own(changed)).value), true);
+  assert.equal(a.trust.view(idB).state, "verified");
+});
+
+test("ratchet key changes and session resets never alter verification; real key changes do", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const a = await device(port, memoryStore());
+  const bStore = await identityStore();
+  let b = await device(port, bStore);
+  const idB = b.id;
+  await a.messenger.lookup(idB);
+  await until(() => a.trust.view(idB).state === "unverified", "observed");
+  assert.equal(await a.trust.verify(idB, (await own(b.keys)).value), true);
+
+  const ratchetKey = async () =>
+    a.pairs.transact(idB, async (state) => ({
+      state,
+      value: Buffer.from(state.own.publicKey).toString("base64url"),
+    }));
+  const exchange = async (rounds: number, label: string) => {
+    for (let i = 0; i < rounds; i++) {
+      assert.deepEqual(await a.messenger.send(idB, `${label} a${i}`), {
+        ok: true,
+      });
+      await until(
+        () => b.inbox.some((m) => m.body === `${label} a${i}`),
+        `b rx ${label}`,
+      );
+      assert.deepEqual(await b.messenger.send(a.id, `${label} b${i}`), {
+        ok: true,
+      });
+      await until(
+        () => a.inbox.some((m) => m.body === `${label} b${i}`),
+        "a rx",
+      );
+    }
+  };
+  await exchange(1, "first");
+  const keys = new Set([await ratchetKey()]);
+  for (let i = 0; i < 4; i++) {
+    await exchange(1, `round ${i}`);
+    keys.add(await ratchetKey());
+  }
+  assert.equal(keys.size, 5);
+  assert.equal(a.trust.view(idB).state, "verified");
+
+  const sessionBefore = a.pairs.id(idB);
+  await b.shutdown();
+  bStore.data.delete(`pairs:${a.id}`);
+  b = await device(port, bStore);
+  assert.deepEqual(await a.messenger.send(idB, "lost before recovery"), {
+    ok: true,
+  });
+  await until(() => b.inbox.length === 1, "undecryptable arrives");
+  assert.equal(b.inbox[0].body, null);
+  await until(
+    () =>
+      a.pairs.state(idB) === "established" && a.pairs.id(idB) !== sessionBefore,
+    "recovered session",
+  );
+  await exchange(1, "after reset");
+  assert.notEqual(a.pairs.id(idB), sessionBefore);
+  assert.equal(a.trust.view(idB).state, "verified");
+
+  await b.shutdown();
+  b = await device(port, await withNewKey(bStore));
+  assert.deepEqual(await b.messenger.send(a.id, "new long-term key hello"), {
+    ok: true,
+  });
+  await until(
+    () => a.inbox.some((m) => m.body === "new long-term key hello"),
+    "a rx from new key",
+  );
+  await exchange(1, "new long-term key");
+  await a.messenger.lookup(idB);
+  await until(() => a.trust.view(idB).state === "changed", "changed");
+  await exchange(2, "still changed");
+  assert.equal(a.trust.view(idB).state, "changed");
+  assert.equal(await a.trust.verify(idB, (await own(b.keys)).value), true);
   assert.equal(a.trust.view(idB).state, "verified");
 });

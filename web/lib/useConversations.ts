@@ -6,6 +6,7 @@ import {
   type ConversationsState,
   type SendAttempt,
 } from "./conversations.ts";
+import { requestDeviceLock } from "./lock.ts";
 import { Messenger } from "./messenger.ts";
 import type { PairState } from "./pairs.ts";
 import { type InitiateResult, Pairing } from "./pairing.ts";
@@ -32,6 +33,7 @@ export function useConversations(
   trustOf: (identity: string) => TrustState;
   verify: (value: string) => Promise<boolean>;
   pairing: PairState | InitiateResult | null;
+  locked: boolean;
 } {
   const [state, setState] = useState<ConversationsState>(empty);
   const [rejected, setRejected] = useState(0);
@@ -40,6 +42,7 @@ export function useConversations(
   const messengerRef = useRef<Messenger | null>(null);
   const pairingRef = useRef<Pairing | null>(null);
   const [pairVersion, setPairVersion] = useState(0);
+  const [locked, setLocked] = useState(false);
   const [attempt, setAttempt] = useState<{
     peer: string;
     result: InitiateResult;
@@ -55,66 +58,92 @@ export function useConversations(
     const untrust = trust.onChange(() => setTrustVersion((v) => v + 1));
     const unpair = session.pairs.onChange(() => setPairVersion((v) => v + 1));
 
-    history.restore().then(({ restored, rejected }) => {
-      if (!active) {
-        return;
+    const controller = new AbortController();
+    let release: (() => void) | null = null;
+    const waiting = setTimeout(() => {
+      if (active) {
+        setLocked(true);
       }
-      setRejected(rejected);
-      const messenger = new Messenger(
-        client,
-        authenticator,
-        keys.identity,
-        keys.exchange,
-      );
-      const conversations = new Conversations(
-        messenger,
-        keys.identity.identity,
-        { history, restored },
-      );
-      store.current = conversations;
-      messengerRef.current = messenger;
-      const unkey = messenger.onKey((bundle) => void trust.observe(bundle));
-      const pairing = session.prekeys
-        ? new Pairing(
-            client,
-            messenger,
-            keys.identity,
-            keys.exchange,
-            session.prekeys,
-            session.pairs,
-          )
-        : null;
-      const unpairKey =
-        pairing?.onKey((bundle) => void trust.observe(bundle)) ?? (() => {});
-      pairingRef.current = pairing;
-      const unsubscribe = conversations.onState(setState);
-      messenger.start();
-      pairing?.start();
-      conversations.start();
-      teardown = () => {
-        unsubscribe();
-        unkey();
-        unpairKey();
-        pairing?.stop();
-        if (pairingRef.current === pairing) {
-          pairingRef.current = null;
+    }, 500);
+    const prekeys = session.prekeys;
+
+    requestDeviceLock(controller.signal)
+      .then(async (unlock) => {
+        release = unlock;
+        clearTimeout(waiting);
+        if (!active || !prekeys) {
+          if (active) {
+            setLocked(true);
+          }
+          return;
         }
-        conversations.stop();
-        messenger.stop();
-        if (store.current === conversations) {
-          store.current = null;
+        setLocked(false);
+        const { restored, rejected } = await history.restore();
+        if (!active) {
+          return;
         }
-        if (messengerRef.current === messenger) {
-          messengerRef.current = null;
+        setRejected(rejected);
+        const pairing = new Pairing(
+          client,
+          keys.identity,
+          keys.exchange,
+          prekeys,
+          session.pairs,
+        );
+        const messenger = new Messenger(
+          client,
+          authenticator,
+          keys.identity,
+          keys.exchange,
+          pairing,
+        );
+        const conversations = new Conversations(
+          messenger,
+          keys.identity.identity,
+          { history, restored },
+        );
+        store.current = conversations;
+        messengerRef.current = messenger;
+        pairingRef.current = pairing;
+        const unkey = messenger.onKey((bundle) => void trust.observe(bundle));
+        const unpairKey = pairing.onKey((bundle) => void trust.observe(bundle));
+        const unsubscribe = conversations.onState(setState);
+        messenger.start();
+        pairing.start(messenger);
+        conversations.start();
+        teardown = () => {
+          unsubscribe();
+          unkey();
+          unpairKey();
+          pairing.stop();
+          conversations.stop();
+          messenger.stop();
+          if (pairingRef.current === pairing) {
+            pairingRef.current = null;
+          }
+          if (store.current === conversations) {
+            store.current = null;
+          }
+          if (messengerRef.current === messenger) {
+            messengerRef.current = null;
+          }
+        };
+      })
+      .catch(() => {
+        clearTimeout(waiting);
+        if (active) {
+          setLocked(true);
         }
-      };
-    });
+      });
 
     return () => {
       active = false;
+      clearTimeout(waiting);
+      controller.abort();
       untrust();
       unpair();
       teardown?.();
+      release?.();
       setState(empty);
       setRejected(0);
     };
@@ -194,5 +223,6 @@ export function useConversations(
     trustOf,
     verify,
     pairing,
+    locked,
   };
 }

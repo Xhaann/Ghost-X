@@ -186,6 +186,7 @@ export default function Messages({
     trustOf,
     verify,
     pairing,
+    locked,
   } = useConversations(client, authenticator, session);
   const [recipient, setRecipient] = useState("");
   const [body, setBody] = useState("");
@@ -222,6 +223,15 @@ export default function Messages({
 
   if (!session || !authenticator) {
     return null;
+  }
+
+  if (locked) {
+    return (
+      <p data-locked>
+        Messaging is open in another tab of this browser. Close it to use
+        messaging here.
+      </p>
+    );
   }
 
   return (
