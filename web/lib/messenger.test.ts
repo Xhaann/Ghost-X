@@ -468,7 +468,10 @@ test("refuses to encrypt to a substituted recipient key", async () => {
     send(data);
   };
   const sendsBefore = a.sent.filter((f) => f.includes('"type":"send"')).length;
+  const observed: string[] = [];
+  a.messenger.onKey((bundle) => observed.push(bundle.key));
 
+  assert.equal(await a.messenger.lookup(b.keys.identity.identity), false);
   assert.deepEqual(await a.messenger.send(b.keys.identity.identity, "secret"), {
     ok: false,
     reason: "encryption_failed",
@@ -481,4 +484,46 @@ test("refuses to encrypt to a substituted recipient key", async () => {
   await barrier(c);
   assert.deepEqual(b.inbox, []);
   assert.deepEqual(c.inbox, []);
+  assert.deepEqual(observed, []);
+});
+
+test("reports only verified key bundles from lookups, sends, and deliveries", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const a = await peer(port);
+  const b = await peer(port);
+  const c = await peer(port);
+  const seen: string[] = [];
+  const names = new Map([
+    [b.keys.exchange.publicKey, "b"],
+    [c.keys.exchange.publicKey, "c"],
+  ]);
+  a.messenger.onKey((bundle) => {
+    const name = names.get(bundle.key) ?? "unknown";
+    const owner = name === "b" ? b : c;
+    seen.push(`${name}:${bundle.identity === owner.keys.identity.identity}`);
+  });
+
+  assert.equal(await a.messenger.lookup(b.keys.identity.identity), true);
+  assert.equal(await a.messenger.lookup("not-an-identity"), false);
+  const absent = await keys();
+  assert.equal(await a.messenger.lookup(absent.identity.identity), false);
+  assert.equal(
+    (await a.messenger.send(c.keys.identity.identity, "x", "s1")).ok,
+    true,
+  );
+  await b.messenger.send(a.keys.identity.identity, "y", "d1");
+  await until(() => a.inbox.length === 1, "delivery");
+  inject(a, {
+    ...lastDelivery(a),
+    id: "d2",
+    key: c.keys.exchange.publicKey,
+  });
+  await barrier(a);
+  await until(() => a.inbox.length === 2, "forged processed");
+  assert.deepEqual(seen, ["b:true", "c:true", "b:true"]);
+
+  a.messenger.stop();
+  assert.equal(await a.messenger.lookup(b.keys.identity.identity), false);
+  assert.equal(seen.length, 3);
 });

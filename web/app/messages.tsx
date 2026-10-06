@@ -9,6 +9,7 @@ import type {
   DeliveryState,
 } from "@/lib/conversations.ts";
 import { bodySize, maxBodySize } from "@/lib/protocol.ts";
+import type { TrustState, TrustView } from "@/lib/trust.ts";
 import { useConversations } from "@/lib/useConversations.ts";
 import type { LocalSession } from "@/lib/useIdentity.ts";
 
@@ -33,14 +34,101 @@ function status(message: ConversationMessage): string {
   return message.body === null ? "Could not be decrypted" : "Received";
 }
 
+const trustLabels: Record<TrustState, string> = {
+  unavailable:
+    "Verification cannot be checked: this identity's current key is not available",
+  unverified:
+    "Not verified: the server authenticated this identity, but you have not compared fingerprints",
+  verified: "Verified: you confirmed this exact fingerprint",
+  changed:
+    "Identity key changed since you verified it. Compare the new fingerprint before relying on this conversation.",
+};
+
+function Verification({
+  view,
+  onVerify,
+}: {
+  view: TrustView;
+  onVerify: (value: string) => Promise<boolean>;
+}) {
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  const current = view.current;
+  const pending = confirming !== null && current?.value === confirming;
+
+  return (
+    <div data-verification={view.state}>
+      <p role={view.state === "changed" ? "alert" : undefined}>
+        <strong>{trustLabels[view.state]}</strong>
+      </p>
+      {current && (
+        <p>
+          Fingerprint <code data-fingerprint>{current.digits}</code>
+        </p>
+      )}
+      {view.state === "changed" && view.verified && (
+        <p>
+          Previously verified fingerprint{" "}
+          <code data-previous>{view.verified.digits}</code>
+        </p>
+      )}
+      {current &&
+        (view.state === "unverified" || view.state === "changed") &&
+        !pending && (
+          <button
+            type="button"
+            onClick={() => {
+              setFailed(false);
+              setConfirming(current.value);
+            }}
+          >
+            Verify identity
+          </button>
+        )}
+      {pending && current && (
+        <div data-confirm>
+          <p>
+            Ask the owner of this identity to read their fingerprint to you over
+            a channel you trust, such as in person or a call. Confirm only if
+            every digit matches:
+          </p>
+          <p>
+            <code data-confirm-fingerprint>{current.digits}</code>
+          </p>
+          <button
+            type="button"
+            onClick={async () => {
+              const value = confirming;
+              setConfirming(null);
+              setFailed(!(await onVerify(value)));
+            }}
+          >
+            Fingerprints match
+          </button>{" "}
+          <button type="button" onClick={() => setConfirming(null)}>
+            Cancel
+          </button>
+        </div>
+      )}
+      {failed && (
+        <output data-verify-failed>
+          Not verified: the fingerprint changed or could not be saved
+        </output>
+      )}
+    </div>
+  );
+}
+
 function ConversationList({
   conversations,
   active,
   onOpen,
+  trustOf,
 }: {
   conversations: readonly Conversation[];
   active: string | null;
   onOpen: (identity: string) => void;
+  trustOf: (identity: string) => TrustState;
 }) {
   if (conversations.length === 0) {
     return <p data-conversations="0">No conversations</p>;
@@ -56,6 +144,9 @@ function ConversationList({
             onClick={() => onOpen(conversation.identity)}
           >
             <code>{conversation.identity}</code>
+            {trustOf(conversation.identity) === "changed" && (
+              <span data-changed>Identity changed</span>
+            )}
             {conversation.unread > 0 && (
               <span data-unread={conversation.unread}>
                 {conversation.unread} unread
@@ -77,11 +168,8 @@ export default function Messages({
   authenticator: Authenticator | null;
   session: LocalSession | null;
 }) {
-  const { state, rejected, open, close, send } = useConversations(
-    client,
-    authenticator,
-    session,
-  );
+  const { state, rejected, open, close, send, verification, trustOf, verify } =
+    useConversations(client, authenticator, session);
   const [recipient, setRecipient] = useState("");
   const [body, setBody] = useState("");
   const [pending, setPending] = useState(false);
@@ -135,6 +223,7 @@ export default function Messages({
         conversations={state.conversations}
         active={state.active}
         onOpen={(identity) => open(identity)}
+        trustOf={trustOf}
       />
       {rejected > 0 && (
         <p data-rejected={rejected}>
@@ -150,6 +239,13 @@ export default function Messages({
             Conversation with <code>{active.identity}</code>
           </p>
           <p data-encryption>End-to-end encrypted to this identity</p>
+          {verification && (
+            <Verification
+              key={verification.identity}
+              view={verification}
+              onVerify={verify}
+            />
+          )}
           <button type="button" onClick={close}>
             Close conversation
           </button>

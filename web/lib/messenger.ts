@@ -48,6 +48,7 @@ export class Messenger {
   readonly #exchange: ExchangeKey;
   readonly #states = new Listeners<MessengerState>();
   readonly #messages = new Listeners<Incoming>();
+  readonly #keys = new Listeners<KeyBundle>();
   #state: MessengerState = { active: false };
   #generation = 0;
   #pending = 0;
@@ -76,6 +77,30 @@ export class Messenger {
 
   onMessage(listener: (message: Incoming) => void): () => void {
     return this.#messages.add(listener);
+  }
+
+  onKey(listener: (bundle: KeyBundle) => void): () => void {
+    return this.#keys.add(listener);
+  }
+
+  async lookup(identity: string): Promise<boolean> {
+    if (!this.#state.active || !isIdentity(identity)) {
+      return false;
+    }
+    const generation = this.#generation;
+    const reply = await this.#client.request({
+      type: "key",
+      payload: { identity },
+    });
+    if (reply?.type !== "key" || reply.payload.identity !== identity) {
+      return false;
+    }
+    const verified = await verifyBundle(reply.payload);
+    if (!verified || generation !== this.#generation) {
+      return false;
+    }
+    this.#keys.emit(reply.payload);
+    return true;
   }
 
   start(): void {
@@ -140,6 +165,9 @@ export class Messenger {
     const toKey = await verifyBundle(bundle.payload);
     if (!toKey) {
       return { ok: false, reason: "encryption_failed" };
+    }
+    if (generation === this.#generation) {
+      this.#keys.emit(bundle.payload);
     }
     const sealed = await this.#exchange.seal(
       {
@@ -235,6 +263,7 @@ export class Messenger {
       if (!fromKey) {
         return null;
       }
+      this.#keys.emit(peer);
       const sealed: Sealed = {
         salt: delivery.salt,
         iv: delivery.iv,

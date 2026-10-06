@@ -3,6 +3,7 @@ import {
   decodeBase64UrlRange,
   encodeBase64Url,
 } from "./base64.ts";
+import { isCanonicalExchangeKey } from "./fingerprint.ts";
 import { type IdentityKey, parseIdentity, verify } from "./identity.ts";
 import {
   exchangeKeySize,
@@ -84,7 +85,7 @@ export async function verifyBundle(
   bundle: KeyBundle,
 ): Promise<Uint8Array<ArrayBuffer> | null> {
   const key = decodeBase64Url(bundle.key, exchangeKeySize);
-  if (!key) {
+  if (!key || !isCanonicalExchangeKey(key)) {
     return null;
   }
   const valid = await verify(

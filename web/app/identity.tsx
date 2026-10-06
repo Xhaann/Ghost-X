@@ -7,7 +7,8 @@ import { useAuth } from "@/lib/useAuth.ts";
 import { type LocalState, useIdentity } from "@/lib/useIdentity.ts";
 import { usePresence } from "@/lib/usePresence.ts";
 import { useWhoami } from "@/lib/useWhoami.ts";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { type Fingerprint, fingerprint } from "@/lib/fingerprint.ts";
 import Messages from "./messages";
 
 const labels: Record<AuthState, string> = {
@@ -65,6 +66,35 @@ function Reset({ onReset }: { onReset: () => void }) {
   );
 }
 
+function OwnFingerprint({
+  identity,
+  exchangeKey,
+}: {
+  identity: string;
+  exchangeKey: string;
+}) {
+  const [print, setPrint] = useState<Fingerprint | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    fingerprint(identity, exchangeKey).then((value) => {
+      if (active) {
+        setPrint(value);
+      }
+    });
+    return () => {
+      active = false;
+      setPrint(null);
+    };
+  }, [identity, exchangeKey]);
+
+  return print ? (
+    <p>
+      Your fingerprint <code data-own-fingerprint>{print.digits}</code>
+    </p>
+  ) : null;
+}
+
 export default function Identity({ client }: { client: Client | null }) {
   const { local, reset } = useIdentity();
   const session = local.status === "ready" ? local : null;
@@ -87,6 +117,12 @@ export default function Identity({ client }: { client: Client | null }) {
         <p data-local={local.status}>
           {localLabels[local.status as keyof typeof localLabels]}
         </p>
+      )}
+      {session && (
+        <OwnFingerprint
+          identity={session.keys.identity.identity}
+          exchangeKey={session.keys.exchange.publicKey}
+        />
       )}
       {(session || local.status === "corrupted") && <Reset onReset={reset} />}
       <p data-auth={state}>{labels[state]}</p>

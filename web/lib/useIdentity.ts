@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { History } from "./history.ts";
 import { openIndexedStore } from "./storage.ts";
+import { Trust } from "./trust.ts";
 import { type Keys, loadVault } from "./vault.ts";
 
-export type LocalSession = { keys: Keys; history: History; created: boolean };
+export type LocalSession = {
+  keys: Keys;
+  history: History;
+  trust: Trust;
+  created: boolean;
+};
 
 export type LocalState =
   | { status: "loading" }
@@ -45,14 +51,22 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
         }
         return;
       }
-      const history = await History.open(store, vault.keys, vault.integrity);
-      const session = { keys: vault.keys, history, created: vault.created };
+      const [history, trust] = await Promise.all([
+        History.open(store, vault.keys, vault.integrity),
+        Trust.open(store, vault.integrity),
+      ]);
+      const session = {
+        keys: vault.keys,
+        history,
+        trust,
+        created: vault.created,
+      };
       if (active) {
         ready = session;
         setLocal({ status: "ready", ...session });
         return;
       }
-      await history.close();
+      await Promise.all([history.close(), trust.close()]);
       vault.keys.identity.release();
       vault.keys.exchange.release();
       close();
@@ -68,7 +82,7 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
       const session = ready;
       settled.current = task.then(async () => {
         if (session) {
-          await session.history.close();
+          await Promise.all([session.history.close(), session.trust.close()]);
           session.keys.identity.release();
           session.keys.exchange.release();
         }

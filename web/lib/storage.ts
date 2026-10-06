@@ -1,4 +1,4 @@
-export type StoreName = "vault" | "messages";
+export type StoreName = "vault" | "messages" | "trust";
 
 export type Entry = { key: string; value: unknown };
 
@@ -7,14 +7,20 @@ export interface KeyValueStore {
   getAll(store: StoreName): Promise<Entry[]>;
   put(store: StoreName, key: string, value: unknown): Promise<void>;
   add(store: StoreName, key: string, value: unknown): Promise<boolean>;
+  swap(
+    store: StoreName,
+    key: string,
+    matches: (current: unknown) => boolean,
+    value: unknown,
+  ): Promise<boolean>;
   delete(store: StoreName, keys: readonly string[]): Promise<void>;
   clear(): Promise<void>;
   close(): void;
 }
 
 const databaseName = "ghostx";
-const databaseVersion = 1;
-const stores: readonly StoreName[] = ["vault", "messages"];
+const databaseVersion = 2;
+const stores: readonly StoreName[] = ["vault", "messages", "trust"];
 
 function done(request: IDBRequest): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -85,6 +91,20 @@ function indexedStore(db: IDBDatabase): KeyValueStore {
       } catch {
         return false;
       }
+    },
+    async swap(store, key, matches, value) {
+      const tx = transaction([store], "readwrite");
+      const objects = tx.objectStore(store);
+      let swapped = false;
+      const request = objects.get(key);
+      request.onsuccess = () => {
+        if (matches(request.result)) {
+          objects.put(value, key);
+          swapped = true;
+        }
+      };
+      await committed(tx);
+      return swapped;
     },
     async delete(store, keys) {
       const tx = transaction([store], "readwrite");

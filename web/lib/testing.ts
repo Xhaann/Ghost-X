@@ -183,6 +183,23 @@ export function memoryStore(): KeyValueStore & {
       data.set(key(name, k), structuredClone(value));
       return true;
     },
+    async swap(
+      name: StoreName,
+      k: string,
+      matches: (current: unknown) => boolean,
+      value: unknown,
+    ) {
+      await Promise.resolve();
+      const current = data.get(key(name, k));
+      if (
+        !matches(current === undefined ? undefined : structuredClone(current))
+      ) {
+        return false;
+      }
+      store.writes += 1;
+      data.set(key(name, k), structuredClone(value));
+      return true;
+    },
     async delete(name: StoreName, keys: readonly string[]) {
       await Promise.resolve();
       keys.forEach((k) => data.delete(key(name, k)));

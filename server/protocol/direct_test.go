@@ -34,6 +34,14 @@ func (m *mailbox) all() []string {
 	return append([]string(nil), m.messages...)
 }
 
+func (m *mailbox) take() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	taken := m.messages
+	m.messages = nil
+	return taken
+}
+
 type directFixture struct {
 	router   *Router
 	sessions *auth.Registry
@@ -476,25 +484,26 @@ func FuzzSendPayload(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, payload string) {
 		sender, session, _ := fx.conn()
+		defer fx.direct.Detach(session)
 		defer session.Close()
 		authenticated(t, sender, a.signer)
 		if resp := decodeResponse(t, sender.Handle(publishRequest(a.key, a.signature))); resp.Type != "published" {
 			t.Fatalf("publish = %+v", resp)
 		}
-		before := len(box.all())
+		box.take()
 		payload = strings.ReplaceAll(payload, "RECIPIENT", recipient.identity)
 		out := sender.Handle([]byte(`{"type":"send","id":"m1","payload":` + payload + `}`))
 		var resp response
 		if err := json.Unmarshal(out, &resp); err != nil {
 			t.Fatalf("invalid response %q", out)
 		}
-		after := box.all()
+		delivered := box.take()
 		if resp.Type == "sent" {
-			if len(after) != before+1 || !strings.Contains(after[len(after)-1], `"from":"`+a.identity+`"`) || strings.Contains(after[len(after)-1], `"body"`) {
-				t.Fatalf("sent without exactly one sealed delivery from session identity: %v", after[before:])
+			if len(delivered) != 1 || !strings.Contains(delivered[0], `"from":"`+a.identity+`"`) || strings.Contains(delivered[0], `"body"`) {
+				t.Fatalf("sent without exactly one sealed delivery from session identity: %v", delivered)
 			}
-		} else if len(after) != before {
-			t.Fatalf("rejected request delivered %v", after[before:])
+		} else if len(delivered) != 0 {
+			t.Fatalf("rejected request delivered %v", delivered)
 		}
 	})
 }
