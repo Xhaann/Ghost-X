@@ -1,6 +1,10 @@
 package app
 
 import (
+	"crypto/ecdh"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -9,19 +13,60 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/Xhaann/ghost-x/server/protocol"
 )
 
 type peer struct {
-	conn     *websocket.Conn
-	key      key
-	messages chan message
+	conn      *websocket.Conn
+	key       key
+	exchange  string
+	signature string
+	messages  chan message
+}
+
+type sealed struct {
+	Salt       string `json:"salt"`
+	IV         string `json:"iv"`
+	Ciphertext string `json:"ciphertext"`
+}
+
+func randomText(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func newSealed(n int) sealed {
+	return sealed{Salt: randomText(protocol.SaltSize), IV: randomText(protocol.IVSize), Ciphertext: randomText(n)}
+}
+
+func bundleFor(t *testing.T, k key) (string, string) {
+	t.Helper()
+	private, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := private.PublicKey().Bytes()
+	signature := ed25519.Sign(k.private, protocol.KeyMessage(k.identity, raw))
+	return base64.RawURLEncoding.EncodeToString(raw), base64.RawURLEncoding.EncodeToString(signature)
 }
 
 func connectPeer(t *testing.T, url string, k key) *peer {
 	t.Helper()
+	exchange, signature := bundleFor(t, k)
+	return connectPeerWith(t, url, k, exchange, signature)
+}
+
+func connectPeerWith(t *testing.T, url string, k key, exchange, signature string) *peer {
+	t.Helper()
 	conn := dialApp(t, url)
 	authenticateConn(t, conn, k)
-	p := &peer{conn: conn, key: k, messages: make(chan message, 256)}
+	publish := fmt.Sprintf(`{"type":"publish","id":"k1","payload":{"key":%q,"signature":%q}}`, exchange, signature)
+	if msg := roundTrip(t, conn, publish); msg.Type != "published" {
+		t.Fatalf("publish = %+v %s", msg, msg.Payload)
+	}
+	p := &peer{conn: conn, key: k, exchange: exchange, signature: signature, messages: make(chan message, 512)}
 	go func() {
 		defer close(p.messages)
 		conn.SetReadDeadline(time.Time{})
@@ -40,13 +85,21 @@ func connectPeer(t *testing.T, url string, k key) *peer {
 	return p
 }
 
-func (p *peer) send(t *testing.T, id, to, body string) {
+func sendFrame(id, to string, s sealed) string {
+	payload, _ := json.Marshal(map[string]string{"to": to, "salt": s.Salt, "iv": s.IV, "ciphertext": s.Ciphertext})
+	return fmt.Sprintf(`{"type":"send","id":%q,"payload":%s}`, id, payload)
+}
+
+func (p *peer) write(t *testing.T, frame string) {
 	t.Helper()
-	payload, _ := json.Marshal(map[string]string{"to": to, "body": body})
-	request := fmt.Sprintf(`{"type":"send","id":%q,"payload":%s}`, id, payload)
-	if err := p.conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+	if err := p.conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func (p *peer) send(t *testing.T, id, to string, s sealed) {
+	t.Helper()
+	p.write(t, sendFrame(id, to, s))
 }
 
 func (p *peer) next(t *testing.T) message {
@@ -77,132 +130,147 @@ func (p *peer) expectError(t *testing.T, id, code string) {
 	}
 }
 
-func (p *peer) expectMessage(t *testing.T, from, body string) {
-	t.Helper()
-	p.expectMessageID(t, "", from, body)
-}
-
-func (p *peer) expectMessageID(t *testing.T, id, from, body string) {
+func (p *peer) expectDelivery(t *testing.T, id string, from *peer, s sealed) {
 	t.Helper()
 	msg := p.next(t)
 	var payload map[string]string
 	json.Unmarshal(msg.Payload, &payload)
-	if msg.Type != "message" || msg.ID != "" || len(payload) != 3 || payload["from"] != from || payload["body"] != body || (id != "" && payload["id"] != id) {
-		t.Fatalf("delivery = %+v %s, want from %s body %q", msg, msg.Payload, from, body)
+	want := map[string]string{
+		"id": id, "from": from.key.identity, "key": from.exchange, "signature": from.signature,
+		"salt": s.Salt, "iv": s.IV, "ciphertext": s.Ciphertext,
+	}
+	if msg.Type != "message" || msg.ID != "" || len(payload) != len(want) {
+		t.Fatalf("delivery = %+v %s", msg, msg.Payload)
+	}
+	for k, v := range want {
+		if payload[k] != v {
+			t.Fatalf("delivery %s = %q, want %q", k, payload[k], v)
+		}
 	}
 }
 
 func (p *peer) barrier(t *testing.T, id string) {
 	t.Helper()
-	if err := p.conn.WriteMessage(websocket.TextMessage, []byte(pingRequest(id, 1))); err != nil {
-		t.Fatal(err)
-	}
+	p.write(t, pingRequest(id, 1))
 	if msg := p.next(t); msg.Type != "pong" || msg.ID != id {
 		t.Fatalf("barrier = %+v, want pong %s", msg, id)
 	}
 }
 
-func TestDirectMessageDelivered(t *testing.T) {
+func TestEncryptedEnvelopeRoutedUnchanged(t *testing.T) {
 	_, url := startServer(t)
 	a := connectPeer(t, url, newKey(t))
 	b := connectPeer(t, url, newKey(t))
 
-	a.send(t, "m1", b.key.identity, "hello from a")
+	first, second := newSealed(48), newSealed(64)
+	a.send(t, "m1", b.key.identity, first)
 	a.expectSent(t, "m1")
-	b.expectMessageID(t, "m1", a.key.identity, "hello from a")
+	b.expectDelivery(t, "m1", a, first)
 
-	b.send(t, "m2", a.key.identity, "hello from b")
+	b.send(t, "m2", a.key.identity, second)
 	b.expectSent(t, "m2")
-	a.expectMessageID(t, "m2", b.key.identity, "hello from b")
+	a.expectDelivery(t, "m2", b, second)
 }
 
-func TestDirectMessageReachesEveryRecipientSessionOnce(t *testing.T) {
+func TestKeyLookupOverWebSocket(t *testing.T) {
+	_, url := startServer(t)
+	a := connectPeer(t, url, newKey(t))
+	b := connectPeer(t, url, newKey(t))
+
+	a.write(t, `{"type":"key","id":"q1","payload":{"identity":"`+b.key.identity+`"}}`)
+	msg := a.next(t)
+	want := `{"identity":"` + b.key.identity + `","key":"` + b.exchange + `","signature":"` + b.signature + `"}`
+	if msg.Type != "key" || msg.ID != "q1" || string(msg.Payload) != want {
+		t.Fatalf("key = %+v %s", msg, msg.Payload)
+	}
+}
+
+func TestPlaintextRejectedOverWebSocket(t *testing.T) {
+	_, url := startServer(t)
+	a := connectPeer(t, url, newKey(t))
+	b := connectPeer(t, url, newKey(t))
+
+	a.write(t, `{"type":"send","id":"p1","payload":{"to":"`+b.key.identity+`","body":"plaintext secret"}}`)
+	a.expectError(t, "p1", "invalid_payload")
+	b.barrier(t, "b1")
+}
+
+func TestEncryptedMessageReachesEveryRecipientSessionOnce(t *testing.T) {
 	_, url := startServer(t)
 	aKey, bKey := newKey(t), newKey(t)
-	a := connectPeer(t, url, aKey)
-	aOther := connectPeer(t, url, aKey)
-	b1 := connectPeer(t, url, bKey)
-	b2 := connectPeer(t, url, bKey)
+	aExchange, aSignature := bundleFor(t, aKey)
+	bExchange, bSignature := bundleFor(t, bKey)
+	a := connectPeerWith(t, url, aKey, aExchange, aSignature)
+	aOther := connectPeerWith(t, url, aKey, aExchange, aSignature)
+	b1 := connectPeerWith(t, url, bKey, bExchange, bSignature)
+	b2 := connectPeerWith(t, url, bKey, bExchange, bSignature)
 
-	a.send(t, "m1", bKey.identity, "one")
+	s := newSealed(40)
+	a.send(t, "m1", bKey.identity, s)
 	a.expectSent(t, "m1")
-	a.send(t, "m2", bKey.identity, "two")
-	a.expectSent(t, "m2")
-
 	for _, b := range []*peer{b1, b2} {
-		b.expectMessage(t, aKey.identity, "one")
-		b.expectMessage(t, aKey.identity, "two")
+		b.expectDelivery(t, "m1", a, s)
 		b.barrier(t, "p1")
 	}
 	a.barrier(t, "p2")
 	aOther.barrier(t, "p3")
 }
 
-func TestDirectMessageUnavailableRecipient(t *testing.T) {
+func TestSecondSessionCannotBindDifferentKey(t *testing.T) {
 	_, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
-	absent := newKey(t)
+	bKey := newKey(t)
+	connectPeer(t, url, bKey)
 
-	a.send(t, "m1", absent.identity, "x")
-	a.expectError(t, "m1", "recipient_unavailable")
-
-	b := connectPeer(t, url, absent)
-	b.conn.Close()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		a.send(t, "m2", absent.identity, "x")
-		msg := a.next(t)
-		if msg.Type == "error" && string(msg.Payload) == `{"code":"recipient_unavailable"}` {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("recipient still reachable after disconnect: %+v", msg)
-		}
-	}
-}
-
-func TestDirectMessageRequiresAuthentication(t *testing.T) {
-	_, url := startServer(t)
-	b := connectPeer(t, url, newKey(t))
 	conn := dialApp(t, url)
-
-	payload, _ := json.Marshal(map[string]string{"to": b.key.identity, "body": "x"})
-	expectError(t, roundTrip(t, conn, `{"type":"send","id":"m1","payload":`+string(payload)+`}`), "authentication_required")
-	challenge(t, conn)
-	expectError(t, roundTrip(t, conn, `{"type":"send","id":"m2","payload":`+string(payload)+`}`), "authentication_required")
-
-	b.barrier(t, "p1")
+	authenticateConn(t, conn, bKey)
+	exchange, signature := bundleFor(t, bKey)
+	expectError(t, roundTrip(t, conn, fmt.Sprintf(`{"type":"publish","id":"k1","payload":{"key":%q,"signature":%q}}`, exchange, signature)), "invalid_payload")
 }
 
-func TestDirectMessageRejectsForgedSender(t *testing.T) {
+func TestEncryptedSendFailures(t *testing.T) {
 	_, url := startServer(t)
 	a := connectPeer(t, url, newKey(t))
 	b := connectPeer(t, url, newKey(t))
 	c := newKey(t)
 
-	forged := `{"type":"send","id":"m1","payload":{"to":"` + b.key.identity + `","body":"x","from":"` + c.identity + `"}}`
-	if err := a.conn.WriteMessage(websocket.TextMessage, []byte(forged)); err != nil {
-		t.Fatal(err)
-	}
-	a.expectError(t, "m1", "invalid_payload")
+	a.send(t, "m1", c.identity, newSealed(32))
+	a.expectError(t, "m1", "recipient_unavailable")
 
-	a.send(t, "m2", b.key.identity, "genuine")
+	s := newSealed(32)
+	a.send(t, "m2", b.key.identity, s)
 	a.expectSent(t, "m2")
-	b.expectMessage(t, a.key.identity, "genuine")
+	a.send(t, "m2", b.key.identity, s)
+	a.expectError(t, "m2", "duplicate_message")
+	b.expectDelivery(t, "m2", a, s)
+	b.barrier(t, "b1")
+
+	forged := `{"type":"send","id":"m3","payload":{"to":"` + b.key.identity + `","from":"` + c.identity + `","salt":"` + s.Salt + `","iv":"` + s.IV + `","ciphertext":"` + s.Ciphertext + `"}}`
+	a.write(t, forged)
+	a.expectError(t, "m3", "invalid_payload")
+
+	a.send(t, "m4", b.key.identity, newSealed(protocol.MaxCiphertext+1))
+	a.expectError(t, "m4", "message_too_large")
+	big := newSealed(protocol.MaxCiphertext)
+	a.send(t, "m5", b.key.identity, big)
+	a.expectSent(t, "m5")
+	b.expectDelivery(t, "m5", a, big)
 }
 
-func TestDirectMessageSizeLimits(t *testing.T) {
+func TestEncryptedSendRequiresAuthenticationAndKey(t *testing.T) {
 	_, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
 	b := connectPeer(t, url, newKey(t))
 
-	a.send(t, "m1", b.key.identity, strings.Repeat("a", 4097))
-	a.expectError(t, "m1", "message_too_large")
-	a.send(t, "m2", b.key.identity, strings.Repeat("a", 4096))
-	a.expectSent(t, "m2")
-	b.expectMessage(t, a.key.identity, strings.Repeat("a", 4096))
+	conn := dialApp(t, url)
+	expectError(t, roundTrip(t, conn, sendFrame("m1", b.key.identity, newSealed(32))), "authentication_required")
+	authenticateConn(t, conn, newKey(t))
+	expectError(t, roundTrip(t, conn, sendFrame("m2", b.key.identity, newSealed(32))), "key_required")
+	b.barrier(t, "b1")
+}
 
-	a.send(t, "m3", b.key.identity, strings.Repeat("a", 40<<10))
+func TestOversizedFrameClosesConnection(t *testing.T) {
+	_, url := startServer(t)
+	a := connectPeer(t, url, newKey(t))
+	a.write(t, sendFrame("m1", a.key.identity, sealed{Salt: "x", IV: "x", Ciphertext: strings.Repeat("A", 40<<10)}))
 	select {
 	case _, ok := <-a.messages:
 		if ok {
@@ -213,7 +281,7 @@ func TestDirectMessageSizeLimits(t *testing.T) {
 	}
 }
 
-func TestDirectMessageAfterReconnectRequiresAuthentication(t *testing.T) {
+func TestReconnectRequiresAuthenticationAndKeyAgain(t *testing.T) {
 	_, url := startServer(t)
 	aKey := newKey(t)
 	b := connectPeer(t, url, newKey(t))
@@ -221,12 +289,13 @@ func TestDirectMessageAfterReconnectRequiresAuthentication(t *testing.T) {
 	first.conn.Close()
 
 	conn := dialApp(t, url)
-	payload, _ := json.Marshal(map[string]string{"to": b.key.identity, "body": "x"})
-	expectError(t, roundTrip(t, conn, `{"type":"send","id":"m1","payload":`+string(payload)+`}`), "authentication_required")
+	expectError(t, roundTrip(t, conn, sendFrame("m1", b.key.identity, newSealed(32))), "authentication_required")
+	authenticateConn(t, conn, aKey)
+	expectError(t, roundTrip(t, conn, sendFrame("m2", b.key.identity, newSealed(32))), "key_required")
 	b.barrier(t, "p1")
 }
 
-func TestConcurrentDirectMessaging(t *testing.T) {
+func TestConcurrentEncryptedMessaging(t *testing.T) {
 	_, url := startServer(t)
 	const peers = 6
 	const perPair = 10
@@ -245,7 +314,7 @@ func TestConcurrentDirectMessaging(t *testing.T) {
 				}
 				for range perPair {
 					n++
-					sender.send(t, fmt.Sprintf("m%d", n), recipient.key.identity, sender.key.identity)
+					sender.send(t, fmt.Sprintf("m%d", n), recipient.key.identity, newSealed(24))
 				}
 			}
 		})
@@ -254,7 +323,7 @@ func TestConcurrentDirectMessaging(t *testing.T) {
 
 	for _, p := range all {
 		sent, received := 0, map[string]int{}
-		for sent < (peers-1)*perPair || len(received) < peers-1 || total(received) < (peers-1)*perPair {
+		for sent < (peers-1)*perPair || total(received) < (peers-1)*perPair {
 			msg := p.next(t)
 			switch msg.Type {
 			case "sent":
@@ -262,9 +331,6 @@ func TestConcurrentDirectMessaging(t *testing.T) {
 			case "message":
 				var payload map[string]string
 				json.Unmarshal(msg.Payload, &payload)
-				if payload["from"] != payload["body"] {
-					t.Fatalf("sender mismatch: from %s body %s", payload["from"], payload["body"])
-				}
 				received[payload["from"]]++
 			default:
 				t.Fatalf("unexpected %+v %s", msg, msg.Payload)
@@ -286,15 +352,16 @@ func total(counts map[string]int) int {
 	return n
 }
 
-func TestRecipientDisconnectDuringDelivery(t *testing.T) {
+func TestRecipientDisconnectDuringEncryptedDelivery(t *testing.T) {
 	srv, url := startServer(t)
 	a := connectPeer(t, url, newKey(t))
 	bKey := newKey(t)
+	exchange, signature := bundleFor(t, bKey)
 
-	for range 20 {
-		b := connectPeer(t, url, bKey)
+	for i := range 20 {
+		b := connectPeerWith(t, url, bKey, exchange, signature)
 		var wg sync.WaitGroup
-		wg.Go(func() { a.send(t, "m1", bKey.identity, "race") })
+		wg.Go(func() { a.send(t, fmt.Sprintf("m%d", i), bKey.identity, newSealed(24)) })
 		wg.Go(func() { b.conn.Close() })
 		wg.Wait()
 		msg := a.next(t)

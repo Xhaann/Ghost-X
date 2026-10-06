@@ -10,6 +10,7 @@ import type {
 } from "@/lib/conversations.ts";
 import { bodySize, maxBodySize } from "@/lib/protocol.ts";
 import { useConversations } from "@/lib/useConversations.ts";
+import type { Keys } from "@/lib/useIdentity.ts";
 
 const deliveryLabels: Record<DeliveryState, string> = {
   sending: "Sending",
@@ -26,9 +27,10 @@ const rejections: Record<string, string> = {
 };
 
 function status(message: ConversationMessage): string {
-  return message.direction === "sent"
-    ? deliveryLabels[message.delivery]
-    : "Received";
+  if (message.direction === "sent") {
+    return deliveryLabels[message.delivery];
+  }
+  return message.body === null ? "Could not be decrypted" : "Received";
 }
 
 function ConversationList({
@@ -69,16 +71,16 @@ function ConversationList({
 export default function Messages({
   client,
   authenticator,
-  self,
+  keys,
 }: {
   client: Client | null;
   authenticator: Authenticator | null;
-  self: string | null;
+  keys: Keys | null;
 }) {
   const { state, open, close, send } = useConversations(
     client,
     authenticator,
-    self,
+    keys,
   );
   const [recipient, setRecipient] = useState("");
   const [body, setBody] = useState("");
@@ -113,7 +115,7 @@ export default function Messages({
     setPending(false);
   };
 
-  if (!self || !authenticator) {
+  if (!keys || !authenticator) {
     return null;
   }
 
@@ -140,6 +142,7 @@ export default function Messages({
           <p>
             Conversation with <code>{active.identity}</code>
           </p>
+          <p data-encryption>End-to-end encrypted to this identity</p>
           <button type="button" onClick={close}>
             Close conversation
           </button>
@@ -155,7 +158,7 @@ export default function Messages({
                     message.direction === "sent" ? message.delivery : undefined
                   }
                 >
-                  <p>{message.body}</p>
+                  {message.body !== null && <p>{message.body}</p>}
                   <small>{status(message)}</small>
                 </li>
               ))}

@@ -31,7 +31,8 @@ function presenceLabel(presence: PresenceState, self: string | undefined) {
 }
 
 export default function Identity({ client }: { client: Client | null }) {
-  const key = useIdentity();
+  const keys = useIdentity();
+  const key = keys?.identity ?? null;
   const { state, authenticator } = useAuth(client, key);
   const presence = usePresence(client, authenticator);
   const { query, result } = useWhoami(client, state);
@@ -78,11 +79,7 @@ export default function Identity({ client }: { client: Client | null }) {
             ))}
         </>
       )}
-      <Messages
-        client={client}
-        authenticator={authenticator}
-        self={key?.identity ?? null}
-      />
+      <Messages client={client} authenticator={authenticator} keys={keys} />
     </section>
   );
 }

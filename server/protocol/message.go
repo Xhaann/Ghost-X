@@ -14,6 +14,8 @@ const (
 	CodeAuthFailed      Code = "authentication_failed"
 	CodeUnavailable     Code = "recipient_unavailable"
 	CodeTooLarge        Code = "message_too_large"
+	CodeKeyRequired     Code = "key_required"
+	CodeDuplicate       Code = "duplicate_message"
 	CodeInternalError   Code = "internal_error"
 )
 

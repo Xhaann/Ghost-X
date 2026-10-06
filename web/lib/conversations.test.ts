@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
+import { ExchangeKey } from "./encryption.ts";
 import {
   type ConversationsState,
   Conversations,
@@ -80,7 +81,7 @@ function conversation(store: Conversations, identity: string) {
   return store.state.conversations.find((c) => c.identity === identity);
 }
 
-function bodies(store: Conversations, identity: string): string[] {
+function bodies(store: Conversations, identity: string): (string | null)[] {
   return conversation(store, identity)?.messages.map((m) => m.body) ?? [];
 }
 
@@ -236,6 +237,24 @@ test("ignores duplicate message ids", async () => {
   assert.deepEqual(bodies(store, b), ["same"]);
   assert.equal(conversation(store, b)?.unread, 1);
   assert.equal(log.length, emissions);
+});
+
+test("records undecryptable messages without fabricated text", async () => {
+  const { store, source, b } = await setup();
+
+  source.deliver({ id: "bad", from: b, body: null });
+  source.deliver({ id: "bad", from: b, body: null });
+  source.deliver({ id: "good", from: b, body: "readable" });
+
+  const messages = conversation(store, b)?.messages ?? [];
+  assert.deepEqual(
+    messages.map((m) => [m.id, m.direction, m.body]),
+    [
+      ["bad", "received", null],
+      ["good", "received", "readable"],
+    ],
+  );
+  assert.equal(conversation(store, b)?.unread, 2);
 });
 
 test("does not duplicate a self-addressed message", async () => {
@@ -492,7 +511,10 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
 
 async function peer(port: number): Promise<Peer> {
   const before = created.length;
-  const key = await IdentityKey.generate();
+  const [key, exchange] = await Promise.all([
+    IdentityKey.generate(),
+    ExchangeKey.generate(),
+  ]);
   const client = track(
     new Client(
       track(
@@ -501,7 +523,7 @@ async function peer(port: number): Promise<Peer> {
     ),
   );
   const auth = new Authenticator(client, key);
-  const messenger = new Messenger(client, auth);
+  const messenger = new Messenger(client, auth, key, exchange);
   const store = new Conversations(messenger, key.identity);
   track({ close: () => store.stop() });
   track({ close: () => messenger.stop() });
@@ -566,16 +588,20 @@ test("real duplicate frames and reconnects do not duplicate messages", async () 
   const a = await peer(port);
   const b = await peer(port);
 
+  const captured: string[] = [];
+  b.socket.addEventListener("message", (event) =>
+    captured.push(String(event.data)),
+  );
   a.store.open(b.key.identity);
   const sent = accepted(a.store, "once");
   await sent.delivery;
   await until(() => bodies(b.store, a.key.identity).length === 1, "delivery");
-  const frame = JSON.stringify({
-    type: "message",
-    payload: { id: sent.id, from: a.key.identity, body: "once" },
-  });
+  const frame = captured.find((data) => data.includes(sent.id));
+  assert.ok(frame);
   b.socket.dispatchEvent(new MessageEvent("message", { data: frame }));
   b.socket.dispatchEvent(new MessageEvent("message", { data: frame }));
+  await barrier(b);
+  await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual(bodies(b.store, a.key.identity), ["once"]);
 
   await stopServer(server);

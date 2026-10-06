@@ -7,6 +7,7 @@ import {
   type SendAttempt,
 } from "./conversations.ts";
 import { Messenger } from "./messenger.ts";
+import type { Keys } from "./useIdentity.ts";
 
 const empty: ConversationsState = {
   connected: false,
@@ -17,7 +18,7 @@ const empty: ConversationsState = {
 export function useConversations(
   client: Client | null,
   authenticator: Authenticator | null,
-  self: string | null,
+  keys: Keys | null,
 ): {
   state: ConversationsState;
   open: (identity: string) => boolean;
@@ -28,11 +29,16 @@ export function useConversations(
   const store = useRef<Conversations | null>(null);
 
   useEffect(() => {
-    if (!client || !authenticator || !self) {
+    if (!client || !authenticator || !keys) {
       return;
     }
-    const messenger = new Messenger(client, authenticator);
-    const conversations = new Conversations(messenger, self);
+    const messenger = new Messenger(
+      client,
+      authenticator,
+      keys.identity,
+      keys.exchange,
+    );
+    const conversations = new Conversations(messenger, keys.identity.identity);
     store.current = conversations;
     const unsubscribe = conversations.onState(setState);
     messenger.start();
@@ -47,7 +53,7 @@ export function useConversations(
       }
       setState(empty);
     };
-  }, [client, authenticator, self]);
+  }, [client, authenticator, keys]);
 
   const open = useCallback(
     (identity: string) => store.current?.open(identity) ?? false,

@@ -9,13 +9,16 @@ type MessageBase = {
   id: string;
   from: string;
   to: string;
-  body: string;
   sequence: number;
 };
 
 export type ConversationMessage =
-  | (MessageBase & { direction: "sent"; delivery: DeliveryState })
-  | (MessageBase & { direction: "received" });
+  | (MessageBase & {
+      direction: "sent";
+      body: string;
+      delivery: DeliveryState;
+    })
+  | (MessageBase & { direction: "received"; body: string | null });
 
 export type Conversation = {
   identity: string;

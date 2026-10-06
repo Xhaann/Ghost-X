@@ -67,6 +67,8 @@ func New(cfg config.Config) *Server {
 		"whoami":   protocol.WhoAmI(),
 		"presence": protocol.Presence(present),
 		"send":     protocol.Send(messages),
+		"publish":  protocol.Publish(messages),
+		"key":      protocol.Key(messages),
 	})
 
 	opts := socket.DefaultOptions()

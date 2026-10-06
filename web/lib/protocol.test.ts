@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { encodeBase64Url } from "./base64.ts";
 import {
   bodySize,
   createId,
@@ -182,23 +183,51 @@ test("rejects malformed presence messages", () => {
   }
 });
 
-test("parses messaging replies and deliveries", () => {
-  const from = "B".repeat(42) + "A";
+function b64(size: number): string {
+  return encodeBase64Url(crypto.getRandomValues(new Uint8Array(size)));
+}
+
+function delivery(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "m1",
+    from: "B".repeat(42) + "A",
+    key: b64(32),
+    signature: b64(64),
+    salt: b64(32),
+    iv: b64(12),
+    ciphertext: b64(40),
+    ...overrides,
+  };
+}
+
+test("parses messaging replies, key bundles, and encrypted deliveries", () => {
+  const identity = "B".repeat(42) + "A";
   assert.deepEqual(parse('{"type":"sent","id":"m1","payload":{}}'), {
     type: "sent",
     id: "m1",
     payload: {},
   });
+  assert.deepEqual(parse('{"type":"published","id":"k1","payload":{}}'), {
+    type: "published",
+    id: "k1",
+    payload: {},
+  });
+  const bundle = { identity, key: b64(32), signature: b64(64) };
   assert.deepEqual(
-    parse(
-      JSON.stringify({
-        type: "message",
-        payload: { id: "m1", from, body: "hi\n" },
-      }),
-    ),
-    { type: "message", payload: { id: "m1", from, body: "hi\n" } },
+    parse(JSON.stringify({ type: "key", id: "q1", payload: bundle })),
+    { type: "key", id: "q1", payload: bundle },
   );
-  for (const code of ["recipient_unavailable", "message_too_large"]) {
+  const payload = delivery();
+  assert.deepEqual(parse(JSON.stringify({ type: "message", payload })), {
+    type: "message",
+    payload,
+  });
+  for (const code of [
+    "recipient_unavailable",
+    "message_too_large",
+    "key_required",
+    "duplicate_message",
+  ]) {
     assert.deepEqual(
       parse(JSON.stringify({ type: "error", id: "m1", payload: { code } })),
       { type: "error", id: "m1", payload: { code } },
@@ -206,31 +235,57 @@ test("parses messaging replies and deliveries", () => {
   }
 });
 
-test("rejects malformed messaging frames", () => {
-  const from = "B".repeat(42) + "A";
+test("rejects malformed key bundles and deliveries", () => {
+  const identity = "B".repeat(42) + "A";
+  const bundle = { identity, key: b64(32), signature: b64(64) };
   for (const message of [
-    { type: "sent", payload: {} },
-    { type: "sent", id: "m1", payload: { to: from } },
-    { type: "message", id: "m1", payload: { id: "m1", from, body: "x" } },
-    { type: "message", payload: { from, body: "x" } },
-    { type: "message", payload: { id: "", from, body: "x" } },
-    { type: "message", payload: { id: "bad id", from, body: "x" } },
-    { type: "message", payload: { id: "a".repeat(65), from, body: "x" } },
-    { type: "message", payload: { id: 1, from, body: "x" } },
-    { type: "message", payload: { id: "m1", body: "x" } },
-    { type: "message", payload: { id: "m1", from, body: "" } },
-    { type: "message", payload: { id: "m1", from, body: 1 } },
-    { type: "message", payload: { id: "m1", from: "short", body: "x" } },
-    { type: "message", payload: { id: "m1", from, body: "x", to: from } },
-    { type: "message", payload: { id: "m1", from, body: "a\u0000b" } },
+    { type: "key", payload: bundle },
+    { type: "key", id: "q1", payload: { ...bundle, key: b64(31) } },
+    { type: "key", id: "q1", payload: { ...bundle, signature: b64(63) } },
+    { type: "key", id: "q1", payload: { ...bundle, identity: "short" } },
+    { type: "key", id: "q1", payload: { ...bundle, private: b64(32) } },
+    { type: "published", payload: {} },
+    { type: "published", id: "k1", payload: { key: b64(32) } },
+    { type: "message", id: "m1", payload: delivery() },
+    { type: "message", payload: delivery({ body: "plaintext" }) },
     {
       type: "message",
-      payload: { id: "m1", from, body: "a".repeat(maxBodySize + 1) },
+      payload: { ...delivery(), ciphertext: undefined, body: "x" },
     },
-    { type: "message", payload: { id: "m1", from, body: "x" }, extra: 1 },
+    { type: "message", payload: delivery({ id: "bad id" }) },
+    { type: "message", payload: delivery({ from: "short" }) },
+    { type: "message", payload: delivery({ key: b64(33) }) },
+    { type: "message", payload: delivery({ signature: "x" }) },
+    { type: "message", payload: delivery({ salt: b64(31) }) },
+    { type: "message", payload: delivery({ iv: b64(16) }) },
+    { type: "message", payload: delivery({ iv: b64(12) + "=" }) },
+    { type: "message", payload: delivery({ ciphertext: "" }) },
+    { type: "message", payload: delivery({ ciphertext: b64(16) }) },
+    {
+      type: "message",
+      payload: delivery({ ciphertext: b64(maxBodySize + 17) }),
+    },
+    { type: "message", payload: delivery({ ciphertext: 7 }) },
+    { type: "message", payload: delivery(), extra: 1 },
   ]) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
   }
+  assert.ok(
+    parse(
+      JSON.stringify({
+        type: "message",
+        payload: delivery({ ciphertext: b64(17) }),
+      }),
+    ),
+  );
+  assert.ok(
+    parse(
+      JSON.stringify({
+        type: "message",
+        payload: delivery({ ciphertext: b64(maxBodySize + 16) }),
+      }),
+    ),
+  );
 });
 
 test("validates message bodies like the server", () => {

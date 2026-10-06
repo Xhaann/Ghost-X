@@ -1,35 +1,40 @@
 import { useEffect, useState } from "react";
+import { ExchangeKey } from "./encryption.ts";
 import { IdentityKey } from "./identity.ts";
 
-export function useIdentity(): IdentityKey | null {
-  const [key, setKey] = useState<IdentityKey | null>(null);
+export type Keys = { identity: IdentityKey; exchange: ExchangeKey };
+
+export function useIdentity(): Keys | null {
+  const [keys, setKeys] = useState<Keys | null>(null);
 
   useEffect(() => {
     let active = true;
-    let generated: IdentityKey | null = null;
+    let generated: Keys | null = null;
 
-    IdentityKey.generate().then(
-      (key) => {
-        generated = key;
+    Promise.all([IdentityKey.generate(), ExchangeKey.generate()]).then(
+      ([identity, exchange]) => {
+        generated = { identity, exchange };
         if (active) {
-          setKey(key);
+          setKeys(generated);
         } else {
-          key.release();
+          identity.release();
+          exchange.release();
         }
       },
       () => {
         if (active) {
-          setKey(null);
+          setKeys(null);
         }
       },
     );
 
     return () => {
       active = false;
-      generated?.release();
-      setKey(null);
+      generated?.identity.release();
+      generated?.exchange.release();
+      setKeys(null);
     };
   }, []);
 
-  return key;
+  return keys;
 }

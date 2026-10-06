@@ -1,9 +1,11 @@
 import type { Client } from "./client.ts";
-import { isIdentity } from "./identity.ts";
+import { type ExchangeKey, verifyBundle } from "./encryption.ts";
+import { type IdentityKey, isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
 import type { AuthSource } from "./presence.ts";
 import {
   type ErrorCode,
+  type ServerMessage,
   bodySize,
   createId,
   isValidBody,
@@ -12,23 +14,40 @@ import {
 } from "./protocol.ts";
 
 export type SendResult =
-  { ok: true } | { ok: false; reason: ErrorCode | "not_sent" };
+  | { ok: true }
+  | { ok: false; reason: ErrorCode | "not_sent" | "encryption_failed" };
 
-export type Incoming = { id: string; from: string; body: string };
+export type Incoming = { id: string; from: string; body: string | null };
 
 export type MessengerState = { active: boolean };
+
+export const maxPendingDecryptions = 128;
+
+type Delivery = Extract<ServerMessage, { type: "message" }>["payload"];
 
 export class Messenger {
   readonly #client: Client;
   readonly #auth: AuthSource;
+  readonly #identity: IdentityKey;
+  readonly #exchange: ExchangeKey;
   readonly #states = new Listeners<MessengerState>();
   readonly #messages = new Listeners<Incoming>();
   #state: MessengerState = { active: false };
+  #generation = 0;
+  #pending = 0;
+  #queue: Promise<void> = Promise.resolve();
   #detach: (() => void) | null = null;
 
-  constructor(client: Client, auth: AuthSource) {
+  constructor(
+    client: Client,
+    auth: AuthSource,
+    identity: IdentityKey,
+    exchange: ExchangeKey,
+  ) {
     this.#client = client;
     this.#auth = auth;
+    this.#identity = identity;
+    this.#exchange = exchange;
   }
 
   get state(): MessengerState {
@@ -49,20 +68,28 @@ export class Messenger {
     }
     const detach = [
       this.#client.onMessage((message) => {
-        if (message.type === "message" && this.#state.active) {
-          this.#messages.emit({ ...message.payload });
+        if (message.type === "message") {
+          this.#receive(message.payload);
         }
       }),
-      this.#auth.onState((state) => this.#activate(state === "authenticated")),
+      this.#auth.onState((state) => {
+        if (state === "authenticated") {
+          this.#publish();
+        } else {
+          this.#deactivate();
+        }
+      }),
     ];
     this.#detach = () => detach.forEach((release) => release());
-    this.#activate(this.#auth.state === "authenticated");
+    if (this.#auth.state === "authenticated") {
+      this.#publish();
+    }
   }
 
   stop(): void {
     this.#detach?.();
     this.#detach = null;
-    this.#activate(false);
+    this.#deactivate();
   }
 
   async send(
@@ -82,8 +109,41 @@ export class Messenger {
     if (!isValidBody(body)) {
       return { ok: false, reason: "invalid_payload" };
     }
+    const generation = this.#generation;
+
+    const bundle = await this.#client.request({
+      type: "key",
+      payload: { identity: to },
+    });
+    if (bundle?.type === "error") {
+      return { ok: false, reason: bundle.payload.code };
+    }
+    if (bundle?.type !== "key" || bundle.payload.identity !== to) {
+      return { ok: false, reason: "not_sent" };
+    }
+    const toKey = await verifyBundle(bundle.payload);
+    if (!toKey) {
+      return { ok: false, reason: "encryption_failed" };
+    }
+    const sealed = await this.#exchange.seal(
+      {
+        id,
+        from: this.#identity.identity,
+        to,
+        fromKey: this.#exchange.publicRaw,
+        toKey,
+      },
+      body,
+    );
+    if (!sealed) {
+      return { ok: false, reason: "encryption_failed" };
+    }
+    if (generation !== this.#generation) {
+      return { ok: false, reason: "not_sent" };
+    }
+
     const reply = await this.#client.request(
-      { type: "send", payload: { to, body } },
+      { type: "send", payload: { to, ...sealed } },
       5000,
       id,
     );
@@ -96,7 +156,80 @@ export class Messenger {
     return { ok: false, reason: "not_sent" };
   }
 
-  #activate(active: boolean): void {
+  #publish(): void {
+    const generation = ++this.#generation;
+    this.#setActive(false);
+    this.#exchange
+      .bind(this.#identity)
+      .then(async (bundle) => {
+        if (!bundle || generation !== this.#generation) {
+          return;
+        }
+        const reply = await this.#client.request({
+          type: "publish",
+          payload: { key: bundle.key, signature: bundle.signature },
+        });
+        if (generation === this.#generation && reply?.type === "published") {
+          this.#setActive(true);
+        }
+      })
+      .catch(() => {});
+  }
+
+  #deactivate(): void {
+    this.#generation += 1;
+    this.#setActive(false);
+  }
+
+  #receive(delivery: Delivery): void {
+    if (!this.#state.active) {
+      return;
+    }
+    const generation = this.#generation;
+    if (this.#pending >= maxPendingDecryptions) {
+      this.#messages.emit({ id: delivery.id, from: delivery.from, body: null });
+      return;
+    }
+    this.#pending += 1;
+    this.#queue = this.#queue.then(async () => {
+      const body = await this.#open(delivery);
+      this.#pending -= 1;
+      if (generation === this.#generation) {
+        this.#messages.emit({ id: delivery.id, from: delivery.from, body });
+      }
+    });
+  }
+
+  async #open(delivery: Delivery): Promise<string | null> {
+    try {
+      const fromKey = await verifyBundle({
+        identity: delivery.from,
+        key: delivery.key,
+        signature: delivery.signature,
+      });
+      if (!fromKey) {
+        return null;
+      }
+      return await this.#exchange.open(
+        {
+          id: delivery.id,
+          from: delivery.from,
+          to: this.#identity.identity,
+          fromKey,
+          toKey: this.#exchange.publicRaw,
+        },
+        {
+          salt: delivery.salt,
+          iv: delivery.iv,
+          ciphertext: delivery.ciphertext,
+        },
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  #setActive(active: boolean): void {
     if (this.#state.active === active) {
       return;
     }

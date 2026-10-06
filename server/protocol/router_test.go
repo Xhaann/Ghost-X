@@ -51,6 +51,7 @@ func testSession() *auth.Session {
 }
 
 func newTestRouter() *Router {
+	messages := direct.NewRegistry()
 	return NewRouter(map[string]Handler{
 		"ping":         Ping(time.Now),
 		"challenge":    Challenge(),
@@ -58,7 +59,9 @@ func newTestRouter() *Router {
 	}, map[string]ProtectedHandler{
 		"whoami":   WhoAmI(),
 		"presence": Presence(presence.NewRegistry()),
-		"send":     Send(direct.NewRegistry()),
+		"send":     Send(messages),
+		"publish":  Publish(messages),
+		"key":      Key(messages),
 	})
 }
 
@@ -198,7 +201,9 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"challenge","id":"a","payload":{}}`,
 		`{"type":"whoami","id":"a","payload":{}}`,
 		`{"type":"presence","id":"a","payload":{}}`,
-		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","body":"x"}}`,
+		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","salt":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","iv":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"publish","id":"a","payload":{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
+		`{"type":"key","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"present","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"authenticate","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 	} {
