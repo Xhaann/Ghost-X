@@ -12,6 +12,8 @@ const (
 	CodeInvalidPayload  Code = "invalid_payload"
 	CodeAuthRequired    Code = "authentication_required"
 	CodeAuthFailed      Code = "authentication_failed"
+	CodeUnavailable     Code = "recipient_unavailable"
+	CodeTooLarge        Code = "message_too_large"
 	CodeInternalError   Code = "internal_error"
 )
 

@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Xhaann/ghost-x/server/auth"
+	"github.com/Xhaann/ghost-x/server/direct"
 	"github.com/Xhaann/ghost-x/server/presence"
 )
 
@@ -57,6 +58,7 @@ func newTestRouter() *Router {
 	}, map[string]ProtectedHandler{
 		"whoami":   WhoAmI(),
 		"presence": Presence(presence.NewRegistry()),
+		"send":     Send(direct.NewRegistry()),
 	})
 }
 
@@ -196,6 +198,7 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"challenge","id":"a","payload":{}}`,
 		`{"type":"whoami","id":"a","payload":{}}`,
 		`{"type":"presence","id":"a","payload":{}}`,
+		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","body":"x"}}`,
 		`{"type":"present","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"authenticate","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 	} {

@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createId, encode, parse } from "./protocol.ts";
+import {
+  bodySize,
+  createId,
+  encode,
+  isValidBody,
+  maxBodySize,
+  parse,
+} from "./protocol.ts";
 
 const pong = (overrides: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -172,6 +179,64 @@ test("rejects malformed presence messages", () => {
     { type: "absent", payload: { identity }, extra: 1 },
   ]) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
+  }
+});
+
+test("parses messaging replies and deliveries", () => {
+  const from = "B".repeat(42) + "A";
+  assert.deepEqual(parse('{"type":"sent","id":"m1","payload":{}}'), {
+    type: "sent",
+    id: "m1",
+    payload: {},
+  });
+  assert.deepEqual(
+    parse(JSON.stringify({ type: "message", payload: { from, body: "hi\n" } })),
+    { type: "message", payload: { from, body: "hi\n" } },
+  );
+  for (const code of ["recipient_unavailable", "message_too_large"]) {
+    assert.deepEqual(
+      parse(JSON.stringify({ type: "error", id: "m1", payload: { code } })),
+      { type: "error", id: "m1", payload: { code } },
+    );
+  }
+});
+
+test("rejects malformed messaging frames", () => {
+  const from = "B".repeat(42) + "A";
+  for (const message of [
+    { type: "sent", payload: {} },
+    { type: "sent", id: "m1", payload: { to: from } },
+    { type: "message", id: "m1", payload: { from, body: "x" } },
+    { type: "message", payload: { body: "x" } },
+    { type: "message", payload: { from, body: "" } },
+    { type: "message", payload: { from, body: 1 } },
+    { type: "message", payload: { from: "short", body: "x" } },
+    { type: "message", payload: { from, body: "x", to: from } },
+    { type: "message", payload: { from, body: "a\u0000b" } },
+    { type: "message", payload: { from, body: "a".repeat(maxBodySize + 1) } },
+    { type: "message", payload: { from, body: "x" }, extra: 1 },
+  ]) {
+    assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
+  }
+});
+
+test("validates message bodies like the server", () => {
+  assert.equal(isValidBody("x"), true);
+  assert.equal(isValidBody("tab\tline\nreturn\r"), true);
+  assert.equal(isValidBody("a".repeat(maxBodySize)), true);
+  assert.equal(isValidBody("é".repeat(maxBodySize / 2)), true);
+  assert.equal(bodySize("é"), 2);
+  for (const body of [
+    "",
+    "a".repeat(maxBodySize + 1),
+    "é".repeat(maxBodySize / 2 + 1),
+    "a\u0000",
+    "a\u001b",
+    "a\u007f",
+    null,
+    1,
+  ]) {
+    assert.equal(isValidBody(body), false, JSON.stringify(body));
   }
 });
 

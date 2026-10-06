@@ -9,6 +9,8 @@ import (
 
 	"github.com/Xhaann/ghost-x/server/auth"
 	"github.com/Xhaann/ghost-x/server/config"
+	"github.com/Xhaann/ghost-x/server/direct"
+	"github.com/Xhaann/ghost-x/server/identity"
 	"github.com/Xhaann/ghost-x/server/presence"
 	"github.com/Xhaann/ghost-x/server/protocol"
 	"github.com/Xhaann/ghost-x/server/socket"
@@ -19,13 +21,29 @@ type Server struct {
 	hub      *socket.Hub
 	sessions *auth.Registry
 	presence *presence.Registry
+	direct   *direct.Registry
 	http     *http.Server
+}
+
+type observers []auth.Observer
+
+func (o observers) Authenticated(s *auth.Session, id identity.Identity) {
+	for _, observer := range o {
+		observer.Authenticated(s, id)
+	}
+}
+
+func (o observers) Closed(s *auth.Session, id identity.Identity) {
+	for _, observer := range o {
+		observer.Closed(s, id)
+	}
 }
 
 type endpoint struct {
 	client  *socket.Client
 	conn    *protocol.Conn
 	session *auth.Session
+	direct  *direct.Registry
 }
 
 func (e *endpoint) Receive(data []byte) {
@@ -34,11 +52,13 @@ func (e *endpoint) Receive(data []byte) {
 
 func (e *endpoint) Close() {
 	e.session.Close()
+	e.direct.Detach(e.session)
 }
 
 func New(cfg config.Config) *Server {
 	present := presence.NewRegistry()
-	sessions := auth.NewRegistry(time.Now, present)
+	messages := direct.NewRegistry()
+	sessions := auth.NewRegistry(time.Now, observers{present, messages})
 	router := protocol.NewRouter(map[string]protocol.Handler{
 		"ping":         protocol.Ping(time.Now),
 		"challenge":    protocol.Challenge(),
@@ -46,13 +66,17 @@ func New(cfg config.Config) *Server {
 	}, map[string]protocol.ProtectedHandler{
 		"whoami":   protocol.WhoAmI(),
 		"presence": protocol.Presence(present),
+		"send":     protocol.Send(messages),
 	})
 
 	opts := socket.DefaultOptions()
 	opts.Accept = func(c *socket.Client) socket.Receiver {
 		session := sessions.Open()
 		push := func(data []byte) { _ = c.Send(data) }
-		return &endpoint{client: c, conn: router.Conn(session, push), session: session}
+		messages.Attach(session, func(m direct.Message) bool {
+			return c.Send(protocol.EncodeMessage(m)) == nil
+		})
+		return &endpoint{client: c, conn: router.Conn(session, push), session: session, direct: messages}
 	}
 	hub := socket.NewHub(opts)
 
@@ -65,6 +89,7 @@ func New(cfg config.Config) *Server {
 		hub:      hub,
 		sessions: sessions,
 		presence: present,
+		direct:   messages,
 		http: &http.Server{
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,

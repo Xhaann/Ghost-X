@@ -7,6 +7,7 @@ import { useAuth } from "@/lib/useAuth.ts";
 import { useIdentity } from "@/lib/useIdentity.ts";
 import { usePresence } from "@/lib/usePresence.ts";
 import { useWhoami } from "@/lib/useWhoami.ts";
+import Messages from "./messages";
 
 const labels: Record<AuthState, string> = {
   unauthenticated: "Unauthenticated",
@@ -77,6 +78,7 @@ export default function Identity({ client }: { client: Client | null }) {
             ))}
         </>
       )}
+      <Messages client={client} authenticator={authenticator} />
     </section>
   );
 }

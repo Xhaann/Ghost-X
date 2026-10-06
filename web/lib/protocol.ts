@@ -7,6 +7,8 @@ export type ErrorCode =
   | "invalid_payload"
   | "authentication_required"
   | "authentication_failed"
+  | "recipient_unavailable"
+  | "message_too_large"
   | "internal_error";
 
 export type ClientMessage =
@@ -14,7 +16,8 @@ export type ClientMessage =
   | { type: "challenge"; payload: Record<string, never> }
   | { type: "authenticate"; payload: { identity: string; signature: string } }
   | { type: "whoami"; payload: Record<string, never> }
-  | { type: "presence"; payload: Record<string, never> };
+  | { type: "presence"; payload: Record<string, never> }
+  | { type: "send"; payload: { to: string; body: string } };
 
 export type ServerMessage =
   | {
@@ -26,6 +29,12 @@ export type ServerMessage =
   | { type: "authenticated"; id: string; payload: { identity: string } }
   | { type: "whoami"; id: string; payload: { identity: string } }
   | { type: "presence"; id: string; payload: Record<string, never> }
+  | { type: "sent"; id: string; payload: Record<string, never> }
+  | {
+      type: "message";
+      id?: undefined;
+      payload: { from: string; body: string };
+    }
   | {
       type: "present" | "absent";
       id?: undefined;
@@ -35,12 +44,31 @@ export type ServerMessage =
 
 export const nonceSize = 32;
 
+export const maxBodySize = 4096;
+
+const encoder = new TextEncoder();
+
+export function bodySize(body: string): number {
+  return encoder.encode(body).length;
+}
+
+export function isValidBody(body: unknown): body is string {
+  return (
+    typeof body === "string" &&
+    body.length > 0 &&
+    bodySize(body) <= maxBodySize &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(body)
+  );
+}
+
 const errorCodes: readonly string[] = [
   "invalid_message",
   "unsupported_type",
   "invalid_payload",
   "authentication_required",
   "authentication_failed",
+  "recipient_unavailable",
+  "message_too_large",
   "internal_error",
 ];
 
@@ -143,6 +171,29 @@ export function parse(data: unknown): ServerMessage | null {
       hasOnly(payload, [])
     ) {
       return { type, id, payload: {} };
+    }
+    return null;
+  }
+
+  if (type === "sent") {
+    if (
+      hasOnly(value, ["type", "id", "payload"]) &&
+      isValidId(id) &&
+      hasOnly(payload, [])
+    ) {
+      return { type, id, payload: {} };
+    }
+    return null;
+  }
+
+  if (type === "message") {
+    if (
+      hasOnly(value, ["type", "payload"]) &&
+      hasOnly(payload, ["from", "body"]) &&
+      isIdentity(payload.from) &&
+      isValidBody(payload.body)
+    ) {
+      return { type, payload: { from: payload.from, body: payload.body } };
     }
     return null;
   }
