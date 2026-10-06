@@ -13,6 +13,14 @@ import type { TrustState, TrustView } from "@/lib/trust.ts";
 import { useConversations } from "@/lib/useConversations.ts";
 import type { LocalSession } from "@/lib/useIdentity.ts";
 
+const pairingLabels: Record<string, string> = {
+  pending: "Asynchronous session pending until this identity responds",
+  established: "Asynchronous session established",
+  unavailable: "This identity has not published prekeys",
+  invalid_bundle: "Prekey bundle failed verification",
+  failed: "Asynchronous session could not be started",
+};
+
 const deliveryLabels: Record<DeliveryState, string> = {
   sending: "Sending",
   delivered: "Delivered",
@@ -168,8 +176,17 @@ export default function Messages({
   authenticator: Authenticator | null;
   session: LocalSession | null;
 }) {
-  const { state, rejected, open, close, send, verification, trustOf, verify } =
-    useConversations(client, authenticator, session);
+  const {
+    state,
+    rejected,
+    open,
+    close,
+    send,
+    verification,
+    trustOf,
+    verify,
+    pairing,
+  } = useConversations(client, authenticator, session);
   const [recipient, setRecipient] = useState("");
   const [body, setBody] = useState("");
   const [pending, setPending] = useState(false);
@@ -239,6 +256,9 @@ export default function Messages({
             Conversation with <code>{active.identity}</code>
           </p>
           <p data-encryption>End-to-end encrypted to this identity</p>
+          {pairing && pairing !== "none" && (
+            <p data-pairing={pairing}>{pairingLabels[pairing]}</p>
+          )}
           {verification && (
             <Verification
               key={verification.identity}

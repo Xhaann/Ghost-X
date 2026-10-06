@@ -1,4 +1,4 @@
-export type StoreName = "vault" | "messages" | "trust";
+export type StoreName = "vault" | "messages" | "trust" | "pairs";
 
 export type Entry = { key: string; value: unknown };
 
@@ -19,8 +19,8 @@ export interface KeyValueStore {
 }
 
 const databaseName = "ghostx";
-const databaseVersion = 2;
-const stores: readonly StoreName[] = ["vault", "messages", "trust"];
+const databaseVersion = 3;
+const stores: readonly StoreName[] = ["vault", "messages", "trust", "pairs"];
 
 function done(request: IDBRequest): Promise<unknown> {
   return new Promise((resolve, reject) => {

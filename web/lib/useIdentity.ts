@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { History } from "./history.ts";
+import { Pairs } from "./pairs.ts";
+import { PrekeyStore } from "./prekeys.ts";
 import { openIndexedStore } from "./storage.ts";
 import { Trust } from "./trust.ts";
 import { type Keys, loadVault } from "./vault.ts";
@@ -8,6 +10,8 @@ export type LocalSession = {
   keys: Keys;
   history: History;
   trust: Trust;
+  prekeys: PrekeyStore | null;
+  pairs: Pairs;
   created: boolean;
 };
 
@@ -51,14 +55,18 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
         }
         return;
       }
-      const [history, trust] = await Promise.all([
+      const [history, trust, prekeys, pairs] = await Promise.all([
         History.open(store, vault.keys, vault.integrity, vault.storage),
         Trust.open(store, vault.integrity),
+        PrekeyStore.open(store, vault.keys, vault.integrity),
+        Pairs.open(store, vault.integrity),
       ]);
       const session = {
         keys: vault.keys,
         history,
         trust,
+        prekeys,
+        pairs,
         created: vault.created,
       };
       if (active) {
@@ -66,7 +74,7 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
         setLocal({ status: "ready", ...session });
         return;
       }
-      await Promise.all([history.close(), trust.close()]);
+      await Promise.all([history.close(), trust.close(), pairs.close()]);
       vault.keys.identity.release();
       vault.keys.exchange.release();
       close();
@@ -82,7 +90,11 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
       const session = ready;
       settled.current = task.then(async () => {
         if (session) {
-          await Promise.all([session.history.close(), session.trust.close()]);
+          await Promise.all([
+            session.history.close(),
+            session.trust.close(),
+            session.pairs.close(),
+          ]);
           session.keys.identity.release();
           session.keys.exchange.release();
         }

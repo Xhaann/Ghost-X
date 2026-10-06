@@ -11,6 +11,7 @@ import (
 	"github.com/Xhaann/ghost-x/server/config"
 	"github.com/Xhaann/ghost-x/server/direct"
 	"github.com/Xhaann/ghost-x/server/identity"
+	"github.com/Xhaann/ghost-x/server/prekey"
 	"github.com/Xhaann/ghost-x/server/presence"
 	"github.com/Xhaann/ghost-x/server/protocol"
 	"github.com/Xhaann/ghost-x/server/socket"
@@ -44,6 +45,7 @@ type endpoint struct {
 	conn    *protocol.Conn
 	session *auth.Session
 	direct  *direct.Registry
+	prekeys *prekey.Registry
 }
 
 func (e *endpoint) Receive(data []byte) {
@@ -53,12 +55,14 @@ func (e *endpoint) Receive(data []byte) {
 func (e *endpoint) Close() {
 	e.session.Close()
 	e.direct.Detach(e.session)
+	e.prekeys.Detach(e.session)
 }
 
 func New(cfg config.Config) *Server {
 	present := presence.NewRegistry()
 	messages := direct.NewRegistry()
-	sessions := auth.NewRegistry(time.Now, observers{present, messages})
+	prekeys := prekey.NewRegistry()
+	sessions := auth.NewRegistry(time.Now, observers{present, messages, prekeys})
 	router := protocol.NewRouter(map[string]protocol.Handler{
 		"ping":         protocol.Ping(time.Now),
 		"challenge":    protocol.Challenge(),
@@ -70,6 +74,10 @@ func New(cfg config.Config) *Server {
 		"publish":  protocol.Publish(messages),
 		"key":      protocol.Key(messages),
 		"session":  protocol.Establish(messages),
+		"prekeys":  protocol.Prekeys(messages, prekeys),
+		"bundle":   protocol.FetchBundle(prekeys),
+		"initiate": protocol.Initiate(messages, prekeys),
+		"accept":   protocol.Accept(prekeys),
 	})
 
 	opts := socket.DefaultOptions()
@@ -79,7 +87,10 @@ func New(cfg config.Config) *Server {
 		messages.Attach(session, func(m direct.Message) bool {
 			return c.Send(protocol.EncodeMessage(m)) == nil
 		})
-		return &endpoint{client: c, conn: router.Conn(session, push), session: session, direct: messages}
+		prekeys.Attach(session, func(e prekey.Event) bool {
+			return c.Send(protocol.EncodeEvent(e)) == nil
+		})
+		return &endpoint{client: c, conn: router.Conn(session, push), session: session, direct: messages, prekeys: prekeys}
 	}
 	hub := socket.NewHub(opts)
 

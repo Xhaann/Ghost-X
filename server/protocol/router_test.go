@@ -12,6 +12,7 @@ import (
 
 	"github.com/Xhaann/ghost-x/server/auth"
 	"github.com/Xhaann/ghost-x/server/direct"
+	"github.com/Xhaann/ghost-x/server/prekey"
 	"github.com/Xhaann/ghost-x/server/presence"
 )
 
@@ -52,6 +53,7 @@ func testSession() *auth.Session {
 
 func newTestRouter() *Router {
 	messages := direct.NewRegistry()
+	prekeys := prekey.NewRegistry()
 	return NewRouter(map[string]Handler{
 		"ping":         Ping(time.Now),
 		"challenge":    Challenge(),
@@ -63,6 +65,10 @@ func newTestRouter() *Router {
 		"publish":  Publish(messages),
 		"key":      Key(messages),
 		"session":  Establish(messages),
+		"prekeys":  Prekeys(messages, prekeys),
+		"bundle":   FetchBundle(prekeys),
+		"initiate": Initiate(messages, prekeys),
+		"accept":   Accept(prekeys),
 	})
 }
 
@@ -206,6 +212,10 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"session","id":"a","payload":{"session":"AAAAAAAAAAAAAAAAAAAAAA","epoch":0,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 		`{"type":"publish","id":"a","payload":{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 		`{"type":"key","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"prekeys","id":"a","payload":{"device":"AAAAAAAAAAAAAAAAAAAAAA","signed":{"id":1,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"},"onetime":[]}}`,
+		`{"type":"bundle","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"initiate","id":"a","payload":{"version":1,"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","device":"AAAAAAAAAAAAAAAAAAAAAA","signed":1,"onetime":null,"ephemeral":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","proof":"x","confirm":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"accept","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ephemeral":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","confirm":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"present","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"authenticate","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 	} {

@@ -18,6 +18,7 @@ const (
 	CodeDuplicate       Code = "duplicate_message"
 	CodeStaleSession    Code = "stale_session"
 	CodeSessionLimit    Code = "session_limit"
+	CodePendingLimit    Code = "pending_limit"
 	CodeInternalError   Code = "internal_error"
 )
 

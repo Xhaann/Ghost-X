@@ -197,6 +197,33 @@ export class ExchangeKey {
       : null;
   }
 
+  async agree(
+    peer: Uint8Array<ArrayBuffer>,
+  ): Promise<Uint8Array<ArrayBuffer> | null> {
+    const privateKey = this.#privateKey;
+    if (!privateKey || peer.length !== exchangeKeySize) {
+      return null;
+    }
+    try {
+      const peerKey = await crypto.subtle.importKey(
+        "raw",
+        peer,
+        exchange,
+        false,
+        [],
+      );
+      return new Uint8Array(
+        await crypto.subtle.deriveBits(
+          { name: "X25519", public: peerKey },
+          privateKey,
+          256,
+        ),
+      );
+    } catch {
+      return null;
+    }
+  }
+
   async openLegacy(parties: Parties, sealed: Sealed): Promise<string | null> {
     if (same(parties.toKey, this.#publicRaw)) {
       return this.#decrypt(parties, parties.fromKey, sealed);

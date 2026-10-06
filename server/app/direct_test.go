@@ -49,10 +49,9 @@ func randomText(n int) string {
 }
 
 func exchangeRaw(t *testing.T) []byte {
-	t.Helper()
 	private, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
 	return private.PublicKey().Bytes()
 }

@@ -409,3 +409,173 @@ test("creates unique valid ids", () => {
     assert.match(id, /^[a-f0-9]{24}$/);
   }
 });
+
+function prekey(overrides: Record<string, unknown> = {}) {
+  return { id: 7, key: b64(32), signature: b64(64), ...overrides };
+}
+
+function deviceBundle(overrides: Record<string, unknown> = {}) {
+  return {
+    device: b64(16),
+    signed: prekey(),
+    onetime: prekey({ id: 9 }),
+    ...overrides,
+  };
+}
+
+function initiationPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    version: 1,
+    from: "B".repeat(42) + "A",
+    key: b64(32),
+    signature: b64(64),
+    device: b64(16),
+    signed: 7,
+    onetime: 9,
+    ephemeral: b64(32),
+    proof: b64(64),
+    confirm: b64(32),
+    ...overrides,
+  };
+}
+
+test("parses prekey bundles, handshake pushes, and replies", () => {
+  const identity = "B".repeat(42) + "A";
+  const bundle = {
+    version: 1,
+    identity,
+    key: b64(32),
+    signature: b64(64),
+    bundles: [deviceBundle(), deviceBundle({ onetime: null })],
+  };
+  assert.deepEqual(
+    parse(JSON.stringify({ type: "bundle", id: "b1", payload: bundle })),
+    { type: "bundle", id: "b1", payload: bundle },
+  );
+  for (const type of ["initiated", "accepted"]) {
+    assert.deepEqual(parse(JSON.stringify({ type, id: "x1", payload: {} })), {
+      type,
+      id: "x1",
+      payload: {},
+    });
+  }
+  assert.deepEqual(
+    parse(
+      JSON.stringify({ type: "prekeys", id: "p1", payload: { available: 20 } }),
+    ),
+    { type: "prekeys", id: "p1", payload: { available: 20 } },
+  );
+  for (const payload of [
+    initiationPayload(),
+    initiationPayload({ onetime: null }),
+  ]) {
+    assert.deepEqual(parse(JSON.stringify({ type: "initiation", payload })), {
+      type: "initiation",
+      payload,
+    });
+  }
+  const acceptance = { from: identity, ephemeral: b64(32), confirm: b64(32) };
+  assert.deepEqual(
+    parse(JSON.stringify({ type: "acceptance", payload: acceptance })),
+    { type: "acceptance", payload: acceptance },
+  );
+  assert.deepEqual(
+    parse(
+      JSON.stringify({
+        type: "error",
+        id: "x",
+        payload: { code: "pending_limit" },
+      }),
+    ),
+    { type: "error", id: "x", payload: { code: "pending_limit" } },
+  );
+});
+
+test("rejects malformed prekey bundles and handshake messages", () => {
+  const identity = "B".repeat(42) + "A";
+  const bundle = {
+    version: 1,
+    identity,
+    key: b64(32),
+    signature: b64(64),
+    bundles: [deviceBundle()],
+  };
+  const twin = deviceBundle();
+  for (const message of [
+    { type: "bundle", payload: bundle },
+    { type: "bundle", id: "b", payload: { ...bundle, version: 2 } },
+    { type: "bundle", id: "b", payload: { ...bundle, version: "1" } },
+    { type: "bundle", id: "b", payload: { ...bundle, bundles: [] } },
+    { type: "bundle", id: "b", payload: { ...bundle, bundles: [twin, twin] } },
+    {
+      type: "bundle",
+      id: "b",
+      payload: {
+        ...bundle,
+        bundles: Array.from({ length: 5 }, () => deviceBundle()),
+      },
+    },
+    { type: "bundle", id: "b", payload: { ...bundle, verified: true } },
+    { type: "bundle", id: "b", payload: { ...bundle, identity: "x" } },
+    ...[
+      { device: b64(15) },
+      { signed: null },
+      { signed: prekey({ id: -1 }) },
+      { signed: prekey({ id: 2 ** 31 }) },
+      { signed: prekey({ key: b64(31) }) },
+      { signed: prekey({ signature: "x" }) },
+      { signed: prekey({ privateKey: b64(32) }) },
+      { onetime: prekey({ id: 1.5 }) },
+      { onetime: prekey({ key: b64(33) }) },
+      { onetime: "none" },
+      { extra: 1 },
+    ].map((field) => ({
+      type: "bundle",
+      id: "b",
+      payload: { ...bundle, bundles: [deviceBundle(field)] },
+    })),
+    { type: "prekeys", id: "p", payload: { available: -1 } },
+    { type: "prekeys", id: "p", payload: { available: 101 } },
+    { type: "prekeys", id: "p", payload: { available: 1, extra: 1 } },
+    { type: "initiated", payload: {} },
+    { type: "initiation", id: "x", payload: initiationPayload() },
+    ...[
+      { version: 2 },
+      { from: "x" },
+      { key: b64(31) },
+      { device: b64(17) },
+      { signed: -1 },
+      { signed: "7" },
+      { onetime: 1.5 },
+      { onetime: "9" },
+      { ephemeral: b64(31) },
+      { proof: b64(63) },
+      { confirm: b64(31) },
+      { body: "plaintext" },
+      { private: b64(32) },
+    ].map((field) => ({
+      type: "initiation",
+      payload: initiationPayload(field),
+    })),
+    { type: "acceptance", payload: { from: identity, ephemeral: b64(32) } },
+    {
+      type: "acceptance",
+      payload: { from: identity, ephemeral: b64(32), confirm: b64(31) },
+    },
+    {
+      type: "acceptance",
+      payload: {
+        from: identity,
+        ephemeral: b64(32),
+        confirm: b64(32),
+        root: b64(32),
+      },
+    },
+  ]) {
+    assert.equal(
+      parse(JSON.stringify(message)),
+      null,
+      JSON.stringify(message).slice(0, 120),
+    );
+  }
+});

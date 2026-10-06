@@ -214,6 +214,20 @@ func (r *Registry) Establish(s *auth.Session, staticKey string, bundle SessionBu
 	return nil
 }
 
+func (r *Registry) Static(s *auth.Session) (Bundle, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	owner, ok := r.identities[s]
+	if !ok {
+		return Bundle{}, false
+	}
+	current := r.keys[owner]
+	if current == nil || !hasSession(current.sessions, s) {
+		return Bundle{}, false
+	}
+	return current.bundle, true
+}
+
 func (r *Registry) Bundle(id identity.Identity) (Bundle, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

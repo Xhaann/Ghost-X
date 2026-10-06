@@ -13,6 +13,7 @@ export type ErrorCode =
   | "duplicate_message"
   | "stale_session"
   | "session_limit"
+  | "pending_limit"
   | "internal_error";
 
 export type ClientMessage =
@@ -35,7 +36,37 @@ export type ClientMessage =
   | {
       type: "send";
       payload: { to: string; epoch: number; envelopes: WireEnvelope[] };
+    }
+  | {
+      type: "prekeys";
+      payload: { device: string; signed: WirePrekey; onetime: WirePrekey[] };
+    }
+  | { type: "bundle"; payload: { identity: string } }
+  | {
+      type: "initiate";
+      payload: {
+        version: number;
+        to: string;
+        device: string;
+        signed: number;
+        onetime: number | null;
+        ephemeral: string;
+        proof: string;
+        confirm: string;
+      };
+    }
+  | {
+      type: "accept";
+      payload: { to: string; ephemeral: string; confirm: string };
     };
+
+export type WirePrekey = { id: number; key: string; signature: string };
+
+export type WireDeviceBundle = {
+  device: string;
+  signed: WirePrekey;
+  onetime: WirePrekey | null;
+};
 
 export type WireSession = {
   session: string;
@@ -65,6 +96,41 @@ export type ServerMessage =
   | { type: "sent"; id: string; payload: Record<string, never> }
   | { type: "published"; id: string; payload: Record<string, never> }
   | { type: "established"; id: string; payload: Record<string, never> }
+  | { type: "initiated"; id: string; payload: Record<string, never> }
+  | { type: "accepted"; id: string; payload: Record<string, never> }
+  | { type: "prekeys"; id: string; payload: { available: number } }
+  | {
+      type: "bundle";
+      id: string;
+      payload: {
+        version: number;
+        identity: string;
+        key: string;
+        signature: string;
+        bundles: WireDeviceBundle[];
+      };
+    }
+  | {
+      type: "initiation";
+      id?: undefined;
+      payload: {
+        version: number;
+        from: string;
+        key: string;
+        signature: string;
+        device: string;
+        signed: number;
+        onetime: number | null;
+        ephemeral: string;
+        proof: string;
+        confirm: string;
+      };
+    }
+  | {
+      type: "acceptance";
+      id?: undefined;
+      payload: { from: string; ephemeral: string; confirm: string };
+    }
   | {
       type: "key";
       id: string;
@@ -106,6 +172,9 @@ export const minCiphertextSize = 1 + tagSize;
 export const sessionIdSize = 16;
 export const maxEpoch = 2 ** 31 - 1;
 export const maxSessions = 4;
+export const deviceIdSize = 16;
+export const confirmSize = 32;
+export const maxOnetimePublish = 100;
 export const maxCiphertextSize = maxBodySize + tagSize;
 
 const encoder = new TextEncoder();
@@ -135,6 +204,7 @@ const errorCodes: readonly string[] = [
   "duplicate_message",
   "stale_session",
   "session_limit",
+  "pending_limit",
   "internal_error",
 ];
 
@@ -183,6 +253,35 @@ function parseSession(value: unknown): WireSession | null {
     };
   }
   return null;
+}
+
+function parsePrekey(value: unknown): WirePrekey | null {
+  if (
+    isObject(value) &&
+    hasOnly(value, ["id", "key", "signature"]) &&
+    isEpoch(value.id) &&
+    isFixed(value.key, exchangeKeySize) &&
+    isFixed(value.signature, signatureSize)
+  ) {
+    return { id: value.id, key: value.key, signature: value.signature };
+  }
+  return null;
+}
+
+function parseDeviceBundle(value: unknown): WireDeviceBundle | null {
+  if (
+    !isObject(value) ||
+    !hasOnly(value, ["device", "signed", "onetime"]) ||
+    !isFixed(value.device, deviceIdSize)
+  ) {
+    return null;
+  }
+  const signed = parsePrekey(value.signed);
+  const onetime = value.onetime === null ? null : parsePrekey(value.onetime);
+  if (!signed || (value.onetime !== null && !onetime)) {
+    return null;
+  }
+  return { device: value.device, signed, onetime };
 }
 
 function parseEnvelope(value: unknown): WireEnvelope | null {
@@ -382,6 +481,137 @@ export function parse(data: unknown): ServerMessage | null {
           signature: payload.signature,
           sender,
           envelope,
+        },
+      };
+    }
+    return null;
+  }
+
+  if (type === "initiated" || type === "accepted") {
+    if (
+      hasOnly(value, ["type", "id", "payload"]) &&
+      isValidId(id) &&
+      hasOnly(payload, [])
+    ) {
+      return { type, id, payload: {} };
+    }
+    return null;
+  }
+
+  if (type === "prekeys") {
+    if (
+      hasOnly(value, ["type", "id", "payload"]) &&
+      isValidId(id) &&
+      hasOnly(payload, ["available"]) &&
+      Number.isSafeInteger(payload.available) &&
+      (payload.available as number) >= 0 &&
+      (payload.available as number) <= maxOnetimePublish
+    ) {
+      return { type, id, payload: { available: payload.available as number } };
+    }
+    return null;
+  }
+
+  if (type === "bundle") {
+    if (
+      hasOnly(value, ["type", "id", "payload"]) &&
+      isValidId(id) &&
+      hasOnly(payload, [
+        "version",
+        "identity",
+        "key",
+        "signature",
+        "bundles",
+      ]) &&
+      payload.version === 1 &&
+      isIdentity(payload.identity) &&
+      isFixed(payload.key, exchangeKeySize) &&
+      isFixed(payload.signature, signatureSize) &&
+      Array.isArray(payload.bundles) &&
+      payload.bundles.length >= 1 &&
+      payload.bundles.length <= maxSessions
+    ) {
+      const bundles = payload.bundles.map(parseDeviceBundle);
+      if (
+        bundles.some((b) => b === null) ||
+        new Set(bundles.map((b) => b?.device)).size !== bundles.length
+      ) {
+        return null;
+      }
+      return {
+        type,
+        id,
+        payload: {
+          version: 1,
+          identity: payload.identity,
+          key: payload.key,
+          signature: payload.signature,
+          bundles: bundles as WireDeviceBundle[],
+        },
+      };
+    }
+    return null;
+  }
+
+  if (type === "initiation") {
+    if (
+      hasOnly(value, ["type", "payload"]) &&
+      hasOnly(payload, [
+        "version",
+        "from",
+        "key",
+        "signature",
+        "device",
+        "signed",
+        "onetime",
+        "ephemeral",
+        "proof",
+        "confirm",
+      ]) &&
+      payload.version === 1 &&
+      isIdentity(payload.from) &&
+      isFixed(payload.key, exchangeKeySize) &&
+      isFixed(payload.signature, signatureSize) &&
+      isFixed(payload.device, deviceIdSize) &&
+      isEpoch(payload.signed) &&
+      (payload.onetime === null || isEpoch(payload.onetime)) &&
+      isFixed(payload.ephemeral, exchangeKeySize) &&
+      isFixed(payload.proof, signatureSize) &&
+      isFixed(payload.confirm, confirmSize)
+    ) {
+      return {
+        type,
+        payload: {
+          version: 1,
+          from: payload.from,
+          key: payload.key,
+          signature: payload.signature,
+          device: payload.device,
+          signed: payload.signed,
+          onetime: payload.onetime as number | null,
+          ephemeral: payload.ephemeral,
+          proof: payload.proof,
+          confirm: payload.confirm,
+        },
+      };
+    }
+    return null;
+  }
+
+  if (type === "acceptance") {
+    if (
+      hasOnly(value, ["type", "payload"]) &&
+      hasOnly(payload, ["from", "ephemeral", "confirm"]) &&
+      isIdentity(payload.from) &&
+      isFixed(payload.ephemeral, exchangeKeySize) &&
+      isFixed(payload.confirm, confirmSize)
+    ) {
+      return {
+        type,
+        payload: {
+          from: payload.from,
+          ephemeral: payload.ephemeral,
+          confirm: payload.confirm,
         },
       };
     }
