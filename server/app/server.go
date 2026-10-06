@@ -69,6 +69,7 @@ func New(cfg config.Config) *Server {
 		"send":     protocol.Send(messages),
 		"publish":  protocol.Publish(messages),
 		"key":      protocol.Key(messages),
+		"session":  protocol.Establish(messages),
 	})
 
 	opts := socket.DefaultOptions()

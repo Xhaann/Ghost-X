@@ -7,6 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before } from "node:test";
 import { fileURLToPath } from "node:url";
+import { encodeBase64Url } from "./base64.ts";
+import {
+  type KeyBundle,
+  type Parties,
+  associatedData as legacyAssociatedData,
+  keyBindingMessage,
+} from "./encryption.ts";
+import { IdentityKey, parseIdentity } from "./identity.ts";
 import type { KeyValueStore, StoreName } from "./storage.ts";
 import type { TransportState } from "./transport.ts";
 
@@ -211,4 +219,89 @@ export function memoryStore(): KeyValueStore & {
     close() {},
   };
   return store;
+}
+
+export type LegacyParty = {
+  identity: IdentityKey;
+  publicRaw: Uint8Array<ArrayBuffer>;
+  privateKey: CryptoKey;
+  bundle: KeyBundle;
+};
+
+export async function legacyParty(): Promise<LegacyParty> {
+  const identity = await IdentityKey.generate();
+  const pair = (await crypto.subtle.generateKey({ name: "X25519" }, false, [
+    "deriveBits",
+  ])) as CryptoKeyPair;
+  const publicRaw = new Uint8Array(
+    await crypto.subtle.exportKey("raw", pair.publicKey),
+  );
+  const signature = await identity.sign(
+    keyBindingMessage(identity.identity, publicRaw),
+  );
+  assert.ok(signature);
+  return {
+    identity,
+    publicRaw,
+    privateKey: pair.privateKey,
+    bundle: {
+      identity: identity.identity,
+      key: encodeBase64Url(publicRaw),
+      signature,
+    },
+  };
+}
+
+export async function legacySeal(
+  parties: Parties,
+  privateKey: CryptoKey,
+  peer: Uint8Array<ArrayBuffer>,
+  body: string,
+): Promise<{ salt: string; iv: string; ciphertext: string }> {
+  const from = parseIdentity(parties.from);
+  const to = parseIdentity(parties.to);
+  const additionalData = legacyAssociatedData(parties);
+  assert.ok(from && to && additionalData);
+  const context = new TextEncoder().encode("ghostx/message/v1\0");
+  const info = new Uint8Array([
+    ...context,
+    ...from,
+    ...to,
+    ...parties.fromKey,
+    ...parties.toKey,
+  ]);
+  const salt = crypto.getRandomValues(new Uint8Array(32));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const peerKey = await crypto.subtle.importKey(
+    "raw",
+    peer,
+    { name: "X25519" },
+    false,
+    [],
+  );
+  const shared = await crypto.subtle.deriveBits(
+    { name: "X25519", public: peerKey },
+    privateKey,
+    256,
+  );
+  const material = await crypto.subtle.importKey("raw", shared, "HKDF", false, [
+    "deriveKey",
+  ]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt, info },
+    material,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt"],
+  );
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData },
+    key,
+    new TextEncoder().encode(body),
+  );
+  return {
+    salt: encodeBase64Url(salt),
+    iv: encodeBase64Url(iv),
+    ciphertext: encodeBase64Url(new Uint8Array(ciphertext)),
+  };
 }

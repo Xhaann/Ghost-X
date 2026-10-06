@@ -62,6 +62,7 @@ func newTestRouter() *Router {
 		"send":     Send(messages),
 		"publish":  Publish(messages),
 		"key":      Key(messages),
+		"session":  Establish(messages),
 	})
 }
 
@@ -201,7 +202,8 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"challenge","id":"a","payload":{}}`,
 		`{"type":"whoami","id":"a","payload":{}}`,
 		`{"type":"presence","id":"a","payload":{}}`,
-		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","salt":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","iv":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","epoch":0,"envelopes":[{"session":"AAAAAAAAAAAAAAAAAAAAAA","epoch":0,"salt":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","iv":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAAA"}]}}`,
+		`{"type":"session","id":"a","payload":{"session":"AAAAAAAAAAAAAAAAAAAAAA","epoch":0,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 		`{"type":"publish","id":"a","payload":{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 		`{"type":"key","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"present","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,

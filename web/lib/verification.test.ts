@@ -7,7 +7,7 @@ import { ExchangeKey } from "./encryption.ts";
 import { fingerprint } from "./fingerprint.ts";
 import { History } from "./history.ts";
 import { IdentityKey } from "./identity.ts";
-import { Messenger } from "./messenger.ts";
+import { Messenger, type MessengerOptions } from "./messenger.ts";
 import { WebSocketTransport } from "./socket.ts";
 import {
   freePort,
@@ -39,6 +39,7 @@ async function connect(
   keys: Keys,
   trust?: Trust,
   history?: History,
+  options: MessengerOptions = {},
 ) {
   const frames: string[] = [];
   const transport = track(
@@ -52,7 +53,13 @@ async function connect(
   transport.onData((data) => frames.push(data));
   const client = track(new Client(transport));
   const auth = new Authenticator(client, keys.identity);
-  const messenger = new Messenger(client, auth, keys.identity, keys.exchange);
+  const messenger = new Messenger(
+    client,
+    auth,
+    keys.identity,
+    keys.exchange,
+    options,
+  );
   const restored = history ? (await history.restore()).restored : [];
   const conversations = new Conversations(messenger, keys.identity.identity, {
     history,
@@ -86,9 +93,9 @@ async function connect(
 async function device(port: number, store: Store) {
   const vault = await loadVault(store);
   assert.equal(vault.status, "ready");
-  const { keys, integrity } = vault as Unlocked;
+  const { keys, integrity, storage } = vault as Unlocked;
   const [history, trust] = await Promise.all([
-    History.open(store, keys, integrity),
+    History.open(store, keys, integrity, storage),
     Trust.open(store, integrity),
   ]);
   return { ...(await connect(port, keys, trust, history)), trust };
@@ -284,4 +291,60 @@ test("another client's verification never changes local trust", async () => {
     () => a.trust.view(c.keys.identity.identity).state === "unverified",
     "a sees c unverified",
   );
+});
+
+test("verification survives ephemeral rotation and fresh sessions but not a key change", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const a = await device(port, memoryStore());
+  const bKeys = await keysWith();
+  const options = { rotationLimit: 2, previousLimit: 1 };
+  let b = await connect(port, bKeys, undefined, undefined, options);
+  const idA = a.keys.identity.identity;
+  const idB = bKeys.identity.identity;
+  await a.messenger.lookup(idB);
+  await until(() => a.trust.view(idB).state === "unverified", "observed");
+  assert.equal(await a.trust.verify(idB, (await own(bKeys)).value), true);
+
+  b.conversations.open(idA);
+  for (let i = 0; i < 8; i++) {
+    const attempt = b.conversations.send(`rotating ${i}`);
+    assert.ok(attempt.accepted);
+    if (attempt.accepted) {
+      assert.equal(await attempt.delivery, "delivered");
+    }
+    await until(() => thread(a.conversations, idB).length === i + 1, `rx ${i}`);
+    assert.equal(a.trust.view(idB).state, "verified");
+  }
+  const offers = b.frames
+    .map((f) => JSON.parse(f))
+    .filter((f) => f.type === "session")
+    .map((f) => f.payload);
+  assert.ok(offers.length >= 4);
+  assert.equal(new Set(offers.map((o) => o.key)).size, offers.length);
+  assert.ok(offers.every((o) => o.session === offers[0].session));
+
+  const firstSession = offers[0].session;
+  await b.shutdown();
+  b = await connect(port, bKeys, undefined, undefined, options);
+  const fresh = b.frames
+    .map((f) => JSON.parse(f))
+    .filter((f) => f.type === "session")
+    .map((f) => f.payload);
+  assert.notEqual(fresh[0].session, firstSession);
+  assert.equal(fresh[0].epoch, 0);
+  b.conversations.open(idA);
+  const again = b.conversations.send("fresh session");
+  assert.ok(again.accepted);
+  await until(() => thread(a.conversations, idB).length === 9, "fresh rx");
+  await a.messenger.lookup(idB);
+  assert.equal(a.trust.view(idB).state, "verified");
+
+  await b.shutdown();
+  const changed = await keysWith(bKeys.identity);
+  b = await connect(port, changed, undefined, undefined, options);
+  await a.messenger.lookup(idB);
+  await until(() => a.trust.view(idB).state === "changed", "changed");
+  assert.equal(await a.trust.verify(idB, (await own(changed)).value), true);
+  assert.equal(a.trust.view(idB).state, "verified");
 });

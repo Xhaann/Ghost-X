@@ -11,18 +11,21 @@ import {
 import {
   History,
   historyVersion,
+  legacyVersion,
   maxRecordSize,
   maxStoredMessages,
+  parseLegacyRecord,
   parseRecord,
 } from "./history.ts";
 import { Listeners } from "./listeners.ts";
-import type {
-  Incoming,
-  MessengerState,
-  SealedRecord,
-  SendResult,
-} from "./messenger.ts";
-import { memoryStore } from "./testing.ts";
+import type { Incoming, MessengerState, SendResult } from "./messenger.ts";
+import { maxBodySize } from "./protocol.ts";
+import {
+  type LegacyParty,
+  legacyParty,
+  legacySeal,
+  memoryStore,
+} from "./testing.ts";
 import { type Unlocked, loadVault } from "./vault.ts";
 
 type Store = ReturnType<typeof memoryStore>;
@@ -42,35 +45,8 @@ async function reload(p: Party): Promise<Party> {
   return { ...(state as Unlocked), store: p.store };
 }
 
-async function sealFor(
-  from: Party,
-  to: Party,
-  id: string,
-  body: string,
-): Promise<{ toRecipient: SealedRecord; toSender: SealedRecord }> {
-  const sealed = await from.keys.exchange.seal(
-    {
-      id,
-      from: from.keys.identity.identity,
-      to: to.keys.identity.identity,
-      fromKey: from.keys.exchange.publicRaw,
-      toKey: to.keys.exchange.publicRaw,
-    },
-    body,
-  );
-  const [fromBundle, toBundle] = await Promise.all([
-    from.keys.exchange.bind(from.keys.identity),
-    to.keys.exchange.bind(to.keys.identity),
-  ]);
-  assert.ok(sealed && fromBundle && toBundle);
-  return {
-    toRecipient: { sealed, peer: fromBundle },
-    toSender: { sealed, peer: toBundle },
-  };
-}
-
-async function open(p: Party): Promise<History> {
-  return History.open(p.store, p.keys, p.integrity);
+function open(p: Party, store: Store = p.store): Promise<History> {
+  return History.open(store, p.keys, p.integrity, p.storage);
 }
 
 function records(store: Store): [string, Record<string, unknown>][] {
@@ -97,7 +73,6 @@ function assertNoPlaintext(store: Store, secrets: string[]): void {
     key,
     ...strings(value),
   ]);
-  const serialized = JSON.stringify([...store.data.entries()]);
   for (const secret of secrets) {
     const bytes = new TextEncoder().encode(secret);
     for (const form of [
@@ -106,8 +81,10 @@ function assertNoPlaintext(store: Store, secrets: string[]): void {
       Buffer.from(bytes).toString("base64"),
       Buffer.from(bytes).toString("hex"),
     ]) {
-      assert.ok(!serialized.includes(form), `plaintext stored: ${form}`);
-      assert.ok(!stored.some((s) => s.includes(form)));
+      assert.ok(
+        !stored.some((s) => s.includes(form)),
+        `plaintext stored: ${form}`,
+      );
     }
   }
 }
@@ -119,45 +96,32 @@ function flip(text: string, index = 0): string {
   return encodeBase64Url(bytes);
 }
 
-async function history(a: Party, b: Party) {
+async function history(a: string, b: Party) {
   const h = await open(b);
   const secrets = ["first secret", "second secret", "reply secret"];
-  const one = await sealFor(a, b, "m1", secrets[0]);
-  const two = await sealFor(a, b, "m2", secrets[1]);
-  const reply = await sealFor(b, a, "r1", secrets[2]);
-  h.received({
-    id: "m1",
-    peer: a.keys.identity.identity,
-    sequence: 2,
-    read: true,
-    record: one.toRecipient,
-  });
-  h.received({
-    id: "m2",
-    peer: a.keys.identity.identity,
-    sequence: 4,
-    read: false,
-    record: two.toRecipient,
-  });
+  h.received({ id: "m1", peer: a, sequence: 2, read: true, body: secrets[0] });
+  h.received({ id: "m2", peer: a, sequence: 4, read: false, body: secrets[1] });
   h.sent({
     id: "r1",
-    peer: a.keys.identity.identity,
+    peer: a,
     sequence: 3,
     delivery: "delivered",
-    record: reply.toSender,
+    body: secrets[2],
   });
   await h.flush();
   return { h, secrets };
+}
+
+async function identity(): Promise<string> {
+  return (await party()).keys.identity.identity;
 }
 
 class Source implements MessageSource {
   state: MessengerState = { active: true };
   readonly states = new Listeners<MessengerState>();
   readonly messages = new Listeners<Incoming>();
-  readonly pending: {
-    id: string;
-    resolve: (result: SendResult) => void;
-  }[] = [];
+  readonly pending: { id: string; resolve: (result: SendResult) => void }[] =
+    [];
 
   onState(listener: (state: MessengerState) => void) {
     return this.states.add(listener);
@@ -180,21 +144,85 @@ function summary(messages: readonly ConversationMessage[] | undefined) {
   );
 }
 
+const legacyContext = "ghostx/history/v1\0";
+
+async function legacyRecord(
+  owner: Party,
+  peer: LegacyParty,
+  fields: {
+    id: string;
+    sequence: number;
+    direction: "sent" | "received";
+    state: string | boolean;
+    body: string;
+  },
+): Promise<[string, Record<string, unknown>]> {
+  const self = owner.keys.identity.identity;
+  const sent = fields.direction === "sent";
+  const parties = {
+    id: fields.id,
+    from: sent ? self : peer.identity.identity,
+    to: sent ? peer.identity.identity : self,
+    fromKey: sent ? owner.keys.exchange.publicRaw : peer.publicRaw,
+    toKey: sent ? peer.publicRaw : owner.keys.exchange.publicRaw,
+  };
+  const sealed = await legacySeal(
+    parties,
+    peer.privateKey,
+    owner.keys.exchange.publicRaw,
+    fields.body,
+  );
+  const record: Record<string, unknown> = {
+    v: legacyVersion,
+    id: fields.id,
+    peer: peer.identity.identity,
+    direction: fields.direction,
+    [sent ? "delivery" : "read"]: fields.state,
+    sequence: fields.sequence,
+    key: peer.bundle.key,
+    signature: peer.bundle.signature,
+    ...sealed,
+  };
+  const order = [
+    "v",
+    "id",
+    "peer",
+    "direction",
+    sent ? "delivery" : "read",
+    "sequence",
+    "key",
+    "signature",
+    "salt",
+    "iv",
+    "ciphertext",
+  ];
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    owner.integrity,
+    new TextEncoder().encode(
+      legacyContext + JSON.stringify(order.map((name) => record[name])),
+    ),
+  );
+  record.mac = encodeBase64Url(new Uint8Array(mac));
+  return [`${peer.identity.identity}/${fields.id}`, record];
+}
+
 test("an empty database restores nothing", async () => {
   const b = await party();
   const h = await open(b);
   assert.deepEqual(await h.restore(), { restored: [], rejected: 0 });
+  assert.equal(h.migrated, 0);
   assert.equal(records(b.store).length, 0);
 });
 
-test("persists only ciphertext and restores it after a reload", async () => {
-  const a = await party();
+test("persists only locally encrypted bodies and restores them after a reload", async () => {
+  const a = await identity();
   const b = await party();
   const { secrets } = await history(a, b);
 
   assertNoPlaintext(b.store, secrets);
   for (const [key, record] of records(b.store)) {
-    assert.equal(key, `${a.keys.identity.identity}/${record.id}`);
+    assert.equal(key, `${a}/${record.id}`);
     assert.equal(record.v, historyVersion);
     assert.deepEqual(
       Object.keys(record).sort(),
@@ -204,17 +232,14 @@ test("persists only ciphertext and restores it after a reload", async () => {
         record.direction === "sent" ? "delivery" : "read",
         "id",
         "iv",
-        "key",
-        "mac",
         "peer",
-        "salt",
         "sequence",
-        "signature",
         "v",
       ].sort(),
     );
-    assert.ok(!("body" in record));
   }
+  const ivs = records(b.store).map(([, r]) => r.iv);
+  assert.equal(new Set(ivs).size, ivs.length);
 
   const restoredB = await reload(b);
   const result = await (await open(restoredB)).restore();
@@ -224,7 +249,7 @@ test("persists only ciphertext and restores it after a reload", async () => {
     [
       {
         id: "m1",
-        from: a.keys.identity.identity,
+        from: a,
         to: b.keys.identity.identity,
         sequence: 2,
         direction: "received",
@@ -234,7 +259,7 @@ test("persists only ciphertext and restores it after a reload", async () => {
       {
         id: "r1",
         from: b.keys.identity.identity,
-        to: a.keys.identity.identity,
+        to: a,
         sequence: 3,
         direction: "sent",
         body: secrets[2],
@@ -242,7 +267,7 @@ test("persists only ciphertext and restores it after a reload", async () => {
       },
       {
         id: "m2",
-        from: a.keys.identity.identity,
+        from: a,
         to: b.keys.identity.identity,
         sequence: 4,
         direction: "received",
@@ -253,51 +278,35 @@ test("persists only ciphertext and restores it after a reload", async () => {
   );
 });
 
-test("records are useless without the matching keys", async () => {
-  const a = await party();
+test("records are unreadable without the matching storage key", async () => {
+  const a = await identity();
   const b = await party();
   const intruder = await party();
   await history(a, b);
-
-  const foreignKeys = await History.open(b.store, intruder.keys, b.integrity);
-  assert.deepEqual(await foreignKeys.restore(), { restored: [], rejected: 3 });
-  const foreignIntegrity = await History.open(
+  const foreign = await History.open(
     b.store,
     b.keys,
-    intruder.integrity,
+    b.integrity,
+    intruder.storage,
   );
-  assert.deepEqual(await foreignIntegrity.restore(), {
-    restored: [],
-    rejected: 3,
-  });
+  assert.deepEqual(await foreign.restore(), { restored: [], rejected: 3 });
   assert.equal(records(b.store).length, 3);
 });
 
 test("rejects each corrupted record while preserving unrelated ones", async () => {
-  const a = await party();
+  const a = await identity();
+  const c = await identity();
   const b = await party();
-  const c = await party();
   await history(a, b);
   const h = await open(b);
-  const fromC = await sealFor(c, b, "c1", "unrelated");
-  h.received({
-    id: "c1",
-    peer: c.keys.identity.identity,
-    sequence: 5,
-    read: true,
-    record: fromC.toRecipient,
-  });
+  h.received({ id: "c1", peer: c, sequence: 5, read: true, body: "unrelated" });
   await h.flush();
 
-  const peerA = a.keys.identity.identity;
-  const target = `${peerA}/m1`;
+  const target = `${a}/m1`;
   const original = b.store.data.get(`messages:${target}`) as Record<
     string,
     unknown
   >;
-  const bundleC = await c.keys.exchange.bind(c.keys.identity);
-  assert.ok(bundleC);
-  const { mac: _mac, ...withoutMac } = original;
   const { iv: _iv, ...withoutIv } = original;
   const mutations: Record<string, unknown> = {
     ciphertext: {
@@ -309,38 +318,25 @@ test("rejects each corrupted record while preserving unrelated ones", async () =
       ciphertext: (original.ciphertext as string).slice(0, -4),
     },
     nonce: { ...original, iv: flip(original.iv as string) },
-    salt: { ...original, salt: flip(original.salt as string) },
-    "sender identity": { ...original, peer: c.keys.identity.identity },
-    "sender public key": { ...original, key: bundleC.key },
-    "key binding": { ...original, signature: bundleC.signature },
-    "substituted bundle": {
-      ...original,
-      key: bundleC.key,
-      signature: bundleC.signature,
-    },
+    "peer identity": { ...original, peer: c },
     "message id": { ...original, id: "m9" },
     direction: { ...original, direction: "sent", delivery: "delivered" },
     "read state": { ...original, read: false },
     sequence: { ...original, sequence: 99 },
     "negative sequence": { ...original, sequence: -1 },
     "future version": { ...original, v: historyVersion + 1 },
-    "string version": { ...original, v: "1" },
-    "missing mac": withoutMac,
+    "string version": { ...original, v: "2" },
     "missing nonce": withoutIv,
-    "unexpected field": { ...original, body: "injected" },
-    "mac flipped": { ...original, mac: flip(original.mac as string) },
+    "unexpected body": { ...original, body: "injected" },
+    "legacy mac field": { ...original, mac: "x" },
     "non-object": "record",
     null: null,
     array: [original],
-    oversized: {
-      ...original,
-      ciphertext: "A".repeat(maxRecordSize),
-    },
+    oversized: { ...original, ciphertext: "A".repeat(maxRecordSize) },
   };
   for (const [name, mutated] of Object.entries(mutations)) {
     b.store.data.set(`messages:${target}`, mutated);
-    const restoredB = await reload(b);
-    const result = await (await open(restoredB)).restore();
+    const result = await (await open(await reload(b))).restore();
     assert.equal(result.rejected, 1, name);
     assert.deepEqual(
       result.restored.map((m) => m.id).sort(),
@@ -351,37 +347,32 @@ test("rejects each corrupted record while preserving unrelated ones", async () =
   }
 
   b.store.data.set(`messages:${target}`, original);
-  const forged = { ...original, id: "m9" };
-  b.store.data.set(`messages:${peerA}/m9`, forged);
-  const result = await (await open(await reload(b))).restore();
-  assert.equal(result.rejected, 1);
-  assert.deepEqual(result.restored.map((m) => m.id).sort(), [
+  b.store.data.set(`messages:${a}/m9`, { ...original, id: "m9" });
+  const moved = await (await open(await reload(b))).restore();
+  assert.equal(moved.rejected, 1);
+  assert.deepEqual(moved.restored.map((m) => m.id).sort(), [
     "c1",
     "m1",
     "m2",
     "r1",
   ]);
 
-  const deliveryTarget = `${peerA}/r1`;
-  const sent = b.store.data.get(`messages:${deliveryTarget}`) as Record<
-    string,
-    unknown
-  >;
+  const sentKey = `messages:${a}/r1`;
+  const sent = b.store.data.get(sentKey) as Record<string, unknown>;
   for (const delivery of ["failed", "unavailable", "sending", "read", "seen"]) {
-    b.store.data.set(`messages:${deliveryTarget}`, { ...sent, delivery });
+    b.store.data.set(sentKey, { ...sent, delivery });
     const check = await (await open(await reload(b))).restore();
     assert.ok(!check.restored.some((m) => m.id === "r1"), delivery);
   }
 });
 
 test("a corrupted record is reported but never displayed as valid", async () => {
-  const a = await party();
+  const a = await identity();
   const b = await party();
   await history(a, b);
-  const key = `messages:${a.keys.identity.identity}/m2`;
+  const key = `messages:${a}/m2`;
   const record = b.store.data.get(key) as Record<string, unknown>;
   b.store.data.set(key, { ...record, sequence: 1 });
-
   const result = await (await open(await reload(b))).restore();
   const store = new Conversations(new Source(), b.keys.identity.identity, {
     restored: result.restored,
@@ -394,58 +385,38 @@ test("a corrupted record is reported but never displayed as valid", async () => 
   ]);
 });
 
-test("restores conversations, ordering, unread, and delivery state", async () => {
-  const a = await party();
+test("restores conversations, ordering, unread, and settled delivery state", async () => {
+  const peerA = await identity();
+  const peerC = await identity();
   const b = await party();
-  const c = await party();
   const first = await open(b);
   const source = new Source();
   const store = new Conversations(source, b.keys.identity.identity, {
     history: first,
   });
   store.start();
-  const peerA = a.keys.identity.identity;
-  const peerC = c.keys.identity.identity;
 
-  const deliver = async (from: Party, id: string, body: string) => {
-    const { toRecipient } = await sealFor(from, b, id, body);
-    source.messages.emit({
-      id,
-      from: from.keys.identity.identity,
-      body,
-      record: toRecipient,
-    });
-  };
-  await deliver(a, "a1", "from a one");
-  await deliver(c, "c1", "from c one");
+  const deliver = (from: string, id: string, body: string) =>
+    source.messages.emit({ id, from, body });
+  deliver(peerA, "a1", "from a one");
+  deliver(peerC, "c1", "from c one");
   store.open(peerA);
-  await deliver(a, "a2", "from a two while active");
-  const outcomes: SendResult[] = [];
-  for (const [body, reason] of [
-    ["to a delivered", null],
-    ["to a unavailable", "recipient_unavailable"],
-    ["to a failed", "internal_error"],
-  ] as const) {
+  deliver(peerA, "a2", "from a two while active");
+  for (const [body, result] of [
+    ["to a delivered", { ok: true }],
+    ["to a unavailable", { ok: false, reason: "recipient_unavailable" }],
+    ["to a failed", { ok: false, reason: "internal_error" }],
+  ] as [string, SendResult][]) {
     const attempt = store.send(body);
     assert.equal(attempt.accepted, true);
-    const pending = source.pending.at(-1);
-    assert.ok(pending);
-    const { toSender } = await sealFor(b, a, pending.id, body);
-    const result: SendResult = reason
-      ? { ok: false, reason, record: toSender }
-      : { ok: true, record: toSender };
-    outcomes.push(result);
-    pending.resolve(result);
+    source.pending.at(-1)?.resolve(result);
     if (attempt.accepted) {
       await attempt.delivery;
     }
   }
-  const pendingAttempt = store.send("still sending at reload");
-  assert.equal(pendingAttempt.accepted, true);
-  await deliver(c, "c2", "from c two");
+  assert.equal(store.send("still sending at reload").accepted, true);
+  deliver(peerC, "c2", "from c two");
   await first.flush();
-
-  const before = store.state;
   assertNoPlaintext(b.store, [
     "from a one",
     "from c one",
@@ -459,8 +430,7 @@ test("restores conversations, ordering, unread, and delivery state", async () =>
   store.stop();
   await first.close();
 
-  const restoredB = await reload(b);
-  const second = await open(restoredB);
+  const second = await open(await reload(b));
   const { restored, rejected } = await second.restore();
   assert.equal(rejected, 0);
   const after = new Conversations(new Source(), b.keys.identity.identity, {
@@ -468,7 +438,6 @@ test("restores conversations, ordering, unread, and delivery state", async () =>
     restored,
   });
   after.start();
-
   assert.equal(after.state.active, null);
   assert.deepEqual(
     after.state.conversations.map((x) => [x.identity, x.unread]),
@@ -477,13 +446,10 @@ test("restores conversations, ordering, unread, and delivery state", async () =>
       [peerA, 0],
     ],
   );
-  const conversationA = after.state.conversations.find(
-    (x) => x.identity === peerA,
-  );
   assert.deepEqual(
-    summary(conversationA?.messages).map((s) =>
-      s.split(":").slice(1).join(":"),
-    ),
+    summary(
+      after.state.conversations.find((x) => x.identity === peerA)?.messages,
+    ).map((s) => s.split(":").slice(1).join(":")),
     [
       "received:from a one",
       "received:from a two while active",
@@ -491,18 +457,6 @@ test("restores conversations, ordering, unread, and delivery state", async () =>
       "sent:unavailable:to a unavailable",
       "sent:failed:to a failed",
     ],
-  );
-  assert.deepEqual(
-    before.conversations
-      .find((x) => x.identity === peerA)
-      ?.messages.filter((m) => m.direction === "sent")
-      .map((m) => m.direction === "sent" && m.delivery),
-    ["delivered", "unavailable", "failed", "sending"],
-  );
-  assert.ok(
-    !after.state.conversations.some((x) =>
-      x.messages.some((m) => m.body === "still sending at reload"),
-    ),
   );
 
   after.open(peerC);
@@ -520,12 +474,10 @@ test("restores conversations, ordering, unread, and delivery state", async () =>
       [peerA, 0],
     ],
   );
-  assert.equal(third.rejected, 0);
-  assert.equal(outcomes.length, 3);
 });
 
 test("live duplicates of restored messages are ignored", async () => {
-  const a = await party();
+  const a = await identity();
   const b = await party();
   await history(a, b);
   const { restored } = await (await open(await reload(b))).restore();
@@ -537,14 +489,7 @@ test("live duplicates of restored messages are ignored", async () => {
   });
   store.start();
   const writes = b.store.writes;
-
-  const replay = await sealFor(a, b, "m1", "first secret");
-  source.messages.emit({
-    id: "m1",
-    from: a.keys.identity.identity,
-    body: "first secret",
-    record: replay.toRecipient,
-  });
+  source.messages.emit({ id: "m1", from: a, body: "first secret" });
   await h.flush();
   assert.equal(b.store.writes, writes);
   assert.deepEqual(summary(store.state.conversations[0].messages), [
@@ -552,15 +497,7 @@ test("live duplicates of restored messages are ignored", async () => {
     "r1:sent:delivered:reply secret",
     "m2:received:second secret",
   ]);
-  assert.equal(store.state.conversations[0].unread, 1);
-
-  const fresh = await sealFor(a, b, "m3", "third secret");
-  source.messages.emit({
-    id: "m3",
-    from: a.keys.identity.identity,
-    body: "third secret",
-    record: fresh.toRecipient,
-  });
+  source.messages.emit({ id: "m3", from: a, body: "third secret" });
   await h.flush();
   const next = await (await open(await reload(b))).restore();
   assert.deepEqual(
@@ -575,7 +512,7 @@ test("live duplicates of restored messages are ignored", async () => {
 });
 
 test("undecryptable live messages are never persisted", async () => {
-  const a = await party();
+  const a = await identity();
   const b = await party();
   const source = new Source();
   const h = await open(b);
@@ -583,59 +520,49 @@ test("undecryptable live messages are never persisted", async () => {
     history: h,
   });
   store.start();
-  source.messages.emit({
-    id: "x1",
-    from: a.keys.identity.identity,
-    body: null,
-  });
+  source.messages.emit({ id: "x1", from: a, body: null });
   await h.flush();
   assert.equal(records(b.store).length, 0);
   assert.equal(store.state.conversations[0].messages[0].body, null);
 });
 
 test("bounds stored messages per conversation, conversations, and total", async () => {
-  const a = await party();
   const b = await party();
   const h = await open(b);
-  const { toRecipient } = await sealFor(a, b, "seed", "seed");
+  const a = await identity();
   const peers = await Promise.all(
-    Array.from({ length: maxConversations + 5 }, () => party()),
+    Array.from({ length: maxConversations + 5 }, identity),
   );
   let sequence = 0;
-
   for (let i = 0; i < maxMessages + 10; i++) {
     h.received({
       id: `a${i}`,
-      peer: a.keys.identity.identity,
+      peer: a,
       sequence: ++sequence,
       read: true,
-      record: toRecipient,
+      body: "x",
     });
   }
   await h.flush();
   const kept = records(b.store).map(([key]) => key.split("/")[1]);
   assert.equal(kept.length, maxMessages);
   assert.ok(!kept.includes("a9") && kept.includes("a10"));
-  assert.ok(kept.includes(`a${maxMessages + 9}`));
 
   for (const [i, p] of peers.entries()) {
     h.received({
       id: `p${i}`,
-      peer: p.keys.identity.identity,
+      peer: p,
       sequence: ++sequence,
       read: true,
-      record: toRecipient,
+      body: "x",
     });
   }
   await h.flush();
   const owners = new Set(records(b.store).map(([, r]) => r.peer));
   assert.equal(owners.size, maxConversations);
-  assert.ok(!owners.has(a.keys.identity.identity));
+  assert.ok(!owners.has(a));
   for (const p of peers.slice(0, 5)) {
-    assert.ok(!owners.has(p.keys.identity.identity));
-  }
-  for (const p of peers.slice(5)) {
-    assert.ok(owners.has(p.keys.identity.identity));
+    assert.ok(!owners.has(p));
   }
 
   const busy = peers.slice(-30);
@@ -643,10 +570,10 @@ test("bounds stored messages per conversation, conversations, and total", async 
     for (const p of busy) {
       h.received({
         id: `b${round}`,
-        peer: p.keys.identity.identity,
+        peer: p,
         sequence: ++sequence,
         read: true,
-        record: toRecipient,
+        body: "x",
       });
     }
   }
@@ -656,92 +583,79 @@ test("bounds stored messages per conversation, conversations, and total", async 
   const sequences = all.map(([, r]) => r.sequence as number);
   assert.equal(Math.min(...sequences), sequence - maxStoredMessages + 1);
   assert.equal(Math.max(...sequences), sequence);
-  for (const [, record] of all) {
-    assert.ok(JSON.stringify(record).length <= maxRecordSize);
-  }
 });
 
-test("refuses to store a record larger than the limit", async () => {
-  const a = await party();
+test("refuses invalid bodies and identifiers and fits the largest body", async () => {
+  const a = await identity();
   const b = await party();
   const h = await open(b);
-  const { toRecipient } = await sealFor(a, b, "m1", "x");
   h.received({
-    id: "m1",
-    peer: a.keys.identity.identity,
+    id: "big",
+    peer: a,
     sequence: 1,
     read: true,
-    record: {
-      ...toRecipient,
-      sealed: { ...toRecipient.sealed, ciphertext: "A".repeat(maxRecordSize) },
-    },
+    body: "a".repeat(maxBodySize),
   });
   h.received({
-    id: "bad id with spaces",
-    peer: a.keys.identity.identity,
+    id: "huge",
+    peer: a,
     sequence: 2,
     read: true,
-    record: toRecipient,
+    body: "a".repeat(maxBodySize + 1),
   });
+  h.received({ id: "empty", peer: a, sequence: 3, read: true, body: "" });
+  h.received({ id: "ctrl", peer: a, sequence: 4, read: true, body: "a\u0000" });
+  h.received({ id: "bad id", peer: a, sequence: 5, read: true, body: "x" });
+  h.received({ id: "nopeer", peer: "x", sequence: 6, read: true, body: "x" });
   await h.flush();
-  assert.equal(records(b.store).length, 0);
+  assert.deepEqual(
+    records(b.store).map(([key]) => key),
+    [`${a}/big`],
+  );
+  assert.ok(JSON.stringify(records(b.store)[0][1]).length <= maxRecordSize);
 });
 
 test("concurrent writes and reads stay consistent", async () => {
-  const a = await party();
+  const a = await identity();
   const b = await party();
   const h = await open(b);
-  const sealed = await Promise.all(
-    Array.from({ length: 40 }, (_, i) => sealFor(a, b, `m${i}`, `body ${i}`)),
-  );
-  sealed.forEach(({ toRecipient }, i) => {
+  for (let i = 0; i < 40; i++) {
     h.received({
       id: `m${i}`,
-      peer: a.keys.identity.identity,
+      peer: a,
       sequence: i + 1,
       read: false,
-      record: toRecipient,
+      body: `body ${i}`,
     });
     if (i % 7 === 0) {
-      h.read(a.keys.identity.identity);
+      h.read(a);
     }
-  });
-  const [restoredDuring] = await Promise.all([
+  }
+  const [during] = await Promise.all([
     (async () => (await open(await reload(b))).restore())(),
     h.flush(),
   ]);
-  assert.equal(restoredDuring.rejected, 0);
-  h.read(a.keys.identity.identity);
+  assert.equal(during.rejected, 0);
+  h.read(a);
   await h.flush();
-
   const result = await (await open(await reload(b))).restore();
   assert.equal(result.rejected, 0);
   assert.deepEqual(
     result.restored.map((m) => m.body),
-    sealed.map((_, i) => `body ${i}`),
+    Array.from({ length: 40 }, (_, i) => `body ${i}`),
   );
   assert.ok(result.restored.every((m) => "read" in m && m.read === true));
 });
 
 test("marking read applies to writes still in flight", async () => {
-  const a = await party();
+  const a = await identity();
   const b = await party();
   const h = await open(b);
-  const sealed = await Promise.all(
-    ["m1", "m2", "m3"].map((id) => sealFor(a, b, id, id)),
-  );
-  sealed.forEach(({ toRecipient }, i) =>
-    h.received({
-      id: `m${i + 1}`,
-      peer: a.keys.identity.identity,
-      sequence: i + 1,
-      read: false,
-      record: toRecipient,
-    }),
-  );
-  h.read(a.keys.identity.identity);
+  for (const id of ["m1", "m2", "m3"]) {
+    h.received({ id, peer: a, sequence: Number(id[1]), read: false, body: id });
+  }
+  h.read(a);
   await h.flush();
-
   const { restored } = await (await open(await reload(b))).restore();
   assert.deepEqual(
     restored.map((m) => [m.id, "read" in m && m.read]),
@@ -754,27 +668,13 @@ test("marking read applies to writes still in flight", async () => {
 });
 
 test("close finishes queued writes and discards later ones", async () => {
-  const a = await party();
+  const a = await identity();
   const b = await party();
   const h = await open(b);
-  const queued = await sealFor(a, b, "m1", "queued");
-  const late = await sealFor(a, b, "m2", "late");
-  h.received({
-    id: "m1",
-    peer: a.keys.identity.identity,
-    sequence: 1,
-    read: false,
-    record: queued.toRecipient,
-  });
+  h.received({ id: "m1", peer: a, sequence: 1, read: false, body: "queued" });
   const closed = h.close();
-  h.received({
-    id: "m2",
-    peer: a.keys.identity.identity,
-    sequence: 2,
-    read: false,
-    record: late.toRecipient,
-  });
-  h.read(a.keys.identity.identity);
+  h.received({ id: "m2", peer: a, sequence: 2, read: false, body: "late" });
+  h.read(a);
   await closed;
   await h.flush();
   assert.deepEqual(
@@ -784,7 +684,7 @@ test("close finishes queued writes and discards later ones", async () => {
 });
 
 test("results that settle after the store stops are not persisted", async () => {
-  const a = await party();
+  const a = await identity();
   const b = await party();
   const h = await open(b);
   const source = new Source();
@@ -792,13 +692,11 @@ test("results that settle after the store stops are not persisted", async () => 
     history: h,
   });
   store.start();
-  store.open(a.keys.identity.identity);
+  store.open(a);
   const attempt = store.send("settles late");
   assert.equal(attempt.accepted, true);
-  const pending = source.pending[0];
-  const { toSender } = await sealFor(b, a, pending.id, "settles late");
   store.stop();
-  pending.resolve({ ok: true, record: toSender });
+  source.pending[0].resolve({ ok: true });
   if (attempt.accepted) {
     await attempt.delivery;
   }
@@ -806,101 +704,75 @@ test("results that settle after the store stops are not persisted", async () => 
   assert.equal(records(b.store).length, 0);
 });
 
-test("restore re-verifies key bindings even for authentic records", async () => {
-  const a = await party();
-  const b = await party();
-  const h = await open(b);
-  const { toRecipient } = await sealFor(a, b, "m1", "unbound");
-  h.received({
-    id: "m1",
-    peer: a.keys.identity.identity,
-    sequence: 1,
-    read: true,
-    record: {
-      ...toRecipient,
-      peer: {
-        ...toRecipient.peer,
-        signature: flip(toRecipient.peer.signature),
-      },
-    },
-  });
-  await h.flush();
-  assert.equal(records(b.store).length, 1);
-  assert.deepEqual(await (await open(await reload(b))).restore(), {
-    restored: [],
-    rejected: 1,
-  });
-});
-
-test("the record decoder enforces the schema independently of the MAC", async () => {
-  const a = await party();
+test("reset removes identity, keys, and history", async () => {
+  const a = await identity();
   const b = await party();
   await history(a, b);
-  const peer = a.keys.identity.identity;
-  const key = `${peer}/m1`;
+  const old = b.keys.identity.identity;
+  await b.store.clear();
+  assert.equal(b.store.data.size, 0);
+  const state = await loadVault(b.store);
+  assert.equal(state.status, "ready");
+  const fresh = state as Unlocked;
+  assert.equal(fresh.created, true);
+  assert.notEqual(fresh.keys.identity.identity, old);
+  const h = await History.open(
+    b.store,
+    fresh.keys,
+    fresh.integrity,
+    fresh.storage,
+  );
+  assert.deepEqual(await h.restore(), { restored: [], rejected: 0 });
+});
+
+test("the record decoders enforce the schema", async () => {
+  const a = await identity();
+  const b = await party();
+  await history(a, b);
+  const key = `${a}/m1`;
   const received = b.store.data.get(`messages:${key}`) as Record<
     string,
     unknown
   >;
-  const sentKey = `${peer}/r1`;
+  const sentKey = `${a}/r1`;
   const sent = b.store.data.get(`messages:${sentKey}`) as Record<
     string,
     unknown
   >;
   assert.deepEqual(parseRecord(key, received), received);
   assert.deepEqual(parseRecord(sentKey, sent), sent);
-
+  assert.equal(parseLegacyRecord(key, received), null);
   const without = (record: Record<string, unknown>, name: string) => {
     const copy = { ...record };
     delete copy[name];
     return copy;
   };
   const cases: [string, string, unknown][] = [
-    ["version 2", key, { ...received, v: historyVersion + 1 }],
-    ["version 0", key, { ...received, v: 0 }],
-    ["version string", key, { ...received, v: "1" }],
-    ["moved record", `${peer}/m2`, received],
-    ["other peer key", `${b.keys.identity.identity}/m1`, received],
-    ["invalid id", `${peer}/bad id`, { ...received, id: "bad id" }],
-    ["empty id", `${peer}/`, { ...received, id: "" }],
+    ["version 1", key, { ...received, v: 1 }],
+    ["version 3", key, { ...received, v: 3 }],
+    ["moved record", `${a}/m2`, received],
+    ["invalid id", `${a}/bad id`, { ...received, id: "bad id" }],
     ["invalid peer", "x/m1", { ...received, peer: "x" }],
     ["sequence zero", key, { ...received, sequence: 0 }],
-    ["sequence negative", key, { ...received, sequence: -1 }],
     ["sequence fraction", key, { ...received, sequence: 1.5 }],
     ["sequence string", key, { ...received, sequence: "2" }],
-    [
-      "sequence unsafe",
-      key,
-      { ...received, sequence: Number.MAX_SAFE_INTEGER + 2 },
-    ],
     ["direction", key, { ...received, direction: "outgoing" }],
     ["read string", key, { ...received, read: "true" }],
-    ["read number", key, { ...received, read: 1 }],
     ["delivery sending", sentKey, { ...sent, delivery: "sending" }],
-    ["delivery read", sentKey, { ...sent, delivery: "read" }],
     ["delivery seen", sentKey, { ...sent, delivery: "seen" }],
-    ["delivery empty", sentKey, { ...sent, delivery: "" }],
     ["sent with read", sentKey, { ...without(sent, "delivery"), read: true }],
-    [
-      "received with delivery",
-      key,
-      {
-        ...without(received, "read"),
-        delivery: "delivered",
-      },
-    ],
-    ["short key", key, { ...received, key: "AAAA" }],
-    ["short signature", key, { ...received, signature: "AAAA" }],
-    ["short salt", key, { ...received, salt: "AAAA" }],
-    ["long iv", key, { ...received, iv: `${received.iv}AA` }],
+    ["short iv", key, { ...received, iv: "AAAA" }],
     ["padded iv", key, { ...received, iv: `${received.iv}=` }],
+    [
+      "tag-only ciphertext",
+      key,
+      { ...received, ciphertext: encodeBase64Url(new Uint8Array(16)) },
+    ],
     ["numeric ciphertext", key, { ...received, ciphertext: 7 }],
-    ["short mac", key, { ...received, mac: "AAAA" }],
     ["unexpected body", key, { ...received, body: "plaintext" }],
-    ["oversized", key, { ...received, ciphertext: "A".repeat(maxRecordSize) }],
+    ["unexpected key", key, { ...received, key: "x" }],
     ["array", key, [received]],
     ["null", key, null],
-    ["string", key, JSON.stringify(received)],
     ...Object.keys(received).map((name): [string, string, unknown] => [
       `missing ${name}`,
       key,
@@ -912,28 +784,151 @@ test("the record decoder enforces the schema independently of the MAC", async ()
   }
 });
 
-test("reset removes identity, keys, and history", async () => {
-  const a = await party();
+test("migrates authentic v1 records to v2 exactly once", async () => {
   const b = await party();
-  await history(a, b);
-  const old = b.keys.identity.identity;
+  const peer = await legacyParty();
+  const legacy = await Promise.all([
+    legacyRecord(b, peer, {
+      id: "l1",
+      sequence: 1,
+      direction: "received",
+      state: false,
+      body: "legacy one",
+    }),
+    legacyRecord(b, peer, {
+      id: "l2",
+      sequence: 2,
+      direction: "sent",
+      state: "delivered",
+      body: "legacy two",
+    }),
+    legacyRecord(b, peer, {
+      id: "l3",
+      sequence: 3,
+      direction: "received",
+      state: true,
+      body: "legacy three",
+    }),
+  ]);
+  for (const [key, value] of legacy) {
+    b.store.data.set(`messages:${key}`, value);
+  }
+  const h = await open(b);
+  assert.equal(h.migrated, 3);
+  const { restored, rejected } = await h.restore();
+  assert.equal(rejected, 0);
+  assert.deepEqual(
+    restored.map((m) => [m.id, m.direction, m.body]),
+    [
+      ["l1", "received", "legacy one"],
+      ["l2", "sent", "legacy two"],
+      ["l3", "received", "legacy three"],
+    ],
+  );
+  for (const [, record] of records(b.store)) {
+    assert.equal(record.v, historyVersion);
+    assert.ok(!("mac" in record) && !("key" in record) && !("salt" in record));
+  }
+  assertNoPlaintext(b.store, ["legacy one", "legacy two", "legacy three"]);
+  const writes = b.store.writes;
+  const again = await open(await reload(b));
+  assert.equal(again.migrated, 0);
+  assert.equal((await again.restore()).restored.length, 3);
+  assert.equal(b.store.writes, writes);
+});
 
-  await b.store.clear();
-  assert.equal(b.store.data.size, 0);
-  const state = await loadVault(b.store);
-  assert.equal(state.status, "ready");
-  const fresh = state as Unlocked;
-  assert.equal(fresh.created, true);
-  assert.notEqual(fresh.keys.identity.identity, old);
-  const h = await History.open(b.store, fresh.keys, fresh.integrity);
-  assert.deepEqual(await h.restore(), { restored: [], rejected: 0 });
+test("mixed, corrupted, and interrupted v1 migrations fail safely", async () => {
+  const b = await party();
+  const peer = await legacyParty();
+  const other = await legacyParty();
+  const a = peer.identity.identity;
+  await history(a, b);
+  const [goodKey, good] = await legacyRecord(b, peer, {
+    id: "g1",
+    sequence: 10,
+    direction: "received",
+    state: true,
+    body: "migrates",
+  });
+  const bad = await Promise.all([
+    legacyRecord(b, peer, {
+      id: "x1",
+      sequence: 11,
+      direction: "received",
+      state: true,
+      body: "mac",
+    }),
+    legacyRecord(b, peer, {
+      id: "x2",
+      sequence: 12,
+      direction: "received",
+      state: true,
+      body: "cipher",
+    }),
+    legacyRecord(b, peer, {
+      id: "x3",
+      sequence: 13,
+      direction: "received",
+      state: true,
+      body: "binding",
+    }),
+    legacyRecord(b, other, {
+      id: "x4",
+      sequence: 14,
+      direction: "received",
+      state: true,
+      body: "key",
+    }),
+  ]);
+  bad[0][1].mac = flip(bad[0][1].mac as string);
+  bad[1][1].ciphertext = flip(bad[1][1].ciphertext as string);
+  bad[2][1].signature = other.bundle.signature;
+  bad[3][1].peer = a;
+  bad[3][1].key = peer.bundle.key;
+  bad[3][0] = `${a}/x4`;
+  b.store.data.set(`messages:${goodKey}`, good);
+  for (const [key, value] of bad) {
+    b.store.data.set(`messages:${key}`, value);
+  }
+
+  const failing = {
+    ...b.store,
+    swap: async () => {
+      throw new Error("interrupted");
+    },
+  };
+  const interrupted = await open(b, failing);
+  assert.equal(interrupted.migrated, 0);
+  const partial = await interrupted.restore();
+  assert.equal(partial.rejected, 5);
+  assert.equal(partial.restored.length, 3);
+  assert.equal(
+    (b.store.data.get(`messages:${goodKey}`) as Record<string, unknown>).v,
+    legacyVersion,
+  );
+
+  const [first, second] = await Promise.all([open(b), open(b)]);
+  assert.equal(first.migrated + second.migrated, 1);
+  for (const h of [first, second]) {
+    const result = await h.restore();
+    assert.equal(result.rejected, 4);
+    assert.deepEqual(result.restored.map((m) => m.id).sort(), [
+      "g1",
+      "m1",
+      "m2",
+      "r1",
+    ]);
+  }
+  for (const [key, value] of bad) {
+    assert.deepEqual(b.store.data.get(`messages:${key}`), value);
+  }
 });
 
 test("fuzzed persisted records never restore as trusted state", async () => {
-  const a = await party();
+  const a = await identity();
   const b = await party();
   await history(a, b);
-  const key = `${a.keys.identity.identity}/m1`;
+  const key = `${a}/m1`;
   const original = b.store.data.get(`messages:${key}`) as Record<
     string,
     unknown
@@ -945,19 +940,18 @@ test("fuzzed persisted records never restore as trusted state", async () => {
     0,
     -1,
     1.5,
-    Number.MAX_SAFE_INTEGER + 2,
+    1,
+    2,
     "",
     "A",
     "=",
     "💥",
-    "\u0000",
     true,
     false,
     [],
     {},
-    { v: 1 },
+    "A".repeat(16),
     "A".repeat(43),
-    "A".repeat(86),
   ];
   let seed = 0x9e3779b9;
   const random = (n: number) => {
@@ -966,12 +960,12 @@ test("fuzzed persisted records never restore as trusted state", async () => {
     seed ^= seed << 5;
     return (seed >>> 0) % n;
   };
+  const chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_+/=";
   const iterations = Number(process.env.FUZZ_ITERATIONS ?? 1500);
-  let accepted = 0;
   for (let i = 0; i < iterations; i++) {
     const mutated: Record<string, unknown> = { ...original };
-    const steps = 1 + random(3);
-    for (let s = 0; s < steps; s++) {
+    for (let s = 0; s <= random(3); s++) {
       const name = names[random(names.length)];
       const choice = random(5);
       if (choice === 0) {
@@ -981,26 +975,22 @@ test("fuzzed persisted records never restore as trusted state", async () => {
       } else if (choice === 2 && typeof mutated[name] === "string") {
         const text = mutated[name] as string;
         const at = random(Math.max(1, text.length));
-        const chars =
-          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_+/=";
         mutated[name] =
           text.slice(0, at) + chars[random(chars.length)] + text.slice(at + 1);
       } else if (choice === 3) {
-        mutated[`x${random(4)}`] = values[random(values.length)];
+        mutated[["mac", "key", "body", "salt"][random(4)]] =
+          values[random(values.length)];
       } else {
         mutated[name] = original[names[random(names.length)]];
       }
     }
     b.store.data.set(`messages:${key}`, mutated);
-    const h = await History.open(b.store, b.keys, b.integrity);
-    const { restored } = await h.restore();
+    const { restored } = await (await open(b)).restore();
     const m1 = restored.find((m) => m.id === "m1");
     if (m1) {
-      accepted += 1;
       assert.deepEqual(mutated, original);
       assert.equal(m1.body, "first secret");
     }
     assert.ok(restored.some((m) => m.id === "m2"));
   }
-  assert.ok(accepted < iterations);
 });

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ExchangeKey, verifyBundle } from "./encryption.ts";
-import { IdentityKey, verify } from "./identity.ts";
-import { memoryStore } from "./testing.ts";
+import { verify } from "./identity.ts";
+import { legacyParty, legacySeal, memoryStore } from "./testing.ts";
 import { type Unlocked, loadVault, vaultVersion } from "./vault.ts";
 
 async function ready(store: ReturnType<typeof memoryStore>): Promise<Unlocked> {
@@ -24,18 +24,33 @@ async function sameIdentity(a: Unlocked, b: Unlocked): Promise<void> {
     await verify(a.keys.identity.identity, challenge, signature),
     true,
   );
-  const peer = await ExchangeKey.generate();
-  const peerIdentity = await IdentityKey.generate();
+  const peer = await legacyParty();
   const parties = {
     id: "m1",
-    from: peerIdentity.identity,
+    from: peer.identity.identity,
     to: a.keys.identity.identity,
     fromKey: peer.publicRaw,
     toKey: a.keys.exchange.publicRaw,
   };
-  const sealed = await peer.seal(parties, "continuity");
-  assert.ok(sealed);
-  assert.equal(await b.keys.exchange.open(parties, sealed), "continuity");
+  const sealed = await legacySeal(
+    parties,
+    peer.privateKey,
+    a.keys.exchange.publicRaw,
+    "continuity",
+  );
+  assert.equal(await b.keys.exchange.openLegacy(parties, sealed), "continuity");
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const local = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    a.storage,
+    new TextEncoder().encode("local"),
+  );
+  assert.equal(
+    new TextDecoder().decode(
+      await crypto.subtle.decrypt({ name: "AES-GCM", iv }, b.storage, local),
+    ),
+    "local",
+  );
 }
 
 test("a fresh installation creates and stores non-extractable keys", async () => {
@@ -50,12 +65,13 @@ test("a fresh installation creates and stores non-extractable keys", async () =>
     "identity",
     "integrity",
     "signing",
+    "storage",
     "v",
   ]);
   assert.equal(record.v, vaultVersion);
   assert.equal(record.identity, first.keys.identity.identity);
   assert.equal(record.exchangeKey, first.keys.exchange.publicKey);
-  for (const name of ["signing", "exchange", "integrity"]) {
+  for (const name of ["signing", "exchange", "integrity", "storage"]) {
     const key = record[name] as CryptoKey;
     assert.ok(key instanceof CryptoKey);
     assert.equal(key.extractable, false);
@@ -72,6 +88,7 @@ test("a fresh installation creates and stores non-extractable keys", async () =>
       exchangeKey: record.exchangeKey,
       exchange: {},
       integrity: {},
+      storage: {},
     }),
   );
 });
@@ -129,6 +146,16 @@ test("corrupted or substituted key material fails closed without overwriting", a
     false,
     ["encrypt", "decrypt"],
   );
+  const shortAes = await crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 128 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+  const looseAes = await crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt", "decrypt"],
+  );
   const weakMac = await crypto.subtle.generateKey(
     { name: "HMAC", hash: "SHA-1", length: 256 },
     false,
@@ -183,6 +210,14 @@ test("corrupted or substituted key material fails closed without overwriting", a
     "wrong exchange algorithm": { ...original, exchange: ecdh.privateKey },
     "wrong integrity algorithm": { ...original, integrity: aes },
     "weak integrity hash": { ...original, integrity: weakMac },
+    "missing storage key": (() => {
+      const { storage: _s, ...rest } = original;
+      return rest;
+    })(),
+    "storage key with wrong algorithm": { ...original, storage: weakMac },
+    "short storage key": { ...original, storage: shortAes },
+    "extractable storage key": { ...original, storage: looseAes },
+    "v1 record with storage key": { ...original, v: 1 },
     "raw bytes instead of key": {
       ...original,
       exchange: new Uint8Array(32),
@@ -217,4 +252,93 @@ test("only an explicit reset produces a different identity", async () => {
   const again = await ready(store);
   assert.equal(again.created, false);
   await sameIdentity(fresh, again);
+});
+
+function legacyOf(record: Record<string, unknown>): Record<string, unknown> {
+  const { storage: _s, ...rest } = record;
+  return { ...rest, v: 1 };
+}
+
+test("migrates a valid v1 vault to v2 exactly once", async () => {
+  const origin = memoryStore();
+  const first = await ready(origin);
+  const v1 = legacyOf(stored(origin));
+  const store = memoryStore();
+  store.data.set("vault:keys", v1);
+
+  const migrated = await ready(store);
+  assert.equal(migrated.created, false);
+  assert.equal(migrated.keys.identity.identity, first.keys.identity.identity);
+  assert.equal(migrated.keys.exchange.publicKey, first.keys.exchange.publicKey);
+  const record = stored(store);
+  assert.equal(record.v, vaultVersion);
+  assert.ok(record.storage instanceof CryptoKey);
+  assert.equal((record.storage as CryptoKey).extractable, false);
+  assert.equal(store.writes, 1);
+
+  const again = await ready(store);
+  await sameIdentity(migrated, again);
+  assert.equal(store.writes, 1);
+  assert.deepEqual(
+    Object.values(record).filter((v) => v instanceof CryptoKey).length,
+    4,
+  );
+});
+
+test("concurrent v1 migrations converge on one storage key", async () => {
+  const origin = memoryStore();
+  await ready(origin);
+  const store = memoryStore();
+  store.data.set("vault:keys", legacyOf(stored(origin)));
+  const results = await Promise.all(
+    Array.from({ length: 6 }, () => ready(store)),
+  );
+  assert.equal(store.writes, 1);
+  for (const result of results) {
+    await sameIdentity(results[0], result);
+  }
+});
+
+test("an interrupted migration leaves the v1 vault intact for a later retry", async () => {
+  const origin = memoryStore();
+  const first = await ready(origin);
+  const v1 = legacyOf(stored(origin));
+  const store = memoryStore();
+  store.data.set("vault:keys", v1);
+  const failing = {
+    ...store,
+    swap: async () => {
+      throw new Error("write interrupted");
+    },
+  };
+  await assert.rejects(loadVault(failing));
+  assert.deepEqual(store.data.get("vault:keys"), v1);
+  assert.equal(store.writes, 0);
+  const retried = await ready(store);
+  assert.equal(retried.keys.identity.identity, first.keys.identity.identity);
+  assert.equal(stored(store).v, vaultVersion);
+});
+
+test("corrupted v1 vaults fail closed without migration", async () => {
+  const origin = memoryStore();
+  await ready(origin);
+  const v1 = legacyOf(stored(origin));
+  const other = memoryStore();
+  await ready(other);
+  const { integrity: _i, ...noIntegrity } = v1;
+  for (const [name, record] of Object.entries({
+    "substituted identity": { ...v1, identity: stored(other).identity },
+    "missing integrity": noIntegrity,
+    "extra field": { ...v1, extra: true },
+    "substituted exchange key": {
+      ...v1,
+      exchangeKey: stored(other).exchangeKey,
+    },
+  })) {
+    const store = memoryStore();
+    store.data.set("vault:keys", record);
+    assert.equal((await loadVault(store)).status, "corrupted", name);
+    assert.equal(store.writes, 0, name);
+    assert.equal(store.data.get("vault:keys"), record, name);
+  }
 });

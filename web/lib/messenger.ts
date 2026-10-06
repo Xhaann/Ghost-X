@@ -2,7 +2,6 @@ import type { Client } from "./client.ts";
 import {
   type ExchangeKey,
   type KeyBundle,
-  type Sealed,
   verifyBundle,
 } from "./encryption.ts";
 import { type IdentityKey, isIdentity } from "./identity.ts";
@@ -11,33 +10,34 @@ import type { AuthSource } from "./presence.ts";
 import {
   type ErrorCode,
   type ServerMessage,
+  type WireEnvelope,
   bodySize,
   createId,
   isValidBody,
   isValidId,
   maxBodySize,
 } from "./protocol.ts";
-
-export type SealedRecord = { sealed: Sealed; peer: KeyBundle };
+import { SessionKeys, type Transcript, verifySession } from "./session.ts";
 
 export type SendResult =
-  | { ok: true; record?: SealedRecord }
-  | {
-      ok: false;
-      reason: ErrorCode | "not_sent" | "encryption_failed";
-      record?: SealedRecord;
-    };
+  | { ok: true }
+  | { ok: false; reason: ErrorCode | "not_sent" | "encryption_failed" };
 
-export type Incoming = {
-  id: string;
-  from: string;
-  body: string | null;
-  record?: SealedRecord;
-};
+export type Incoming = { id: string; from: string; body: string | null };
 
 export type MessengerState = { active: boolean };
 
+export type SessionInfo = { session: string; epochs: number[] };
+
+export type MessengerOptions = {
+  rotationLimit?: number;
+  previousLimit?: number;
+};
+
 export const maxPendingDecryptions = 128;
+export const rotationLimit = 32;
+export const previousLimit = 8;
+export const replayLimit = 4096;
 
 type Delivery = Extract<ServerMessage, { type: "message" }>["payload"];
 
@@ -46,10 +46,17 @@ export class Messenger {
   readonly #auth: AuthSource;
   readonly #identity: IdentityKey;
   readonly #exchange: ExchangeKey;
+  readonly #rotationLimit: number;
+  readonly #previousLimit: number;
   readonly #states = new Listeners<MessengerState>();
   readonly #messages = new Listeners<Incoming>();
-  readonly #keys = new Listeners<KeyBundle>();
+  readonly #bundles = new Listeners<KeyBundle>();
+  readonly #seen = new Set<string>();
   #state: MessengerState = { active: false };
+  #session: SessionKeys | null = null;
+  #uses = 0;
+  #sincePrevious = 0;
+  #rotating = false;
   #generation = 0;
   #pending = 0;
   #queue: Promise<void> = Promise.resolve();
@@ -60,15 +67,25 @@ export class Messenger {
     auth: AuthSource,
     identity: IdentityKey,
     exchange: ExchangeKey,
+    options: MessengerOptions = {},
   ) {
     this.#client = client;
     this.#auth = auth;
     this.#identity = identity;
     this.#exchange = exchange;
+    this.#rotationLimit = options.rotationLimit ?? rotationLimit;
+    this.#previousLimit = options.previousLimit ?? previousLimit;
   }
 
   get state(): MessengerState {
     return this.#state;
+  }
+
+  get session(): SessionInfo | null {
+    const session = this.#session;
+    return session && !session.destroyed
+      ? { session: session.session, epochs: session.epochs }
+      : null;
   }
 
   onState(listener: (state: MessengerState) => void): () => void {
@@ -80,27 +97,7 @@ export class Messenger {
   }
 
   onKey(listener: (bundle: KeyBundle) => void): () => void {
-    return this.#keys.add(listener);
-  }
-
-  async lookup(identity: string): Promise<boolean> {
-    if (!this.#state.active || !isIdentity(identity)) {
-      return false;
-    }
-    const generation = this.#generation;
-    const reply = await this.#client.request({
-      type: "key",
-      payload: { identity },
-    });
-    if (reply?.type !== "key" || reply.payload.identity !== identity) {
-      return false;
-    }
-    const verified = await verifyBundle(reply.payload);
-    if (!verified || generation !== this.#generation) {
-      return false;
-    }
-    this.#keys.emit(reply.payload);
-    return true;
+    return this.#bundles.add(listener);
   }
 
   start(): void {
@@ -115,7 +112,7 @@ export class Messenger {
       }),
       this.#auth.onState((state) => {
         if (state === "authenticated") {
-          this.#publish();
+          this.#establish();
         } else {
           this.#deactivate();
         }
@@ -123,7 +120,7 @@ export class Messenger {
     ];
     this.#detach = () => detach.forEach((release) => release());
     if (this.#auth.state === "authenticated") {
-      this.#publish();
+      this.#establish();
     }
   }
 
@@ -133,12 +130,77 @@ export class Messenger {
     this.#deactivate();
   }
 
+  async lookup(identity: string): Promise<boolean> {
+    if (!this.#state.active || !isIdentity(identity)) {
+      return false;
+    }
+    const generation = this.#generation;
+    const reply = await this.#client.request({
+      type: "key",
+      payload: { identity },
+    });
+    if (reply?.type !== "key" || reply.payload.identity !== identity) {
+      return false;
+    }
+    const bundle: KeyBundle = {
+      identity,
+      key: reply.payload.key,
+      signature: reply.payload.signature,
+    };
+    if (!(await verifyBundle(bundle)) || generation !== this.#generation) {
+      return false;
+    }
+    this.#bundles.emit(bundle);
+    return true;
+  }
+
+  async rotate(): Promise<boolean> {
+    const session = this.#session;
+    const generation = this.#generation;
+    if (!session || this.#rotating || !this.#state.active) {
+      return false;
+    }
+    this.#rotating = true;
+    try {
+      const epoch = await session.prepare();
+      const bundle =
+        epoch === null
+          ? null
+          : await session.bind(this.#identity, this.#exchange, "pending");
+      if (generation !== this.#generation || this.#session !== session) {
+        return false;
+      }
+      const reply = bundle
+        ? await this.#client.request({ type: "session", payload: bundle })
+        : null;
+      if (generation !== this.#generation || this.#session !== session) {
+        return false;
+      }
+      if (
+        epoch !== null &&
+        reply?.type === "established" &&
+        session.activate(epoch)
+      ) {
+        this.#uses = 0;
+        this.#sincePrevious = 0;
+        return true;
+      }
+      this.#deactivate();
+      return false;
+    } finally {
+      if (this.#session === session) {
+        this.#rotating = false;
+      }
+    }
+  }
+
   async send(
     to: string,
     body: string,
     id: string = createId(),
   ): Promise<SendResult> {
-    if (!this.#state.active) {
+    const session = this.#session;
+    if (!this.#state.active || !session || session.destroyed) {
       return { ok: false, reason: "authentication_required" };
     }
     if (!isIdentity(to) || !isValidId(id)) {
@@ -152,82 +214,177 @@ export class Messenger {
     }
     const generation = this.#generation;
 
-    const bundle = await this.#client.request({
+    const reply = await this.#client.request({
       type: "key",
       payload: { identity: to },
     });
-    if (bundle?.type === "error") {
-      return { ok: false, reason: bundle.payload.code };
+    if (reply?.type === "error") {
+      return { ok: false, reason: reply.payload.code };
     }
-    if (bundle?.type !== "key" || bundle.payload.identity !== to) {
+    if (reply?.type !== "key" || reply.payload.identity !== to) {
       return { ok: false, reason: "not_sent" };
     }
-    const toKey = await verifyBundle(bundle.payload);
-    if (!toKey) {
+    const bundle: KeyBundle = {
+      identity: to,
+      key: reply.payload.key,
+      signature: reply.payload.signature,
+    };
+    const toStatic = await verifyBundle(bundle);
+    if (!toStatic) {
       return { ok: false, reason: "encryption_failed" };
     }
     if (generation === this.#generation) {
-      this.#keys.emit(bundle.payload);
+      this.#bundles.emit(bundle);
     }
-    const sealed = await this.#exchange.seal(
-      {
-        id,
-        from: this.#identity.identity,
-        to,
-        fromKey: this.#exchange.publicRaw,
-        toKey,
-      },
-      body,
-    );
-    if (!sealed) {
-      return { ok: false, reason: "encryption_failed" };
-    }
-    const record: SealedRecord = { sealed, peer: bundle.payload };
-    if (generation !== this.#generation) {
-      return { ok: false, reason: "not_sent", record };
+    if (reply.payload.sessions.length === 0) {
+      return { ok: false, reason: "recipient_unavailable" };
     }
 
-    const reply = await this.#client.request(
-      { type: "send", payload: { to, ...sealed } },
+    const current = session.current;
+    if (!current) {
+      return { ok: false, reason: "not_sent" };
+    }
+    const envelopes: WireEnvelope[] = [];
+    for (const target of reply.payload.sessions) {
+      const ephemeral = await verifySession(to, toStatic, target);
+      if (!ephemeral) {
+        return { ok: false, reason: "encryption_failed" };
+      }
+      const transcript: Transcript = {
+        id,
+        from: {
+          identity: this.#identity.identity,
+          staticKey: this.#exchange.publicRaw,
+          session: session.session,
+          epoch: current.epoch,
+          ephemeral: current.key,
+        },
+        to: {
+          identity: to,
+          staticKey: toStatic,
+          session: target.session,
+          epoch: target.epoch,
+          ephemeral,
+        },
+      };
+      const sealed = await session.seal(transcript, body);
+      if (!sealed) {
+        return { ok: false, reason: "encryption_failed" };
+      }
+      envelopes.push({
+        session: target.session,
+        epoch: target.epoch,
+        ...sealed,
+      });
+    }
+    if (generation !== this.#generation || this.#session !== session) {
+      return { ok: false, reason: "not_sent" };
+    }
+    this.#used();
+
+    const result = await this.#client.request(
+      { type: "send", payload: { to, epoch: current.epoch, envelopes } },
       5000,
       id,
     );
-    if (reply?.type === "sent") {
-      return { ok: true, record };
+    if (result?.type === "sent") {
+      return { ok: true };
     }
-    if (reply?.type === "error") {
-      return { ok: false, reason: reply.payload.code, record };
+    if (result?.type === "error") {
+      return { ok: false, reason: result.payload.code };
     }
-    return { ok: false, reason: "not_sent", record };
+    return { ok: false, reason: "not_sent" };
   }
 
-  #publish(): void {
+  #establish(): void {
     const generation = ++this.#generation;
     this.#setActive(false);
-    this.#exchange
-      .bind(this.#identity)
-      .then(async (bundle) => {
-        if (!bundle || generation !== this.#generation) {
-          return;
-        }
-        const reply = await this.#client.request({
-          type: "publish",
-          payload: { key: bundle.key, signature: bundle.signature },
-        });
-        if (generation === this.#generation && reply?.type === "published") {
-          this.#setActive(true);
-        }
-      })
-      .catch(() => {});
+    this.#discard();
+    (async () => {
+      const bundle = await this.#exchange.bind(this.#identity);
+      if (!bundle || generation !== this.#generation) {
+        return;
+      }
+      const published = await this.#client.request({
+        type: "publish",
+        payload: { key: bundle.key, signature: bundle.signature },
+      });
+      if (generation !== this.#generation || published?.type !== "published") {
+        return;
+      }
+      const session = await SessionKeys.create();
+      const offer = await session.bind(
+        this.#identity,
+        this.#exchange,
+        "current",
+      );
+      const reply =
+        offer && generation === this.#generation
+          ? await this.#client.request({ type: "session", payload: offer })
+          : null;
+      if (generation === this.#generation && reply?.type === "established") {
+        this.#session = session;
+        this.#uses = 0;
+        this.#sincePrevious = 0;
+        this.#rotating = false;
+        this.#setActive(true);
+      } else {
+        session.destroy();
+      }
+    })().catch(() => {});
   }
 
   #deactivate(): void {
     this.#generation += 1;
+    this.#discard();
     this.#setActive(false);
   }
 
+  #discard(): void {
+    this.#session?.destroy();
+    this.#session = null;
+    this.#rotating = false;
+  }
+
+  #used(): void {
+    const session = this.#session;
+    if (!session) {
+      return;
+    }
+    this.#uses += 1;
+    if (session.epochs.length > 1) {
+      this.#sincePrevious += 1;
+      if (this.#sincePrevious >= this.#previousLimit) {
+        session.discardPrevious();
+        this.#sincePrevious = 0;
+      }
+    }
+    if (this.#uses >= this.#rotationLimit) {
+      void this.rotate();
+    }
+  }
+
+  #remember(key: string): void {
+    this.#seen.add(key);
+    if (this.#seen.size > replayLimit) {
+      const oldest = this.#seen.values().next().value;
+      if (oldest !== undefined) {
+        this.#seen.delete(oldest);
+      }
+    }
+  }
+
   #receive(delivery: Delivery): void {
-    if (!this.#state.active) {
+    const session = this.#session;
+    if (
+      !this.#state.active ||
+      !session ||
+      delivery.envelope.session !== session.session
+    ) {
+      return;
+    }
+    const replay = `${delivery.from}/${delivery.id}`;
+    if (this.#seen.has(replay)) {
       return;
     }
     const generation = this.#generation;
@@ -237,49 +394,70 @@ export class Messenger {
     }
     this.#pending += 1;
     this.#queue = this.#queue.then(async () => {
-      const opened = await this.#open(delivery);
+      const body = await this.#open(delivery, session);
       this.#pending -= 1;
-      if (generation === this.#generation) {
-        this.#messages.emit({
-          id: delivery.id,
-          from: delivery.from,
-          body: opened?.body ?? null,
-          record: opened?.record,
-        });
+      if (generation !== this.#generation || this.#session !== session) {
+        return;
       }
+      if (body !== null) {
+        if (this.#seen.has(replay)) {
+          return;
+        }
+        this.#remember(replay);
+        this.#used();
+      }
+      this.#messages.emit({ id: delivery.id, from: delivery.from, body });
     });
   }
 
   async #open(
     delivery: Delivery,
-  ): Promise<{ body: string; record: SealedRecord } | null> {
+    session: SessionKeys,
+  ): Promise<string | null> {
     try {
       const peer: KeyBundle = {
         identity: delivery.from,
         key: delivery.key,
         signature: delivery.signature,
       };
-      const fromKey = await verifyBundle(peer);
-      if (!fromKey) {
+      const fromStatic = await verifyBundle(peer);
+      if (!fromStatic) {
         return null;
       }
-      this.#keys.emit(peer);
-      const sealed: Sealed = {
-        salt: delivery.salt,
-        iv: delivery.iv,
-        ciphertext: delivery.ciphertext,
-      };
-      const body = await this.#exchange.open(
+      this.#bundles.emit(peer);
+      const fromEphemeral = await verifySession(
+        delivery.from,
+        fromStatic,
+        delivery.sender,
+      );
+      const toEphemeral = session.publicKeyOf(delivery.envelope.epoch);
+      if (!fromEphemeral || !toEphemeral) {
+        return null;
+      }
+      return await session.open(
         {
           id: delivery.id,
-          from: delivery.from,
-          to: this.#identity.identity,
-          fromKey,
-          toKey: this.#exchange.publicRaw,
+          from: {
+            identity: delivery.from,
+            staticKey: fromStatic,
+            session: delivery.sender.session,
+            epoch: delivery.sender.epoch,
+            ephemeral: fromEphemeral,
+          },
+          to: {
+            identity: this.#identity.identity,
+            staticKey: this.#exchange.publicRaw,
+            session: session.session,
+            epoch: delivery.envelope.epoch,
+            ephemeral: toEphemeral,
+          },
         },
-        sealed,
+        {
+          salt: delivery.envelope.salt,
+          iv: delivery.envelope.iv,
+          ciphertext: delivery.envelope.ciphertext,
+        },
       );
-      return body === null ? null : { body, record: { sealed, peer } };
     } catch {
       return null;
     }

@@ -2,13 +2,19 @@ package direct
 
 import (
 	"errors"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/Xhaann/ghost-x/server/auth"
 	"github.com/Xhaann/ghost-x/server/identity"
 )
 
-const recentLimit = 256
+const (
+	recentLimit = 256
+	MaxSessions = 4
+	MaxEpoch    = 1<<31 - 1
+)
 
 var (
 	ErrUnauthenticated = errors.New("direct: sender not authenticated")
@@ -16,6 +22,8 @@ var (
 	ErrNoKey           = errors.New("direct: sender has no published key")
 	ErrKeyConflict     = errors.New("direct: identity already bound to another key")
 	ErrDuplicate       = errors.New("direct: duplicate message id")
+	ErrStale           = errors.New("direct: stale or invalid session state")
+	ErrSessionLimit    = errors.New("direct: too many sessions for identity")
 )
 
 type Bundle struct {
@@ -23,7 +31,16 @@ type Bundle struct {
 	Signature string
 }
 
+type SessionBundle struct {
+	ID        string
+	Epoch     uint32
+	Key       string
+	Signature string
+}
+
 type Envelope struct {
+	Session    string
+	Epoch      uint32
 	Salt       string
 	IV         string
 	Ciphertext string
@@ -33,6 +50,7 @@ type Message struct {
 	ID       string
 	From     string
 	Sender   Bundle
+	Session  SessionBundle
 	Envelope Envelope
 }
 
@@ -41,6 +59,21 @@ type Deliver func(Message) bool
 type binding struct {
 	bundle   Bundle
 	sessions map[*auth.Session]struct{}
+}
+
+type epochs struct {
+	current  SessionBundle
+	previous *SessionBundle
+}
+
+func (e *epochs) at(epoch uint32) (SessionBundle, bool) {
+	if e.current.Epoch == epoch {
+		return e.current, true
+	}
+	if e.previous != nil && e.previous.Epoch == epoch {
+		return *e.previous, true
+	}
+	return SessionBundle{}, false
 }
 
 type recent struct {
@@ -67,6 +100,7 @@ type Registry struct {
 	identities map[*auth.Session]string
 	recipients map[string]map[*auth.Session]struct{}
 	keys       map[string]*binding
+	sessions   map[*auth.Session]*epochs
 	recent     map[*auth.Session]*recent
 }
 
@@ -76,6 +110,7 @@ func NewRegistry() *Registry {
 		identities: make(map[*auth.Session]string),
 		recipients: make(map[string]map[*auth.Session]struct{}),
 		keys:       make(map[string]*binding),
+		sessions:   make(map[*auth.Session]*epochs),
 		recent:     make(map[*auth.Session]*recent),
 	}
 }
@@ -129,9 +164,53 @@ func (r *Registry) Publish(s *auth.Session, bundle Bundle) error {
 		current.sessions[s] = struct{}{}
 	case len(current.sessions) == 1 && hasSession(current.sessions, s):
 		current.bundle = bundle
+		delete(r.sessions, s)
 	default:
 		return ErrKeyConflict
 	}
+	return nil
+}
+
+func (r *Registry) Establish(s *auth.Session, staticKey string, bundle SessionBundle) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	owner, ok := r.identities[s]
+	if !ok {
+		return ErrUnauthenticated
+	}
+	current := r.keys[owner]
+	if current == nil || !hasSession(current.sessions, s) || current.bundle.Key != staticKey {
+		return ErrNoKey
+	}
+	if bundle.Epoch > MaxEpoch {
+		return ErrStale
+	}
+	state := r.sessions[s]
+	if state == nil || (bundle.Epoch == 0 && bundle.ID != state.current.ID) {
+		if bundle.Epoch != 0 {
+			return ErrStale
+		}
+		count := 0
+		for other := range r.recipients[owner] {
+			if st := r.sessions[other]; st != nil && other != s {
+				count++
+				if st.current.ID == bundle.ID {
+					return ErrStale
+				}
+			}
+		}
+		if count >= MaxSessions {
+			return ErrSessionLimit
+		}
+		r.sessions[s] = &epochs{current: bundle}
+		return nil
+	}
+	if bundle.ID != state.current.ID || bundle.Epoch != state.current.Epoch+1 {
+		return ErrStale
+	}
+	previous := state.current
+	state.previous = &previous
+	state.current = bundle
 	return nil
 }
 
@@ -145,7 +224,25 @@ func (r *Registry) Bundle(id identity.Identity) (Bundle, bool) {
 	return current.bundle, true
 }
 
-func (r *Registry) Send(from *auth.Session, to identity.Identity, id string, envelope Envelope) error {
+func (r *Registry) Lookup(id identity.Identity) (Bundle, []SessionBundle, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := id.String()
+	current := r.keys[key]
+	if current == nil {
+		return Bundle{}, nil, false
+	}
+	sessions := []SessionBundle{}
+	for s := range r.recipients[key] {
+		if st := r.sessions[s]; st != nil && hasSession(current.sessions, s) {
+			sessions = append(sessions, st.current)
+		}
+	}
+	slices.SortFunc(sessions, func(a, b SessionBundle) int { return strings.Compare(a.ID, b.ID) })
+	return current.bundle, sessions, true
+}
+
+func (r *Registry) Send(from *auth.Session, to identity.Identity, id string, epoch uint32, envelopes []Envelope) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	sender, ok := r.identities[from]
@@ -153,17 +250,32 @@ func (r *Registry) Send(from *auth.Session, to identity.Identity, id string, env
 		return ErrUnauthenticated
 	}
 	current := r.keys[sender]
-	if current == nil || !hasSession(current.sessions, from) {
+	state := r.sessions[from]
+	if current == nil || !hasSession(current.sessions, from) || state == nil {
 		return ErrNoKey
+	}
+	senderSession, ok := state.at(epoch)
+	if !ok {
+		return ErrStale
 	}
 	if !r.recent[from].add(id) {
 		return ErrDuplicate
 	}
 	delivered := 0
-	msg := Message{ID: id, From: sender, Sender: current.bundle, Envelope: envelope}
-	for s := range r.recipients[to.String()] {
-		if deliver, ok := r.endpoints[s]; ok && deliver(msg) {
-			delivered++
+	for _, envelope := range envelopes {
+		for s := range r.recipients[to.String()] {
+			st := r.sessions[s]
+			if st == nil || st.current.ID != envelope.Session {
+				continue
+			}
+			if _, ok := st.at(envelope.Epoch); !ok {
+				break
+			}
+			msg := Message{ID: id, From: sender, Sender: current.bundle, Session: senderSession, Envelope: envelope}
+			if deliver, ok := r.endpoints[s]; ok && deliver(msg) {
+				delivered++
+			}
+			break
 		}
 	}
 	if delivered == 0 {
@@ -179,6 +291,7 @@ func (r *Registry) forget(s *auth.Session) {
 	}
 	delete(r.identities, s)
 	delete(r.recent, s)
+	delete(r.sessions, s)
 	delete(r.recipients[key], s)
 	if len(r.recipients[key]) == 0 {
 		delete(r.recipients, key)

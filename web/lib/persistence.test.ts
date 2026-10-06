@@ -46,7 +46,12 @@ async function boot(port: number, store: Store): Promise<Device> {
   const vault = await loadVault(store);
   assert.equal(vault.status, "ready");
   const unlocked = vault as Unlocked;
-  const history = await History.open(store, unlocked.keys, unlocked.integrity);
+  const history = await History.open(
+    store,
+    unlocked.keys,
+    unlocked.integrity,
+    unlocked.storage,
+  );
   const { restored, rejected } = await history.restore();
 
   const before = created.length;
@@ -267,7 +272,7 @@ test("history and identity survive a server restart and multiple conversations",
   assert.deepEqual(thread(a, idC), ["received:from c"]);
 });
 
-test("a message that was never encrypted is never persisted", async () => {
+test("an undelivered message is persisted encrypted as not delivered", async () => {
   const port = await freePort();
   await startServer(port);
   const storeA = memoryStore();
@@ -281,15 +286,13 @@ test("a message that was never encrypted is never persisted", async () => {
   while ((await send(a, "probe").delivery) !== "unavailable") {
     assert.ok(Date.now() < deadline);
   }
-  assert.equal(await send(a, "never encrypted").delivery, "unavailable");
-  assert.equal(thread(a, idB).at(-1), "sent:unavailable:never encrypted");
+  assert.equal(await send(a, "undelivered secret").delivery, "unavailable");
   await a.history.flush();
-  assertSealedAtRest(storeA, ["never encrypted", "probe"]);
+  assertSealedAtRest(storeA, ["undelivered secret", "probe"]);
   await a.shutdown();
   a = await boot(port, storeA);
-  const restored = thread(a, idB);
-  assert.ok(!restored.some((m) => m.endsWith(":never encrypted")));
-  assert.ok(restored.every((m) => m === "sent:unavailable:probe"));
+  assert.equal(thread(a, idB).at(-1), "sent:unavailable:undelivered secret");
+  assert.ok(thread(a, idB).every((m) => m.startsWith("sent:unavailable:")));
 });
 
 test("a corrupted record is rejected while the rest of the history restores", async () => {

@@ -7,6 +7,7 @@ import {
   encode,
   isValidBody,
   maxBodySize,
+  maxSessions,
   parse,
 } from "./protocol.ts";
 
@@ -187,12 +188,20 @@ function b64(size: number): string {
   return encodeBase64Url(crypto.getRandomValues(new Uint8Array(size)));
 }
 
-function delivery(overrides: Record<string, unknown> = {}) {
+function sessionBundle(overrides: Record<string, unknown> = {}) {
   return {
-    id: "m1",
-    from: "B".repeat(42) + "A",
+    session: b64(16),
+    epoch: 0,
     key: b64(32),
     signature: b64(64),
+    ...overrides,
+  };
+}
+
+function envelope(overrides: Record<string, unknown> = {}) {
+  return {
+    session: b64(16),
+    epoch: 3,
     salt: b64(32),
     iv: b64(12),
     ciphertext: b64(40),
@@ -200,23 +209,43 @@ function delivery(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function delivery(
+  overrides: Record<string, unknown> = {},
+  sender: Record<string, unknown> = {},
+  sealed: Record<string, unknown> = {},
+) {
+  return {
+    id: "m1",
+    from: "B".repeat(42) + "A",
+    key: b64(32),
+    signature: b64(64),
+    sender: sessionBundle(sender),
+    envelope: envelope(sealed),
+    ...overrides,
+  };
+}
+
 test("parses messaging replies, key bundles, and encrypted deliveries", () => {
   const identity = "B".repeat(42) + "A";
-  assert.deepEqual(parse('{"type":"sent","id":"m1","payload":{}}'), {
-    type: "sent",
-    id: "m1",
-    payload: {},
-  });
-  assert.deepEqual(parse('{"type":"published","id":"k1","payload":{}}'), {
-    type: "published",
-    id: "k1",
-    payload: {},
-  });
-  const bundle = { identity, key: b64(32), signature: b64(64) };
-  assert.deepEqual(
-    parse(JSON.stringify({ type: "key", id: "q1", payload: bundle })),
-    { type: "key", id: "q1", payload: bundle },
-  );
+  for (const type of ["sent", "published", "established"]) {
+    assert.deepEqual(parse(JSON.stringify({ type, id: "m1", payload: {} })), {
+      type,
+      id: "m1",
+      payload: {},
+    });
+  }
+  for (const sessions of [
+    [],
+    [sessionBundle()],
+    [sessionBundle(), sessionBundle({ epoch: 2 ** 31 - 1 })],
+    Array.from({ length: maxSessions }, () => sessionBundle()),
+  ]) {
+    const bundle = { identity, key: b64(32), signature: b64(64), sessions };
+    assert.deepEqual(
+      parse(JSON.stringify({ type: "key", id: "q1", payload: bundle })),
+      { type: "key", id: "q1", payload: bundle },
+    );
+  }
   const payload = delivery();
   assert.deepEqual(parse(JSON.stringify({ type: "message", payload })), {
     type: "message",
@@ -227,6 +256,8 @@ test("parses messaging replies, key bundles, and encrypted deliveries", () => {
     "message_too_large",
     "key_required",
     "duplicate_message",
+    "stale_session",
+    "session_limit",
   ]) {
     assert.deepEqual(
       parse(JSON.stringify({ type: "error", id: "m1", payload: { code } })),
@@ -237,55 +268,101 @@ test("parses messaging replies, key bundles, and encrypted deliveries", () => {
 
 test("rejects malformed key bundles and deliveries", () => {
   const identity = "B".repeat(42) + "A";
-  const bundle = { identity, key: b64(32), signature: b64(64) };
+  const bundle = { identity, key: b64(32), signature: b64(64), sessions: [] };
+  const twin = sessionBundle();
+  const badEpochs = [-1, 0.5, 2 ** 31, "0", null, Number.MAX_SAFE_INTEGER + 2];
   for (const message of [
     { type: "key", payload: bundle },
     { type: "key", id: "q1", payload: { ...bundle, key: b64(31) } },
     { type: "key", id: "q1", payload: { ...bundle, signature: b64(63) } },
     { type: "key", id: "q1", payload: { ...bundle, identity: "short" } },
     { type: "key", id: "q1", payload: { ...bundle, private: b64(32) } },
+    {
+      type: "key",
+      id: "q1",
+      payload: { identity, key: b64(32), signature: b64(64) },
+    },
+    { type: "key", id: "q1", payload: { ...bundle, sessions: null } },
+    {
+      type: "key",
+      id: "q1",
+      payload: { ...bundle, sessions: sessionBundle() },
+    },
+    { type: "key", id: "q1", payload: { ...bundle, sessions: [twin, twin] } },
+    {
+      type: "key",
+      id: "q1",
+      payload: {
+        ...bundle,
+        sessions: Array.from({ length: maxSessions + 1 }, () =>
+          sessionBundle(),
+        ),
+      },
+    },
+    ...[
+      { session: b64(15) },
+      { session: b64(16) + "=" },
+      { key: b64(31) },
+      { signature: "x" },
+      { private: b64(32) },
+      ...badEpochs.map((epoch) => ({ epoch })),
+    ].map((field) => ({
+      type: "key",
+      id: "q1",
+      payload: { ...bundle, sessions: [sessionBundle(field)] },
+    })),
     { type: "published", payload: {} },
-    { type: "published", id: "k1", payload: { key: b64(32) } },
+    { type: "established", id: "k1", payload: { epoch: 1 } },
     { type: "message", id: "m1", payload: delivery() },
     { type: "message", payload: delivery({ body: "plaintext" }) },
     {
       type: "message",
-      payload: { ...delivery(), ciphertext: undefined, body: "x" },
+      payload: delivery({ salt: b64(32), iv: b64(12), ciphertext: b64(40) }),
     },
     { type: "message", payload: delivery({ id: "bad id" }) },
     { type: "message", payload: delivery({ from: "short" }) },
     { type: "message", payload: delivery({ key: b64(33) }) },
     { type: "message", payload: delivery({ signature: "x" }) },
-    { type: "message", payload: delivery({ salt: b64(31) }) },
-    { type: "message", payload: delivery({ iv: b64(16) }) },
-    { type: "message", payload: delivery({ iv: b64(12) + "=" }) },
-    { type: "message", payload: delivery({ ciphertext: "" }) },
-    { type: "message", payload: delivery({ ciphertext: b64(16) }) },
+    { type: "message", payload: delivery({ sender: undefined }) },
+    { type: "message", payload: delivery({ envelope: undefined }) },
+    { type: "message", payload: delivery({ envelope: [envelope()] }) },
+    ...badEpochs.map((epoch) => ({
+      type: "message",
+      payload: delivery({}, { epoch }),
+    })),
+    ...badEpochs.map((epoch) => ({
+      type: "message",
+      payload: delivery({}, {}, { epoch }),
+    })),
+    { type: "message", payload: delivery({}, { session: b64(17) }) },
+    { type: "message", payload: delivery({}, { key: b64(31) }) },
+    { type: "message", payload: delivery({}, { extra: 1 }) },
+    { type: "message", payload: delivery({}, {}, { session: "" }) },
+    { type: "message", payload: delivery({}, {}, { salt: b64(31) }) },
+    { type: "message", payload: delivery({}, {}, { iv: b64(16) }) },
+    { type: "message", payload: delivery({}, {}, { iv: b64(12) + "=" }) },
+    { type: "message", payload: delivery({}, {}, { ciphertext: "" }) },
+    { type: "message", payload: delivery({}, {}, { ciphertext: b64(16) }) },
     {
       type: "message",
-      payload: delivery({ ciphertext: b64(maxBodySize + 17) }),
+      payload: delivery({}, {}, { ciphertext: b64(maxBodySize + 17) }),
     },
-    { type: "message", payload: delivery({ ciphertext: 7 }) },
+    { type: "message", payload: delivery({}, {}, { ciphertext: 7 }) },
+    { type: "message", payload: delivery({}, {}, { body: "plaintext" }) },
     { type: "message", payload: delivery(), extra: 1 },
   ]) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
   }
-  assert.ok(
-    parse(
-      JSON.stringify({
-        type: "message",
-        payload: delivery({ ciphertext: b64(17) }),
-      }),
-    ),
-  );
-  assert.ok(
-    parse(
-      JSON.stringify({
-        type: "message",
-        payload: delivery({ ciphertext: b64(maxBodySize + 16) }),
-      }),
-    ),
-  );
+  for (const ciphertext of [b64(17), b64(maxBodySize + 16)]) {
+    assert.ok(
+      parse(
+        JSON.stringify({
+          type: "message",
+          payload: delivery({}, {}, { ciphertext }),
+        }),
+      ),
+    );
+  }
 });
 
 test("validates message bodies like the server", () => {

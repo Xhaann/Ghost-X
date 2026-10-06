@@ -52,7 +52,7 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
         return;
       }
       const [history, trust] = await Promise.all([
-        History.open(store, vault.keys, vault.integrity),
+        History.open(store, vault.keys, vault.integrity, vault.storage),
         Trust.open(store, vault.integrity),
       ]);
       const session = {

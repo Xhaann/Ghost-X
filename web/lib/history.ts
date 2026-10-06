@@ -1,4 +1,8 @@
-import { decodeBase64Url, encodeBase64Url } from "./base64.ts";
+import {
+  decodeBase64Url,
+  decodeBase64UrlRange,
+  encodeBase64Url,
+} from "./base64.ts";
 import type {
   HistoryPort,
   Restored,
@@ -7,103 +11,168 @@ import type {
 import { maxConversations, maxMessages } from "./conversations.ts";
 import { type Parties, verifyBundle } from "./encryption.ts";
 import { isIdentity } from "./identity.ts";
-import type { SealedRecord } from "./messenger.ts";
 import {
   exchangeKeySize,
   isFixed,
+  isValidBody,
   isValidId,
   ivSize,
+  maxCiphertextSize,
+  minCiphertextSize,
   saltSize,
   signatureSize,
 } from "./protocol.ts";
 import type { KeyValueStore } from "./storage.ts";
 import type { Keys } from "./vault.ts";
 
-export const historyVersion = 1;
+export const historyVersion = 2;
+export const legacyVersion = 1;
 export const maxStoredMessages = 5000;
 export const maxRecordSize = 8192;
 
 const macSize = 32;
 const encoder = new TextEncoder();
-const context = encoder.encode("ghostx/history/v1\0");
+const decoder = new TextDecoder("utf-8", { fatal: true });
+const context = encoder.encode("ghostx/history/v2\0");
+const legacyContext = encoder.encode("ghostx/history/v1\0");
 const deliveries: readonly SettledDelivery[] = [
   "delivered",
   "unavailable",
   "failed",
 ];
-const sealedFields = ["key", "signature", "salt", "iv", "ciphertext"] as const;
 const sentFields = ["v", "id", "peer", "direction", "delivery", "sequence"];
 const receivedFields = ["v", "id", "peer", "direction", "read", "sequence"];
+const legacySealed = ["key", "signature", "salt", "iv", "ciphertext", "mac"];
 
-type Common = {
+type Metadata =
+  | {
+      id: string;
+      peer: string;
+      sequence: number;
+      direction: "sent";
+      delivery: SettledDelivery;
+    }
+  | {
+      id: string;
+      peer: string;
+      sequence: number;
+      direction: "received";
+      read: boolean;
+    };
+
+export type PersistedRecord = Metadata & {
   v: number;
-  id: string;
-  peer: string;
-  sequence: number;
+  iv: string;
+  ciphertext: string;
+};
+
+type LegacyRecord = Metadata & {
+  v: number;
   key: string;
   signature: string;
   salt: string;
   iv: string;
   ciphertext: string;
+  mac: string;
 };
-
-export type StoredRecord =
-  | (Common & { direction: "sent"; delivery: SettledDelivery })
-  | (Common & { direction: "received"; read: boolean });
-
-export type PersistedRecord = StoredRecord & { mac: string };
 
 function storageKey(peer: string, id: string): string {
   return `${peer}/${id}`;
 }
 
-function fieldsOf(direction: "sent" | "received"): string[] {
-  return [
-    ...(direction === "sent" ? sentFields : receivedFields),
-    ...sealedFields,
-  ];
-}
-
-function macInput(record: StoredRecord): Uint8Array<ArrayBuffer> {
-  const fields = fieldsOf(record.direction) as (keyof StoredRecord)[];
-  const values = encoder.encode(
-    JSON.stringify(fields.map((name) => record[name as keyof typeof record])),
-  );
-  const out = new Uint8Array(context.length + values.length);
-  out.set(context);
-  out.set(values, context.length);
+function concat(a: Uint8Array, b: Uint8Array): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
   return out;
 }
 
-export function parseRecord(
+function state(record: Metadata): SettledDelivery | boolean {
+  return record.direction === "sent" ? record.delivery : record.read;
+}
+
+function associatedData(v: number, record: Metadata): Uint8Array<ArrayBuffer> {
+  return concat(
+    context,
+    encoder.encode(
+      JSON.stringify([
+        v,
+        record.id,
+        record.peer,
+        record.direction,
+        state(record),
+        record.sequence,
+      ]),
+    ),
+  );
+}
+
+function shapeOf(
   key: string,
   value: unknown,
-): PersistedRecord | null {
+  version: number,
+  extra: readonly string[],
+): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
   }
   const record = value as Record<string, unknown>;
-  if (record.v !== historyVersion) {
+  if (record.v !== version) {
     return null;
   }
   if (record.direction !== "sent" && record.direction !== "received") {
     return null;
   }
-  const expected = [...fieldsOf(record.direction), "mac"];
+  const expected = [
+    ...(record.direction === "sent" ? sentFields : receivedFields),
+    ...extra,
+  ];
   const names = Object.keys(record);
   if (
     names.length !== expected.length ||
-    !expected.every((name) => names.includes(name))
-  ) {
-    return null;
-  }
-  if (
+    !expected.every((name) => names.includes(name)) ||
     !isValidId(record.id) ||
     !isIdentity(record.peer) ||
     key !== storageKey(record.peer, record.id) ||
     typeof record.sequence !== "number" ||
     !Number.isSafeInteger(record.sequence) ||
     record.sequence < 1 ||
+    (record.direction === "sent"
+      ? !deliveries.includes(record.delivery as SettledDelivery)
+      : typeof record.read !== "boolean") ||
+    JSON.stringify(record).length > maxRecordSize
+  ) {
+    return null;
+  }
+  return record;
+}
+
+export function parseRecord(
+  key: string,
+  value: unknown,
+): PersistedRecord | null {
+  const record = shapeOf(key, value, historyVersion, ["iv", "ciphertext"]);
+  if (
+    !record ||
+    !isFixed(record.iv, ivSize) ||
+    decodeBase64UrlRange(
+      record.ciphertext,
+      minCiphertextSize,
+      maxCiphertextSize,
+    ) === null
+  ) {
+    return null;
+  }
+  return record as PersistedRecord;
+}
+
+export function parseLegacyRecord(
+  key: string,
+  value: unknown,
+): LegacyRecord | null {
+  const record = shapeOf(key, value, legacyVersion, legacySealed);
+  if (
+    !record ||
     !isFixed(record.key, exchangeKeySize) ||
     !isFixed(record.signature, signatureSize) ||
     !isFixed(record.salt, saltSize) ||
@@ -113,17 +182,40 @@ export function parseRecord(
   ) {
     return null;
   }
-  if (
-    record.direction === "sent"
-      ? !deliveries.includes(record.delivery as SettledDelivery)
-      : typeof record.read !== "boolean"
-  ) {
-    return null;
-  }
-  if (JSON.stringify(record).length > maxRecordSize) {
-    return null;
-  }
-  return record as PersistedRecord;
+  return record as LegacyRecord;
+}
+
+function legacyMacInput(record: LegacyRecord): Uint8Array<ArrayBuffer> {
+  const fields = [
+    ...(record.direction === "sent" ? sentFields : receivedFields),
+    "key",
+    "signature",
+    "salt",
+    "iv",
+    "ciphertext",
+  ];
+  const values = fields.map(
+    (name) => (record as unknown as Record<string, unknown>)[name],
+  );
+  return concat(legacyContext, encoder.encode(JSON.stringify(values)));
+}
+
+function metadataOf(record: Metadata): Metadata {
+  return record.direction === "sent"
+    ? {
+        id: record.id,
+        peer: record.peer,
+        sequence: record.sequence,
+        direction: "sent",
+        delivery: record.delivery,
+      }
+    : {
+        id: record.id,
+        peer: record.peer,
+        sequence: record.sequence,
+        direction: "received",
+        read: record.read,
+      };
 }
 
 export type RestoreResult = { restored: Restored[]; rejected: number };
@@ -132,28 +224,41 @@ export class History implements HistoryPort {
   readonly #store: KeyValueStore;
   readonly #keys: Keys;
   readonly #integrity: CryptoKey;
+  readonly #storage: CryptoKey;
   readonly #records = new Map<string, PersistedRecord>();
   #rejected = 0;
+  #migrated = 0;
   #queue: Promise<void> = Promise.resolve();
   #closed = false;
 
-  private constructor(store: KeyValueStore, keys: Keys, integrity: CryptoKey) {
+  private constructor(
+    store: KeyValueStore,
+    keys: Keys,
+    integrity: CryptoKey,
+    storage: CryptoKey,
+  ) {
     this.#store = store;
     this.#keys = keys;
     this.#integrity = integrity;
+    this.#storage = storage;
   }
 
   static async open(
     store: KeyValueStore,
     keys: Keys,
     integrity: CryptoKey,
+    storage: CryptoKey,
   ): Promise<History> {
-    const history = new History(store, keys, integrity);
+    const history = new History(store, keys, integrity, storage);
     const entries = await store.getAll("messages");
     const checked = await Promise.all(
       entries.map(async ({ key, value }) => {
         const record = parseRecord(key, value);
-        return record && (await history.#authentic(record)) ? record : null;
+        if (record) {
+          return record;
+        }
+        const legacy = parseLegacyRecord(key, value);
+        return legacy ? history.#migrate(key, legacy) : null;
       }),
     );
     checked.forEach((record, i) => {
@@ -170,43 +275,24 @@ export class History implements HistoryPort {
     return this.#rejected;
   }
 
+  get migrated(): number {
+    return this.#migrated;
+  }
+
   async restore(): Promise<RestoreResult> {
     const self = this.#keys.identity.identity;
-    const own = this.#keys.exchange.publicRaw;
     const entries = [...this.#records.entries()];
     const opened = await Promise.all(
       entries.map(async ([, record]): Promise<Restored | null> => {
-        const peerKey = await verifyBundle({
-          identity: record.peer,
-          key: record.key,
-          signature: record.signature,
-        });
-        if (!peerKey) {
-          return null;
-        }
-        const sent = record.direction === "sent";
-        const parties: Parties = {
-          id: record.id,
-          from: sent ? self : record.peer,
-          to: sent ? record.peer : self,
-          fromKey: sent ? own : peerKey,
-          toKey: sent ? peerKey : own,
-        };
-        const sealed = {
-          salt: record.salt,
-          iv: record.iv,
-          ciphertext: record.ciphertext,
-        };
-        const body = sent
-          ? await this.#keys.exchange.openOwn(parties, sealed)
-          : await this.#keys.exchange.open(parties, sealed);
+        const body = await this.#decrypt(record);
         if (body === null) {
           return null;
         }
+        const sent = record.direction === "sent";
         const base = {
           id: record.id,
-          from: parties.from,
-          to: parties.to,
+          from: sent ? self : record.peer,
+          to: sent ? record.peer : self,
           sequence: record.sequence,
         };
         return record.direction === "sent"
@@ -232,17 +318,12 @@ export class History implements HistoryPort {
     peer: string;
     sequence: number;
     read: boolean;
-    record: SealedRecord;
+    body: string;
   }): void {
-    this.#write({
-      v: historyVersion,
-      id: entry.id,
-      peer: entry.peer,
-      direction: "received",
-      read: entry.read,
-      sequence: entry.sequence,
-      ...this.#sealedFields(entry.record),
-    });
+    const { body, ...metadata } = entry;
+    this.#enqueue(() =>
+      this.#persist({ ...metadata, direction: "received" }, body),
+    );
   }
 
   sent(entry: {
@@ -250,17 +331,12 @@ export class History implements HistoryPort {
     peer: string;
     sequence: number;
     delivery: SettledDelivery;
-    record: SealedRecord;
+    body: string;
   }): void {
-    this.#write({
-      v: historyVersion,
-      id: entry.id,
-      peer: entry.peer,
-      direction: "sent",
-      delivery: entry.delivery,
-      sequence: entry.sequence,
-      ...this.#sealedFields(entry.record),
-    });
+    const { body, ...metadata } = entry;
+    this.#enqueue(() =>
+      this.#persist({ ...metadata, direction: "sent" }, body),
+    );
   }
 
   read(identity: string): void {
@@ -271,8 +347,13 @@ export class History implements HistoryPort {
           record.direction === "received" &&
           !record.read
         ) {
-          const { mac: _, ...rest } = record;
-          await this.#persist({ ...rest, read: true });
+          const body = await this.#decrypt(record);
+          if (body !== null) {
+            await this.#persist(
+              { ...metadataOf(record), read: true } as Metadata,
+              body,
+            );
+          }
         }
       }
     });
@@ -287,35 +368,125 @@ export class History implements HistoryPort {
     return this.#queue;
   }
 
-  #sealedFields(record: SealedRecord) {
-    return {
-      key: record.peer.key,
-      signature: record.peer.signature,
-      salt: record.sealed.salt,
-      iv: record.sealed.iv,
-      ciphertext: record.sealed.ciphertext,
-    };
-  }
-
-  async #authentic(record: PersistedRecord): Promise<boolean> {
-    const mac = decodeBase64Url(record.mac, macSize);
-    if (!mac) {
-      return false;
-    }
+  async #migrate(
+    key: string,
+    legacy: LegacyRecord,
+  ): Promise<PersistedRecord | null> {
     try {
-      return await crypto.subtle.verify(
-        "HMAC",
-        this.#integrity,
-        mac,
-        macInput(record),
+      const mac = decodeBase64Url(legacy.mac, macSize);
+      const authentic =
+        mac &&
+        (await crypto.subtle.verify(
+          "HMAC",
+          this.#integrity,
+          mac,
+          legacyMacInput(legacy),
+        ));
+      const peerKey =
+        authentic &&
+        (await verifyBundle({
+          identity: legacy.peer,
+          key: legacy.key,
+          signature: legacy.signature,
+        }));
+      if (!peerKey) {
+        return null;
+      }
+      const self = this.#keys.identity.identity;
+      const own = this.#keys.exchange.publicRaw;
+      const sent = legacy.direction === "sent";
+      const parties: Parties = {
+        id: legacy.id,
+        from: sent ? self : legacy.peer,
+        to: sent ? legacy.peer : self,
+        fromKey: sent ? own : peerKey,
+        toKey: sent ? peerKey : own,
+      };
+      const body = await this.#keys.exchange.openLegacy(parties, {
+        salt: legacy.salt,
+        iv: legacy.iv,
+        ciphertext: legacy.ciphertext,
+      });
+      if (body === null || !isValidBody(body)) {
+        return null;
+      }
+      const record = await this.#seal(metadataOf(legacy), body);
+      if (!record) {
+        return null;
+      }
+      const replaced = await this.#store.swap(
+        "messages",
+        key,
+        (current) =>
+          typeof current === "object" &&
+          current !== null &&
+          (current as { mac?: unknown }).mac === legacy.mac,
+        record,
       );
+      if (!replaced) {
+        const current = parseRecord(
+          key,
+          await this.#store.get("messages", key),
+        );
+        return current && (await this.#decrypt(current)) !== null
+          ? current
+          : null;
+      }
+      this.#migrated += 1;
+      return record;
     } catch {
-      return false;
+      return null;
     }
   }
 
-  #write(record: StoredRecord): void {
-    this.#enqueue(() => this.#persist(record));
+  async #seal(
+    metadata: Metadata,
+    body: string,
+  ): Promise<PersistedRecord | null> {
+    const iv = crypto.getRandomValues(new Uint8Array(ivSize));
+    const ciphertext = await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv,
+        additionalData: associatedData(historyVersion, metadata),
+      },
+      this.#storage,
+      encoder.encode(body),
+    );
+    const record = {
+      v: historyVersion,
+      ...metadata,
+      iv: encodeBase64Url(iv),
+      ciphertext: encodeBase64Url(new Uint8Array(ciphertext)),
+    };
+    return parseRecord(storageKey(metadata.peer, metadata.id), record);
+  }
+
+  async #decrypt(record: PersistedRecord): Promise<string | null> {
+    try {
+      const iv = decodeBase64Url(record.iv, ivSize);
+      const ciphertext = decodeBase64UrlRange(
+        record.ciphertext,
+        minCiphertextSize,
+        maxCiphertextSize,
+      );
+      if (!iv || !ciphertext) {
+        return null;
+      }
+      const plaintext = await crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv,
+          additionalData: associatedData(record.v, metadataOf(record)),
+        },
+        this.#storage,
+        ciphertext,
+      );
+      const body = decoder.decode(plaintext);
+      return isValidBody(body) ? body : null;
+    } catch {
+      return null;
+    }
   }
 
   #enqueue(task: () => Promise<void>): void {
@@ -325,22 +496,17 @@ export class History implements HistoryPort {
     this.#queue = this.#queue.then(task).catch(() => {});
   }
 
-  async #persist(record: StoredRecord): Promise<void> {
-    const key = storageKey(record.peer, record.id);
-    const mac = await crypto.subtle.sign(
-      "HMAC",
-      this.#integrity,
-      macInput(record),
-    );
-    const sealed: PersistedRecord = {
-      ...record,
-      mac: encodeBase64Url(new Uint8Array(mac)),
-    };
-    if (parseRecord(key, sealed) === null) {
+  async #persist(metadata: Metadata, body: string): Promise<void> {
+    if (!isValidBody(body)) {
       return;
     }
-    await this.#store.put("messages", key, sealed);
-    this.#records.set(key, sealed);
+    const record = await this.#seal(metadata, body);
+    if (!record) {
+      return;
+    }
+    const key = storageKey(record.peer, record.id);
+    await this.#store.put("messages", key, record);
+    this.#records.set(key, record);
     const expired = this.#expired(key);
     if (expired.length > 0) {
       await this.#store.delete("messages", expired);

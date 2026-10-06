@@ -197,43 +197,14 @@ export class ExchangeKey {
       : null;
   }
 
-  async seal(parties: Parties, body: string): Promise<Sealed | null> {
-    if (!same(parties.fromKey, this.#publicRaw)) {
-      return null;
+  async openLegacy(parties: Parties, sealed: Sealed): Promise<string | null> {
+    if (same(parties.toKey, this.#publicRaw)) {
+      return this.#decrypt(parties, parties.fromKey, sealed);
     }
-    try {
-      const salt = crypto.getRandomValues(new Uint8Array(saltSize));
-      const iv = crypto.getRandomValues(new Uint8Array(ivSize));
-      const key = await this.#messageKey(
-        parties,
-        parties.toKey,
-        salt,
-        "encrypt",
-      );
-      const additionalData = associatedData(parties);
-      if (!key || !additionalData) {
-        return null;
-      }
-      const ciphertext = await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv, additionalData },
-        key,
-        encoder.encode(body),
-      );
-      return {
-        salt: encodeBase64Url(salt),
-        iv: encodeBase64Url(iv),
-        ciphertext: encodeBase64Url(new Uint8Array(ciphertext)),
-      };
-    } catch {
-      return null;
+    if (same(parties.fromKey, this.#publicRaw)) {
+      return this.#decrypt(parties, parties.toKey, sealed);
     }
-  }
-
-  async open(parties: Parties, sealed: Sealed): Promise<string | null> {
-    if (!same(parties.toKey, this.#publicRaw)) {
-      return null;
-    }
-    return this.#decrypt(parties, parties.fromKey, sealed);
+    return null;
   }
 
   async #decrypt(
@@ -266,13 +237,6 @@ export class ExchangeKey {
     } catch {
       return null;
     }
-  }
-
-  async openOwn(parties: Parties, sealed: Sealed): Promise<string | null> {
-    if (!same(parties.fromKey, this.#publicRaw)) {
-      return null;
-    }
-    return this.#decrypt(parties, parties.toKey, sealed);
   }
 
   async #messageKey(

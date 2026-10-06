@@ -16,6 +16,8 @@ const (
 	CodeTooLarge        Code = "message_too_large"
 	CodeKeyRequired     Code = "key_required"
 	CodeDuplicate       Code = "duplicate_message"
+	CodeStaleSession    Code = "stale_session"
+	CodeSessionLimit    Code = "session_limit"
 	CodeInternalError   Code = "internal_error"
 )
 

@@ -1,11 +1,6 @@
 import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
-import type {
-  Incoming,
-  MessengerState,
-  SealedRecord,
-  SendResult,
-} from "./messenger.ts";
+import type { Incoming, MessengerState, SendResult } from "./messenger.ts";
 import { bodySize, createId, isValidBody, maxBodySize } from "./protocol.ts";
 
 export type DeliveryState = "sending" | "delivered" | "unavailable" | "failed";
@@ -66,14 +61,14 @@ export interface HistoryPort {
     peer: string;
     sequence: number;
     read: boolean;
-    record: SealedRecord;
+    body: string;
   }): void;
   sent(entry: {
     id: string;
     peer: string;
     sequence: number;
     delivery: SettledDelivery;
-    record: SealedRecord;
+    body: string;
   }): void;
   read(identity: string): void;
 }
@@ -207,13 +202,13 @@ export class Conversations {
     const delivery = this.#source.send(to, body, id).then(
       (result) => {
         const settled = deliveryOf(result);
-        if (result.record && generation === this.#generation) {
+        if (generation === this.#generation) {
           this.#history?.sent({
             id,
             peer: to,
             sequence,
             delivery: settled,
-            record: result.record,
+            body,
           });
         }
         return this.#settle(generation, to, id, settled);
@@ -261,13 +256,13 @@ export class Conversations {
       sequence,
       direction: "received",
     });
-    if (message.record) {
+    if (message.body !== null) {
       this.#history?.received({
         id: message.id,
         peer: message.from,
         sequence,
         read: this.#active === message.from,
-        record: message.record,
+        body: message.body,
       });
     }
     if (this.#active !== message.from) {
