@@ -10,7 +10,12 @@ import {
 } from "./conversations.ts";
 import { IdentityKey } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
-import type { Incoming, MessengerState, SendResult } from "./messenger.ts";
+import type {
+  MessengerState,
+  Receipt,
+  Receiver,
+  SendResult,
+} from "./messenger.ts";
 import type { Messenger } from "./messenger.ts";
 import { maxBodySize } from "./protocol.ts";
 import {
@@ -25,10 +30,12 @@ import {
 
 useServer();
 
+type Incoming = { id: string; from: string; body: string | null };
+
 class Source implements MessageSource {
   state: MessengerState = { active: true };
   readonly states = new Listeners<MessengerState>();
-  readonly messages = new Listeners<Incoming>();
+  receiver: Receiver | null = null;
   readonly sent: {
     to: string;
     body: string;
@@ -40,16 +47,33 @@ class Source implements MessageSource {
     return this.states.add(listener);
   }
 
-  onMessage(listener: (message: Incoming) => void) {
-    return this.messages.add(listener);
+  receive(receiver: Receiver) {
+    this.receiver = receiver;
+    return () => {
+      this.receiver = null;
+    };
   }
 
   send(to: string, body: string, id: string): Promise<SendResult> {
     return new Promise((resolve) => this.sent.push({ to, body, id, resolve }));
   }
 
-  deliver(message: Incoming) {
-    this.messages.emit(message);
+  async deliver(message: Incoming): Promise<boolean> {
+    if (!this.receiver) {
+      return false;
+    }
+    if (message.body === null) {
+      this.receiver.reject(message);
+      return true;
+    }
+    if (this.receiver.has(message.from, message.id)) {
+      return true;
+    }
+    return this.receiver.accept({ ...message, body: message.body });
+  }
+
+  async receipt(receipt: Receipt): Promise<boolean> {
+    return this.receiver ? this.receiver.settle(receipt) : false;
   }
 
   setActive(active: boolean) {
@@ -117,7 +141,7 @@ test("opens a conversation only for a real identity", async () => {
 test("a received message creates the sender's conversation", async () => {
   const { store, source, self, b } = await setup();
 
-  source.deliver({ id: "r1", from: b, body: "hi" });
+  await source.deliver({ id: "r1", from: b, body: "hi" });
 
   const conv = conversation(store, b);
   assert.equal(store.state.conversations.length, 1);
@@ -127,7 +151,7 @@ test("a received message creates the sender's conversation", async () => {
       from: b,
       to: self,
       body: "hi",
-      sequence: 2,
+      sequence: 1,
       direction: "received",
     },
   ]);
@@ -159,7 +183,7 @@ test("classifies direction from the local identity", async () => {
   const { store, source, self, b } = await setup();
   store.open(b);
   accepted(store, "out");
-  source.deliver({ id: "r1", from: b, body: "in" });
+  await source.deliver({ id: "r1", from: b, body: "in" });
 
   const messages = conversation(store, b)?.messages ?? [];
   assert.deepEqual(
@@ -178,8 +202,8 @@ test("keeps conversations isolated and preserves them across switches", async ()
   accepted(store, "to b");
   store.open(c);
   accepted(store, "to c");
-  source.deliver({ id: "rb", from: b, body: "from b" });
-  source.deliver({ id: "rc", from: c, body: "from c" });
+  await source.deliver({ id: "rb", from: b, body: "from b" });
+  await source.deliver({ id: "rc", from: c, body: "from c" });
   store.open(b);
 
   assert.deepEqual(bodies(store, b), ["to b", "from b"]);
@@ -208,18 +232,18 @@ test("tracks unread for inactive conversations only", async () => {
   const { store, source, b, c } = await setup();
   store.open(c);
 
-  source.deliver({ id: "1", from: b, body: "a" });
-  source.deliver({ id: "2", from: b, body: "b" });
-  source.deliver({ id: "3", from: c, body: "c" });
+  await source.deliver({ id: "1", from: b, body: "a" });
+  await source.deliver({ id: "2", from: b, body: "b" });
+  await source.deliver({ id: "3", from: c, body: "c" });
 
   assert.equal(conversation(store, b)?.unread, 2);
   assert.equal(conversation(store, c)?.unread, 0);
 
   store.open(b);
   assert.equal(conversation(store, b)?.unread, 0);
-  source.deliver({ id: "4", from: b, body: "d" });
+  await source.deliver({ id: "4", from: b, body: "d" });
   assert.equal(conversation(store, b)?.unread, 0);
-  source.deliver({ id: "5", from: c, body: "e" });
+  await source.deliver({ id: "5", from: c, body: "e" });
   assert.equal(conversation(store, c)?.unread, 1);
 });
 
@@ -227,10 +251,10 @@ test("ignores duplicate message ids", async () => {
   const { store, source, b, log } = await setup();
 
   for (let i = 0; i < 5; i++) {
-    source.deliver({ id: "dup", from: b, body: "same" });
+    await source.deliver({ id: "dup", from: b, body: "same" });
   }
   const emissions = log.length;
-  source.deliver({ id: "dup", from: b, body: "different body" });
+  await source.deliver({ id: "dup", from: b, body: "different body" });
 
   assert.deepEqual(bodies(store, b), ["same"]);
   assert.equal(conversation(store, b)?.unread, 1);
@@ -240,9 +264,9 @@ test("ignores duplicate message ids", async () => {
 test("records undecryptable messages without fabricated text", async () => {
   const { store, source, b } = await setup();
 
-  source.deliver({ id: "bad", from: b, body: null });
-  source.deliver({ id: "bad", from: b, body: null });
-  source.deliver({ id: "good", from: b, body: "readable" });
+  await source.deliver({ id: "bad", from: b, body: null });
+  await source.deliver({ id: "bad", from: b, body: null });
+  await source.deliver({ id: "good", from: b, body: "readable" });
 
   const messages = conversation(store, b)?.messages ?? [];
   assert.deepEqual(
@@ -260,7 +284,7 @@ test("does not duplicate a self-addressed message", async () => {
   store.open(self);
   const attempt = accepted(store, "note");
 
-  source.deliver({ id: attempt.id, from: self, body: "note" });
+  await source.deliver({ id: attempt.id, from: self, body: "note" });
 
   assert.deepEqual(bodies(store, self), ["note"]);
 });
@@ -270,7 +294,7 @@ test("orders messages deterministically by arrival", async () => {
   store.open(b);
 
   const first = accepted(store, "1");
-  source.deliver({ id: "r", from: b, body: "2" });
+  await source.deliver({ id: "r", from: b, body: "2" });
   const third = accepted(store, "3");
   source.sent[1].resolve({ ok: true });
   source.sent[0].resolve({ ok: true });
@@ -289,24 +313,52 @@ test("orders messages deterministically by arrival", async () => {
   assert.equal(new Set(sequences).size, sequences.length);
 });
 
-test("marks only the acknowledged message delivered", async () => {
-  const { store, source, b } = await setup();
+test("server acceptance is queued and only a receipt marks a message delivered", async () => {
+  const { store, source, b, c } = await setup();
   store.open(b);
   const first = accepted(store, "first");
   const second = accepted(store, "second");
+  const third = accepted(store, "third");
 
   source.sent[1].resolve({ ok: true });
-  assert.equal(await second.delivery, "delivered");
+  assert.equal(await second.delivery, "queued");
 
   const delivery = () =>
     (conversation(store, b)?.messages ?? []).map((m) =>
       m.direction === "sent" ? m.delivery : m.direction,
     );
-  assert.deepEqual(delivery(), ["sending", "delivered"]);
+  assert.deepEqual(delivery(), ["sending", "queued", "sending"]);
+
+  assert.equal(
+    await source.receipt({ to: b, id: second.id, status: "delivered" }),
+    true,
+  );
+  assert.deepEqual(delivery(), ["sending", "delivered", "sending"]);
+  await source.receipt({ to: c, id: second.id, status: "expired" });
+  await source.receipt({ to: b, id: second.id, status: "expired" });
+  assert.deepEqual(delivery(), ["sending", "delivered", "sending"]);
+
+  await source.receipt({ to: b, id: third.id, status: "delivered" });
+  source.sent[2].resolve({ ok: true });
+  assert.equal(await third.delivery, "delivered");
 
   source.sent[0].resolve({ ok: false, reason: "recipient_unavailable" });
   assert.equal(await first.delivery, "unavailable");
-  assert.deepEqual(delivery(), ["unavailable", "delivered"]);
+  assert.deepEqual(delivery(), ["unavailable", "delivered", "delivered"]);
+  await source.receipt({ to: b, id: first.id, status: "delivered" });
+  assert.deepEqual(delivery(), ["delivered", "delivered", "delivered"]);
+});
+
+test("an expiry receipt marks a queued message not delivered", async () => {
+  const { store, source, b } = await setup();
+  store.open(b);
+  const attempt = accepted(store, "late");
+  source.sent[0].resolve({ ok: true });
+  assert.equal(await attempt.delivery, "queued");
+  await source.receipt({ to: b, id: attempt.id, status: "expired" });
+  const [message] = conversation(store, b)?.messages ?? [];
+  assert.ok(message.direction === "sent");
+  assert.equal(message.delivery, "expired");
 });
 
 test("maps other failures to failed without touching other messages", async () => {
@@ -331,7 +383,7 @@ test("maps other failures to failed without touching other messages", async () =
       m.direction === "sent" ? m.delivery : "received",
     );
   assert.deepEqual(states(b), ["failed", "failed", "failed", "failed"]);
-  assert.deepEqual(states(c), ["delivered"]);
+  assert.deepEqual(states(c), ["queued"]);
 });
 
 test("rejects empty, invalid, and oversized messages without adding them", async () => {
@@ -387,13 +439,13 @@ test("starts once and stops cleanly like a StrictMode remount", async () => {
   second.start();
   second.start();
 
-  source.deliver({ id: "r1", from: b, body: "once" });
+  await source.deliver({ id: "r1", from: b, body: "once" });
 
   assert.deepEqual(bodies(second, b), ["once"]);
   assert.deepEqual(first.state.conversations, []);
   assert.equal(firstLog.at(-1)?.conversations.length, 0);
   const emitted = firstLog.length;
-  source.deliver({ id: "r2", from: b, body: "later" });
+  await source.deliver({ id: "r2", from: b, body: "later" });
   source.setActive(false);
   assert.equal(firstLog.length, emitted);
   assert.equal(first.open(b), false);
@@ -407,7 +459,7 @@ test("ignores results that settle after stop", async () => {
   store.stop();
   const emitted = log.length;
   source.sent[0].resolve({ ok: true });
-  assert.equal(await attempt.delivery, "delivered");
+  assert.equal(await attempt.delivery, "queued");
 
   assert.equal(log.length, emitted);
   assert.deepEqual(store.state, {
@@ -437,7 +489,7 @@ test("ignores results from before a restart of the same store", async () => {
 
 test("returns a stable state object between changes", async () => {
   const { store, source, b } = await setup();
-  source.deliver({ id: "r1", from: b, body: "x" });
+  await source.deliver({ id: "r1", from: b, body: "x" });
   const snapshot = store.state;
 
   assert.equal(store.state, snapshot);
@@ -449,7 +501,7 @@ test("returns a stable state object between changes", async () => {
 test("bounds messages per conversation", async () => {
   const { store, source, b } = await setup();
   for (let i = 0; i < maxMessages + 10; i++) {
-    source.deliver({ id: `m${i}`, from: b, body: `${i}` });
+    await source.deliver({ id: `m${i}`, from: b, body: `${i}` });
   }
 
   const messages = conversation(store, b)?.messages ?? [];
@@ -465,7 +517,7 @@ test("bounds conversations and never evicts the active one", async () => {
   store.open(others[0]);
 
   for (const identity of others.slice(1)) {
-    source.deliver({ id: "x", from: identity, body: "hi" });
+    await source.deliver({ id: "x", from: identity, body: "hi" });
   }
 
   assert.equal(store.state.conversations.length, maxConversations);
@@ -476,13 +528,13 @@ test("bounds conversations and never evicts the active one", async () => {
 
 test("lists conversations by most recent activity", async () => {
   const { store, source, b, c } = await setup();
-  source.deliver({ id: "1", from: b, body: "x" });
-  source.deliver({ id: "2", from: c, body: "y" });
+  await source.deliver({ id: "1", from: b, body: "x" });
+  await source.deliver({ id: "2", from: c, body: "y" });
   assert.deepEqual(
     store.state.conversations.map((conv) => conv.identity),
     [c, b],
   );
-  source.deliver({ id: "3", from: b, body: "z" });
+  await source.deliver({ id: "3", from: b, body: "z" });
   assert.deepEqual(
     store.state.conversations.map((conv) => conv.identity),
     [b, c],
@@ -522,6 +574,24 @@ async function peer(port: number): Promise<Peer> {
   };
 }
 
+async function delivered(
+  store: Conversations,
+  peer: string,
+  attempt: { id: string; delivery: Promise<unknown> },
+): Promise<void> {
+  assert.equal(await attempt.delivery, "queued");
+  await until(
+    () =>
+      conversation(store, peer)?.messages.some(
+        (m) =>
+          m.id === attempt.id &&
+          m.direction === "sent" &&
+          m.delivery === "delivered",
+      ) === true,
+    "delivery receipt",
+  );
+}
+
 async function barrier(p: Peer): Promise<void> {
   const reply = await p.client.request({
     type: "ping",
@@ -539,7 +609,7 @@ test("real conversation between identities with replies and isolation", async ()
 
   a.store.open(b.key.identity);
   const first = accepted(a.store, "hello b");
-  assert.equal(await first.delivery, "delivered");
+  await delivered(a.store, b.key.identity, first);
   await until(
     () => conversation(b.store, a.key.identity)?.messages.length === 1,
     "b receives",
@@ -548,7 +618,7 @@ test("real conversation between identities with replies and isolation", async ()
 
   b.store.open(a.key.identity);
   assert.equal(conversation(b.store, a.key.identity)?.unread, 0);
-  assert.equal(await accepted(b.store, "hello a").delivery, "delivered");
+  await delivered(b.store, a.key.identity, accepted(b.store, "hello a"));
   await until(
     () => bodies(a.store, b.key.identity).length === 2,
     "a receives reply",
@@ -557,9 +627,10 @@ test("real conversation between identities with replies and isolation", async ()
   assert.equal(conversation(a.store, b.key.identity)?.unread, 0);
 
   a.store.open(c.key.identity);
-  assert.equal(
-    await accepted(b.store, "while a views c").delivery,
-    "delivered",
+  await delivered(
+    b.store,
+    a.key.identity,
+    accepted(b.store, "while a views c"),
   );
   await until(() => bodies(a.store, b.key.identity).length === 3, "a receives");
   assert.deepEqual(bodies(a.store, c.key.identity), []);
@@ -604,7 +675,7 @@ test("real duplicate frames and reconnects do not duplicate messages", async () 
 
   assert.deepEqual(bodies(b.store, a.key.identity), ["once"]);
   assert.deepEqual(bodies(a.store, b.key.identity), ["once"]);
-  assert.equal(await accepted(a.store, "after").delivery, "delivered");
+  await delivered(a.store, b.key.identity, accepted(a.store, "after"));
   await until(
     () => bodies(b.store, a.key.identity).length === 2,
     "post-reconnect delivery",
@@ -612,24 +683,15 @@ test("real duplicate frames and reconnects do not duplicate messages", async () 
   assert.deepEqual(bodies(b.store, a.key.identity), ["once", "after"]);
 });
 
-test("real unavailable recipient is shown as not delivered", async () => {
+test("real recipient that never published is shown as unavailable", async () => {
   const port = await freePort();
   await startServer(port);
   const a = await peer(port);
-  const b = await peer(port);
-  const bIdentity = b.key.identity;
-  b.store.stop();
-  b.messenger.stop();
-  b.client.close();
-  const deadline = Date.now() + 5000;
-  while ((await a.messenger.send(bIdentity, "probe")).ok) {
-    assert.ok(Date.now() < deadline, "recipient never became unavailable");
-  }
-
-  a.store.open(bIdentity);
+  const stranger = (await IdentityKey.generate()).identity;
+  a.store.open(stranger);
   const attempt = accepted(a.store, "anyone there");
   assert.equal(await attempt.delivery, "unavailable");
-  const [message] = conversation(a.store, bIdentity)?.messages ?? [];
+  const [message] = conversation(a.store, stranger)?.messages ?? [];
   assert.ok(message.direction === "sent");
   assert.equal(message.delivery, "unavailable");
 });

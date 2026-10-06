@@ -311,6 +311,12 @@ func (r *Registry) Fetch(id identity.Identity) (Static, []Bundle, bool) {
 	return static, bundles, true
 }
 
+func (r *Registry) Known(id identity.Identity) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.owners[id.String()]) > 0
+}
+
 func (r *Registry) Device(to identity.Identity, deviceID string) (Static, Prekey, *Prekey, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

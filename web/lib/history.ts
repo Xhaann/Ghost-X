@@ -8,7 +8,7 @@ import type {
   Restored,
   SettledDelivery,
 } from "./conversations.ts";
-import { maxConversations, maxMessages } from "./conversations.ts";
+import { advances, maxConversations, maxMessages } from "./conversations.ts";
 import { type Parties, verifyBundle } from "./encryption.ts";
 import { isIdentity } from "./identity.ts";
 import {
@@ -17,8 +17,8 @@ import {
   isValidBody,
   isValidId,
   ivSize,
-  maxCiphertextSize,
-  minCiphertextSize,
+  maxSealedSize,
+  minSealedSize,
   saltSize,
   signatureSize,
 } from "./protocol.ts";
@@ -36,7 +36,9 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 const context = encoder.encode("ghostx/history/v2\0");
 const legacyContext = encoder.encode("ghostx/history/v1\0");
 const deliveries: readonly SettledDelivery[] = [
+  "queued",
   "delivered",
+  "expired",
   "unavailable",
   "failed",
 ];
@@ -155,11 +157,8 @@ export function parseRecord(
   if (
     !record ||
     !isFixed(record.iv, ivSize) ||
-    decodeBase64UrlRange(
-      record.ciphertext,
-      minCiphertextSize,
-      maxCiphertextSize,
-    ) === null
+    decodeBase64UrlRange(record.ciphertext, minSealedSize, maxSealedSize) ===
+      null
   ) {
     return null;
   }
@@ -313,16 +312,21 @@ export class History implements HistoryPort {
     return { restored, rejected: this.#rejected };
   }
 
+  has(peer: string, id: string): boolean {
+    return this.#records.get(storageKey(peer, id))?.direction === "received";
+  }
+
   received(entry: {
     id: string;
     peer: string;
     sequence: number;
     read: boolean;
     body: string;
-  }): void {
+  }): Promise<boolean> {
     const { body, ...metadata } = entry;
-    this.#enqueue(() =>
-      this.#persist({ ...metadata, direction: "received" }, body),
+    return this.#enqueue(
+      () => this.#persist({ ...metadata, direction: "received" }, body),
+      false,
     );
   }
 
@@ -332,15 +336,46 @@ export class History implements HistoryPort {
     sequence: number;
     delivery: SettledDelivery;
     body: string;
-  }): void {
+  }): Promise<boolean> {
     const { body, ...metadata } = entry;
-    this.#enqueue(() =>
-      this.#persist({ ...metadata, direction: "sent" }, body),
-    );
+    return this.#enqueue(async () => {
+      const current = this.#records.get(storageKey(metadata.peer, metadata.id));
+      if (
+        current?.direction === "sent" &&
+        !advances(current.delivery, metadata.delivery)
+      ) {
+        return true;
+      }
+      return this.#persist({ ...metadata, direction: "sent" }, body);
+    }, false);
+  }
+
+  settle(
+    peer: string,
+    id: string,
+    delivery: SettledDelivery,
+  ): Promise<boolean> {
+    return this.#enqueue(async () => {
+      const record = this.#records.get(storageKey(peer, id));
+      if (
+        record?.direction !== "sent" ||
+        !advances(record.delivery, delivery)
+      ) {
+        return true;
+      }
+      const body = await this.#decrypt(record);
+      if (body === null) {
+        return true;
+      }
+      return this.#persist(
+        { ...metadataOf(record), delivery } as Metadata,
+        body,
+      );
+    }, false);
   }
 
   read(identity: string): void {
-    this.#enqueue(async () => {
+    void this.#enqueue(async () => {
       for (const record of [...this.#records.values()]) {
         if (
           record.peer === identity &&
@@ -356,7 +391,8 @@ export class History implements HistoryPort {
           }
         }
       }
-    });
+      return true;
+    }, false);
   }
 
   flush(): Promise<void> {
@@ -467,8 +503,8 @@ export class History implements HistoryPort {
       const iv = decodeBase64Url(record.iv, ivSize);
       const ciphertext = decodeBase64UrlRange(
         record.ciphertext,
-        minCiphertextSize,
-        maxCiphertextSize,
+        minSealedSize,
+        maxSealedSize,
       );
       if (!iv || !ciphertext) {
         return null;
@@ -489,20 +525,25 @@ export class History implements HistoryPort {
     }
   }
 
-  #enqueue(task: () => Promise<void>): void {
+  #enqueue<T>(task: () => Promise<T>, fallback: T): Promise<T> {
     if (this.#closed) {
-      return;
+      return Promise.resolve(fallback);
     }
-    this.#queue = this.#queue.then(task).catch(() => {});
+    const run = this.#queue.then(task);
+    this.#queue = run.then(
+      () => {},
+      () => {},
+    );
+    return run.catch(() => fallback);
   }
 
-  async #persist(metadata: Metadata, body: string): Promise<void> {
+  async #persist(metadata: Metadata, body: string): Promise<boolean> {
     if (!isValidBody(body)) {
-      return;
+      return false;
     }
     const record = await this.#seal(metadata, body);
     if (!record) {
-      return;
+      return false;
     }
     const key = storageKey(record.peer, record.id);
     await this.#store.put("messages", key, record);
@@ -512,6 +553,7 @@ export class History implements HistoryPort {
       await this.#store.delete("messages", expired);
       expired.forEach((name) => this.#records.delete(name));
     }
+    return true;
   }
 
   #expired(written: string): string[] {

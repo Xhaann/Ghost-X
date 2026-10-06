@@ -1,9 +1,20 @@
 import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
-import type { Incoming, MessengerState, SendResult } from "./messenger.ts";
-import { bodySize, createId, isValidBody, maxBodySize } from "./protocol.ts";
+import type {
+  MessengerState,
+  Receipt,
+  Receiver,
+  SendResult,
+} from "./messenger.ts";
+import {
+  bodySize,
+  createMessageId,
+  isValidBody,
+  maxBodySize,
+} from "./protocol.ts";
 
-export type DeliveryState = "sending" | "delivered" | "unavailable" | "failed";
+export type DeliveryState =
+  "sending" | "queued" | "delivered" | "expired" | "unavailable" | "failed";
 
 type MessageBase = {
   id: string;
@@ -47,29 +58,44 @@ export type SendAttempt =
 export interface MessageSource {
   readonly state: MessengerState;
   onState(listener: (state: MessengerState) => void): () => void;
-  onMessage(listener: (message: Incoming) => void): () => void;
+  receive(receiver: Receiver): () => void;
   send(to: string, body: string, id: string): Promise<SendResult>;
 }
 
 export type SettledDelivery = Exclude<DeliveryState, "sending">;
 
+const ranks: Record<DeliveryState, number> = {
+  sending: 0,
+  failed: 1,
+  unavailable: 1,
+  queued: 2,
+  delivered: 3,
+  expired: 3,
+};
+
+export function advances(from: DeliveryState, to: DeliveryState): boolean {
+  return ranks[to] > ranks[from];
+}
+
 export type Restored = ConversationMessage & { read?: boolean };
 
 export interface HistoryPort {
+  has(peer: string, id: string): boolean;
   received(entry: {
     id: string;
     peer: string;
     sequence: number;
     read: boolean;
     body: string;
-  }): void;
+  }): Promise<boolean>;
   sent(entry: {
     id: string;
     peer: string;
     sequence: number;
     delivery: SettledDelivery;
     body: string;
-  }): void;
+  }): Promise<boolean>;
+  settle(peer: string, id: string, delivery: SettledDelivery): Promise<boolean>;
   read(identity: string): void;
 }
 
@@ -89,12 +115,12 @@ const empty: ConversationsState = {
 
 function deliveryOf(result: SendResult): SettledDelivery {
   if (result.ok) {
-    return "delivered";
+    return "queued";
   }
   return result.reason === "recipient_unavailable" ? "unavailable" : "failed";
 }
 
-export class Conversations {
+export class Conversations implements Receiver {
   readonly #source: MessageSource;
   readonly #self: string;
   readonly #history: HistoryPort | null;
@@ -130,7 +156,7 @@ export class Conversations {
       return;
     }
     const detach = [
-      this.#source.onMessage((message) => this.#receive(message)),
+      this.#source.receive(this),
       this.#source.onState(() => this.#publish()),
     ];
     this.#detach = () => detach.forEach((release) => release());
@@ -184,7 +210,7 @@ export class Conversations {
       return { accepted: false, reason: "invalid_payload" };
     }
 
-    const id = createId();
+    const id = createMessageId();
     const generation = this.#generation;
     const target = this.#ensure(to);
     const sequence = ++this.#sequence;
@@ -200,22 +226,84 @@ export class Conversations {
     this.#publish();
 
     const delivery = this.#source.send(to, body, id).then(
-      (result) => {
-        const settled = deliveryOf(result);
-        if (generation === this.#generation) {
-          this.#history?.sent({
-            id,
-            peer: to,
-            sequence,
-            delivery: settled,
-            body,
-          });
-        }
-        return this.#settle(generation, to, id, settled);
-      },
+      (result) => this.#record(generation, to, id, sequence, body, result),
       () => this.#settle(generation, to, id, "failed"),
     );
     return { accepted: true, id, delivery };
+  }
+
+  has(from: string, id: string): boolean {
+    return (
+      this.#conversations
+        .get(from)
+        ?.messages.some(
+          (m) => m.id === id && m.direction === "received" && m.body !== null,
+        ) === true || this.#history?.has(from, id) === true
+    );
+  }
+
+  async accept(message: {
+    from: string;
+    id: string;
+    body: string;
+  }): Promise<boolean> {
+    if (!this.#detach || !isValidBody(message.body)) {
+      return false;
+    }
+    const generation = this.#generation;
+    const sequence = ++this.#sequence;
+    const read = this.#active === message.from;
+    if (this.#history) {
+      const stored = await this.#history.received({
+        id: message.id,
+        peer: message.from,
+        sequence,
+        read,
+        body: message.body,
+      });
+      if (!stored) {
+        return false;
+      }
+    }
+    if (generation === this.#generation) {
+      this.#receive({ ...message, sequence });
+    }
+    return true;
+  }
+
+  reject(message: { from: string; id: string }): void {
+    if (this.#detach) {
+      this.#receive({ ...message, body: null, sequence: ++this.#sequence });
+    }
+  }
+
+  async settle(receipt: Receipt): Promise<boolean> {
+    const delivery: SettledDelivery = receipt.status;
+    this.#settle(this.#generation, receipt.to, receipt.id, delivery);
+    return this.#history
+      ? this.#history.settle(receipt.to, receipt.id, delivery)
+      : true;
+  }
+
+  async #record(
+    generation: number,
+    to: string,
+    id: string,
+    sequence: number,
+    body: string,
+    result: SendResult,
+  ): Promise<DeliveryState> {
+    const settled = this.#settle(generation, to, id, deliveryOf(result));
+    if (generation === this.#generation && settled !== "sending") {
+      await this.#history?.sent({
+        id,
+        peer: to,
+        sequence,
+        delivery: settled,
+        body,
+      });
+    }
+    return settled;
   }
 
   #settle(
@@ -225,46 +313,52 @@ export class Conversations {
     delivery: DeliveryState,
   ): DeliveryState {
     const conversation = this.#conversations.get(identity);
-    if (generation !== this.#generation || !conversation) {
+    const current = conversation?.messages.find(
+      (message) => message.id === id && message.direction === "sent",
+    );
+    if (
+      generation !== this.#generation ||
+      !conversation ||
+      current?.direction !== "sent"
+    ) {
       return delivery;
     }
+    if (!advances(current.delivery, delivery)) {
+      return current.delivery;
+    }
     const messages = conversation.messages.map((message) =>
-      message.id === id && message.direction === "sent"
-        ? { ...message, delivery }
-        : message,
+      message === current ? { ...current, delivery } : message,
     );
     this.#conversations.set(identity, { ...conversation, messages });
     this.#publish();
     return delivery;
   }
 
-  #receive(message: Incoming): void {
-    if (!this.#detach) {
-      return;
-    }
+  #receive(message: {
+    from: string;
+    id: string;
+    body: string | null;
+    sequence: number;
+  }): void {
     const existing = this.#conversations.get(message.from);
-    if (existing?.messages.some((m) => m.id === message.id)) {
+    const duplicate = existing?.messages.find((m) => m.id === message.id);
+    if (duplicate && (duplicate.body !== null || message.body === null)) {
       return;
     }
-    const target = this.#ensure(message.from);
-    const sequence = ++this.#sequence;
+    const target = duplicate
+      ? {
+          ...existing!,
+          messages: existing!.messages.filter((m) => m !== duplicate),
+        }
+      : this.#ensure(message.from);
     const conversation = this.#append(target, {
       id: message.id,
       from: message.from,
       to: this.#self,
       body: message.body,
-      sequence,
+      sequence: message.sequence,
       direction: "received",
     });
-    if (message.body !== null) {
-      this.#history?.received({
-        id: message.id,
-        peer: message.from,
-        sequence,
-        read: this.#active === message.from,
-        body: message.body,
-      });
-    }
     if (this.#active !== message.from) {
       this.#conversations.set(message.from, {
         ...conversation,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Conversations } from "./conversations.ts";
+import { IdentityKey } from "./identity.ts";
 import {
   type SecureDevice,
   freePort,
@@ -32,7 +33,7 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
 }
 
 async function boot(port: number, store: Store): Promise<Device> {
-  const device = await secureDevice(port, { store });
+  const device = await secureDevice(port, { store, inbox: false });
   const { restored, rejected } = await device.history.restore();
   const conversations = new Conversations(device.messenger, device.id, {
     history: device.history,
@@ -99,11 +100,15 @@ test("a reloaded device keeps its identity, keys, and encrypted history", async 
 
   a.conversations.open(idB);
   const first = send(a, "before reload");
-  assert.equal(await first.delivery, "delivered");
+  assert.equal(await first.delivery, "queued");
   await until(() => thread(b, idA).length === 1, "b receives");
   b.conversations.open(idA);
-  assert.equal(await send(b, "reply before reload").delivery, "delivered");
+  assert.equal(await send(b, "reply before reload").delivery, "queued");
   await until(() => thread(a, idB).length === 2, "a receives reply");
+  await until(
+    () => thread(b, idA).includes("sent:delivered:reply before reload"),
+    "receipt",
+  );
   await b.history.flush();
   const frame = b.received.find((data) => data.includes(first.id));
   assert.ok(frame);
@@ -125,7 +130,7 @@ test("a reloaded device keeps its identity, keys, and encrypted history", async 
 
   b.deliver(frame);
   b.deliver(frame);
-  assert.equal(await send(a, "after reload").delivery, "delivered");
+  assert.equal(await send(a, "after reload").delivery, "queued");
   await until(() => thread(b, idA).length === 3, "b receives after reload");
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual(thread(b, idA), [
@@ -170,9 +175,9 @@ test("history and identity survive a server restart and multiple conversations",
   const idC = c.keys.identity.identity;
 
   b.conversations.open(idA);
-  assert.equal(await send(b, "from b").delivery, "delivered");
+  assert.equal(await send(b, "from b").delivery, "queued");
   c.conversations.open(idA);
-  assert.equal(await send(c, "from c").delivery, "delivered");
+  assert.equal(await send(c, "from c").delivery, "queued");
   await until(
     () => thread(a, idB).length === 1 && thread(a, idC).length === 1,
     "a receives both",
@@ -201,7 +206,7 @@ test("history and identity survive a server restart and multiple conversations",
       [idB, 1, 1],
     ],
   );
-  assert.equal(await send(b, "after restart").delivery, "delivered");
+  assert.equal(await send(b, "after restart").delivery, "queued");
   await until(() => thread(a, idB).length === 2, "a receives after restart");
   assert.deepEqual(thread(a, idB), [
     "received:from b",
@@ -210,29 +215,29 @@ test("history and identity survive a server restart and multiple conversations",
   assert.deepEqual(thread(a, idC), ["received:from c"]);
 });
 
-test("an undelivered message is persisted encrypted as not delivered", async () => {
+test("queued and undeliverable messages are persisted encrypted with their state", async () => {
   const port = await freePort();
   await startServer(port);
   const storeA = memoryStore();
   let a = await boot(port, storeA);
   const b = await boot(port, memoryStore());
   const idB = b.keys.identity.identity;
+  assert.equal(await a.pairing.establish(idB), "established");
   await b.shutdown();
 
   a.conversations.open(idB);
-  const deadline = Date.now() + 5000;
-  while (await a.messenger.lookup(idB)) {
-    assert.ok(Date.now() < deadline);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.equal(await send(a, "probe").delivery, "unavailable");
-  assert.equal(await send(a, "undelivered secret").delivery, "unavailable");
+  assert.equal(await send(a, "queued secret").delivery, "queued");
+  const nobody = (await IdentityKey.generate()).identity;
+  a.conversations.open(nobody);
+  assert.equal(await send(a, "undeliverable secret").delivery, "unavailable");
   await a.history.flush();
-  assertSealedAtRest(storeA, ["undelivered secret", "probe"]);
+  assertSealedAtRest(storeA, ["queued secret", "undeliverable secret"]);
   await a.shutdown();
   a = await boot(port, storeA);
-  assert.equal(thread(a, idB).at(-1), "sent:unavailable:undelivered secret");
-  assert.ok(thread(a, idB).every((m) => m.startsWith("sent:unavailable:")));
+  assert.deepEqual(thread(a, idB), ["sent:queued:queued secret"]);
+  assert.deepEqual(thread(a, nobody), [
+    "sent:unavailable:undeliverable secret",
+  ]);
 });
 
 test("a corrupted record is rejected while the rest of the history restores", async () => {
@@ -244,7 +249,7 @@ test("a corrupted record is rejected while the rest of the history restores", as
   const idA = a.keys.identity.identity;
   a.conversations.open(b.keys.identity.identity);
   for (const body of ["one", "two", "three"]) {
-    assert.equal(await send(a, body).delivery, "delivered");
+    assert.equal(await send(a, body).delivery, "queued");
   }
   await until(() => thread(b, idA).length === 3, "received");
   await b.history.flush();
@@ -260,7 +265,7 @@ test("a corrupted record is rejected while the rest of the history restores", as
   b = await boot(port, storeB);
   assert.equal(b.rejected, 1);
   assert.deepEqual(thread(b, idA), ["received:one", "received:three"]);
-  assert.equal(await send(a, "four").delivery, "delivered");
+  assert.equal(await send(a, "four").delivery, "queued");
   await until(() => thread(b, idA).length === 3, "still receiving");
 });
 
@@ -272,7 +277,7 @@ test("an explicit reset yields a new identity that cannot read the old history",
   let b = await boot(port, storeB);
   const oldB = b.keys.identity.identity;
   a.conversations.open(oldB);
-  assert.equal(await send(a, "to the old identity").delivery, "delivered");
+  assert.equal(await send(a, "to the old identity").delivery, "queued");
   await until(() => thread(b, a.keys.identity.identity).length === 1, "rx");
   await b.history.flush();
   await b.shutdown();
@@ -282,5 +287,7 @@ test("an explicit reset yields a new identity that cannot read the old history",
   assert.equal(b.created, true);
   assert.notEqual(b.keys.identity.identity, oldB);
   assert.deepEqual(b.conversations.state.conversations, []);
-  assert.equal(await send(a, "old identity is gone").delivery, "unavailable");
+  assert.equal(await send(a, "old identity is gone").delivery, "queued");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(b.conversations.state.conversations, []);
 });

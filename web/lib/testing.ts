@@ -21,10 +21,10 @@ import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
 import { History } from "./history.ts";
 import {
-  type Incoming,
   Messenger,
-  type MessengerOptions,
   type MessengerState,
+  type Receipt,
+  type Receiver,
 } from "./messenger.ts";
 import { Pairing } from "./pairing.ts";
 import { Pairs } from "./pairs.ts";
@@ -323,12 +323,55 @@ export async function legacySeal(
 
 export type MemoryStore = ReturnType<typeof memoryStore>;
 
+export type Inbound = { id: string; from: string; body: string | null };
+
+export function memoryReceiver() {
+  const inbox: Inbound[] = [];
+  const receipts: Receipt[] = [];
+  const stored = new Set<string>();
+  let failing = false;
+  const receiver: Receiver = {
+    has: (from, id) => stored.has(`${from}/${id}`),
+    accept: async ({ from, id, body }) => {
+      await Promise.resolve();
+      if (failing) {
+        return false;
+      }
+      if (!stored.has(`${from}/${id}`)) {
+        stored.add(`${from}/${id}`);
+        inbox.push({ id, from, body });
+      }
+      return true;
+    },
+    reject: ({ from, id }) => {
+      inbox.push({ id, from, body: null });
+    },
+    settle: async (receipt) => {
+      await Promise.resolve();
+      if (failing) {
+        return false;
+      }
+      receipts.push(receipt);
+      return true;
+    },
+  };
+  return {
+    receiver,
+    inbox,
+    receipts,
+    fail: (value: boolean) => {
+      failing = value;
+    },
+  };
+}
+
 export async function secureDevice(
   port: number,
   options: {
     store?: MemoryStore;
-    messenger?: MessengerOptions;
     wait?: boolean;
+    drop?: string[];
+    inbox?: boolean;
   } = {},
 ) {
   const store = options.store ?? memoryStore();
@@ -349,7 +392,16 @@ export async function secureDevice(
   const received: string[] = [];
   const frames: string[] = [];
   const listeners: ((data: string) => void)[] = [];
-  let held = false;
+  const dropped = new Set<string>(options.drop ?? []);
+  const delayed = new Set<string>();
+  const buffered: string[] = [];
+  const typeOf = (data: string) => {
+    try {
+      return (JSON.parse(data) as { type?: unknown }).type;
+    } catch {
+      return null;
+    }
+  };
   const transmit = transport.send.bind(transport);
   transport.send = (data: string) => {
     sent.push(data);
@@ -364,9 +416,17 @@ export async function secureDevice(
   transport.onData = (listener: (data: string) => void) => {
     listeners.push(listener);
     return onData((data) => {
-      if (!(held && data.includes('"type":"message"'))) {
-        listener(data);
+      const type = typeOf(data);
+      if (typeof type === "string" && dropped.has(type)) {
+        return;
       }
+      if (typeof type === "string" && delayed.has(type)) {
+        if (listener === listeners[0]) {
+          buffered.push(data);
+        }
+        return;
+      }
+      listener(data);
     });
   };
   const client = track(new Client(transport));
@@ -384,11 +444,12 @@ export async function secureDevice(
     keys.identity,
     keys.exchange,
     pairing,
-    options.messenger,
   );
-  const inbox: Incoming[] = [];
+  const sink = memoryReceiver();
   const states: MessengerState[] = [];
-  messenger.onMessage((message) => inbox.push(message));
+  if (options.inbox !== false) {
+    messenger.receive(sink.receiver);
+  }
   messenger.onState((state) => states.push(state));
   pairing.onKey((bundle) => void trust.observe(bundle));
   messenger.onKey((bundle) => void trust.observe(bundle));
@@ -432,14 +493,34 @@ export async function secureDevice(
     auth,
     pairing,
     messenger,
-    inbox,
+    inbox: sink.inbox,
+    receipts: sink.receipts,
+    failStorage: sink.fail,
     states,
     sent,
     received,
     frames,
     deliver: (data: string) => listeners.forEach((listener) => listener(data)),
     hold: (value: boolean) => {
-      held = value;
+      if (value) {
+        dropped.add("message");
+      } else {
+        dropped.delete("message");
+      }
+    },
+    drop: (types: string[]) => {
+      dropped.clear();
+      types.forEach((type) => dropped.add(type));
+    },
+    delay: (types: string[]) => {
+      types.forEach((type) => delayed.add(type));
+    },
+    release: () => {
+      delayed.clear();
+      const pending = buffered.splice(0);
+      pending.forEach((data) =>
+        listeners.forEach((listener) => listener(data)),
+      );
     },
     shutdown,
   };

@@ -19,6 +19,7 @@ const (
 	CodeStaleSession    Code = "stale_session"
 	CodeSessionLimit    Code = "session_limit"
 	CodePendingLimit    Code = "pending_limit"
+	CodeQueueFull       Code = "queue_full"
 	CodeInternalError   Code = "internal_error"
 )
 

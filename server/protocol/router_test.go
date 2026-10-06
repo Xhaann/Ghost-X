@@ -14,6 +14,7 @@ import (
 	"github.com/Xhaann/ghost-x/server/direct"
 	"github.com/Xhaann/ghost-x/server/prekey"
 	"github.com/Xhaann/ghost-x/server/presence"
+	"github.com/Xhaann/ghost-x/server/queue"
 )
 
 type response struct {
@@ -54,6 +55,7 @@ func testSession() *auth.Session {
 func newTestRouter() *Router {
 	messages := direct.NewRegistry()
 	prekeys := prekey.NewRegistry()
+	queued := queue.NewRegistry(time.Now)
 	return NewRouter(map[string]Handler{
 		"ping":         Ping(time.Now),
 		"challenge":    Challenge(),
@@ -61,10 +63,12 @@ func newTestRouter() *Router {
 	}, map[string]ProtectedHandler{
 		"whoami":   WhoAmI(),
 		"presence": Presence(presence.NewRegistry()),
-		"send":     Send(messages),
+		"send":     Send(messages, prekeys, queued),
+		"fetch":    Fetch(queued),
+		"ack":      Ack(queued),
+		"clear":    Clear(queued),
 		"publish":  Publish(messages),
 		"key":      Key(messages),
-		"session":  Establish(messages),
 		"prekeys":  Prekeys(messages, prekeys),
 		"bundle":   FetchBundle(prekeys),
 		"initiate": Initiate(messages, prekeys),
@@ -208,8 +212,10 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"challenge","id":"a","payload":{}}`,
 		`{"type":"whoami","id":"a","payload":{}}`,
 		`{"type":"presence","id":"a","payload":{}}`,
-		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","epoch":0,"envelopes":[{"session":"AAAAAAAAAAAAAAAAAAAAAA","epoch":0,"salt":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","iv":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAAA"}]}}`,
-		`{"type":"session","id":"a","payload":{"session":"AAAAAAAAAAAAAAAAAAAAAA","epoch":0,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
+		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA","ciphertext":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"fetch","id":"a","payload":{}}`,
+		`{"type":"ack","id":"a","payload":{"from":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"clear","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"publish","id":"a","payload":{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 		`{"type":"key","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"prekeys","id":"a","payload":{"device":"AAAAAAAAAAAAAAAAAAAAAA","signed":{"id":1,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"},"onetime":[]}}`,

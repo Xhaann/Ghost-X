@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { encodeBase64Url } from "./base64.ts";
+import { createMessageId } from "./protocol.ts";
 import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
 import { Messenger } from "./messenger.ts";
@@ -92,7 +93,7 @@ test("establishes a session with an offline recipient that completes on reconnec
     1,
     "initiation delivered exactly once",
   );
-  assert.deepEqual(await a.messenger.send(idB, "after async setup", "m1"), {
+  assert.deepEqual(await a.messenger.send(idB, "after async setup"), {
     ok: true,
   });
 
@@ -459,19 +460,24 @@ test("a stripped one-time prekey or a stale replayed bundle is handled safely", 
   assert.equal(error.code, "stale_session");
 });
 
-test("only a missing session triggers recovery; pending or established sessions never re-key on input", async () => {
+test("open classifies input by session state and never re-keys on its own", async () => {
   const port = await freePort();
   await startServer(port);
   const { encodeHeader, generateRatchetKey } = await import("./ratchet.ts");
-  const probe = async () => {
+  const probe = async (session?: string | null) => {
     const header = encodeHeader({
-      session: encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))),
+      session:
+        session ?? encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))),
       ratchet: (await generateRatchetKey()).publicKey,
       previous: 0,
       n: 0,
     });
     assert.ok(header);
-    return new Uint8Array([...header, ...new Uint8Array(17)]);
+    return new Uint8Array([...header, ...new Uint8Array(40)]);
+  };
+  const id = createMessageId();
+  const never = async () => {
+    throw new Error("must not record");
   };
   const initiations = (d: { frames: string[] }) =>
     frames(d.frames, "initiate").filter((f) => (f.payload as Json).to).length;
@@ -483,7 +489,19 @@ test("only a missing session triggers recovery; pending or established sessions 
   const a = await device(port);
   assert.equal(await a.pairing.initiate(idB), "pending");
   const pendingCount = initiations(a);
-  assert.equal(await a.pairing.open(idB, await probe()), null);
+  assert.equal(await a.pairing.open(idB, id, await probe(), never), "rejected");
+  assert.equal(
+    await a.pairing.open(idB, id, await probe(a.pairs.id(idB)), never),
+    "deferred",
+  );
+  assert.equal(
+    await a.pairing.open(idB, id, new Uint8Array(80), never),
+    "rejected",
+  );
+  assert.equal(
+    await a.pairing.open(idB, "bad", await probe(a.pairs.id(idB)), never),
+    "rejected",
+  );
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(initiations(a), pendingCount);
   assert.equal(a.pairs.state(idB), "pending");
@@ -491,13 +509,18 @@ test("only a missing session triggers recovery; pending or established sessions 
   b = await device(port, storeB);
   await until(() => a.pairs.state(idB) === "established", "established");
   const session = a.pairs.id(idB);
-  assert.equal(await a.pairing.open(idB, await probe()), null);
+  assert.equal(await a.pairing.open(idB, id, await probe(), never), "rejected");
+  assert.equal(
+    await a.pairing.open(idB, id, await probe(session), never),
+    "rejected",
+  );
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(initiations(a), pendingCount);
   assert.equal(a.pairs.id(idB), session);
 
   const c = await device(port);
-  assert.equal(await c.pairing.open(idB, await probe()), null);
-  await until(() => initiations(c) === 1, "recovery initiation");
-  await until(() => c.pairs.state(idB) === "established", "recovered");
+  assert.equal(await c.pairing.open(idB, id, await probe(), never), "missing");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(initiations(c), 0);
+  assert.equal(c.pairs.state(idB), "none");
 });

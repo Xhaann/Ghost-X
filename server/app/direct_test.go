@@ -14,23 +14,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/Xhaann/ghost-x/server/identity"
 	"github.com/Xhaann/ghost-x/server/protocol"
 )
-
-type wireSession struct {
-	Session   string `json:"session"`
-	Epoch     uint32 `json:"epoch"`
-	Key       string `json:"key"`
-	Signature string `json:"signature"`
-}
-
-type wireEnvelope struct {
-	Session    string `json:"session"`
-	Epoch      uint32 `json:"epoch"`
-	Salt       string `json:"salt"`
-	IV         string `json:"iv"`
-	Ciphertext string `json:"ciphertext"`
-}
 
 type peer struct {
 	conn      *websocket.Conn
@@ -38,7 +24,6 @@ type peer struct {
 	exchange  string
 	staticRaw []byte
 	signature string
-	keys      wireSession
 	messages  chan message
 }
 
@@ -68,23 +53,6 @@ func bundleFor(t *testing.T, k key) (string, string) {
 	return base64.RawURLEncoding.EncodeToString(raw), base64.RawURLEncoding.EncodeToString(signature)
 }
 
-func sessionFor(t *testing.T, k key, staticRaw []byte, id string, epoch uint32) wireSession {
-	t.Helper()
-	raw := exchangeRaw(t)
-	message := protocol.SessionMessage(decoded(k.identity), staticRaw, decoded(id), epoch, raw)
-	return wireSession{
-		Session:   id,
-		Epoch:     epoch,
-		Key:       base64.RawURLEncoding.EncodeToString(raw),
-		Signature: base64.RawURLEncoding.EncodeToString(ed25519.Sign(k.private, message)),
-	}
-}
-
-func sessionFrame(id string, s wireSession) string {
-	payload, _ := json.Marshal(s)
-	return fmt.Sprintf(`{"type":"session","id":%q,"payload":%s}`, id, payload)
-}
-
 func connectPeer(t *testing.T, url string, k key) *peer {
 	t.Helper()
 	exchange, signature := bundleFor(t, k)
@@ -99,12 +67,7 @@ func connectPeerWith(t *testing.T, url string, k key, exchange, signature string
 	if msg := roundTrip(t, conn, publish); msg.Type != "published" {
 		t.Fatalf("publish = %+v %s", msg, msg.Payload)
 	}
-	staticRaw := decoded(exchange)
-	keys := sessionFor(t, k, staticRaw, randomText(protocol.SessionIDSize), 0)
-	if msg := roundTrip(t, conn, sessionFrame("s0", keys)); msg.Type != "established" {
-		t.Fatalf("session = %+v %s", msg, msg.Payload)
-	}
-	p := &peer{conn: conn, key: k, exchange: exchange, staticRaw: staticRaw, signature: signature, keys: keys, messages: make(chan message, 512)}
+	p := &peer{conn: conn, key: k, exchange: exchange, staticRaw: decoded(exchange), signature: signature, messages: make(chan message, 512)}
 	go func() {
 		defer close(p.messages)
 		conn.SetReadDeadline(time.Time{})
@@ -123,24 +86,17 @@ func connectPeerWith(t *testing.T, url string, k key, exchange, signature string
 	return p
 }
 
-func (p *peer) rotate(t *testing.T) {
+func joinPeer(t *testing.T, url string, k key, exchange, signature string) *peer {
 	t.Helper()
-	next := sessionFor(t, p.key, p.staticRaw, p.keys.Session, p.keys.Epoch+1)
-	id := fmt.Sprintf("r%d", next.Epoch)
-	p.write(t, sessionFrame(id, next))
-	if msg := p.next(t); msg.Type != "established" || msg.ID != id {
-		t.Fatalf("rotate = %+v %s", msg, msg.Payload)
+	p := connectPeerWith(t, url, k, exchange, signature)
+	deviceID := randomText(protocol.DeviceIDSize)
+	signed, _ := signedPrekey(k, p.staticRaw, deviceID, 1, true)
+	payload, _ := json.Marshal(map[string]any{"device": deviceID, "signed": signed, "onetime": []any{}})
+	p.write(t, fmt.Sprintf(`{"type":"prekeys","id":"p1","payload":%s}`, payload))
+	if msg := p.next(t); msg.Type != "prekeys" {
+		t.Fatalf("prekeys = %+v %s", msg, msg.Payload)
 	}
-	p.keys = next
-}
-
-func envelopeFor(s wireSession, n int) wireEnvelope {
-	return wireEnvelope{Session: s.Session, Epoch: s.Epoch, Salt: randomText(protocol.SaltSize), IV: randomText(protocol.IVSize), Ciphertext: randomText(n)}
-}
-
-func sendFrame(id, to string, epoch uint32, envelopes ...wireEnvelope) string {
-	payload, _ := json.Marshal(map[string]any{"to": to, "epoch": epoch, "envelopes": envelopes})
-	return fmt.Sprintf(`{"type":"send","id":%q,"payload":%s}`, id, payload)
+	return p
 }
 
 func (p *peer) write(t *testing.T, frame string) {
@@ -148,11 +104,6 @@ func (p *peer) write(t *testing.T, frame string) {
 	if err := p.conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func (p *peer) send(t *testing.T, id, to string, envelopes ...wireEnvelope) {
-	t.Helper()
-	p.write(t, sendFrame(id, to, p.keys.Epoch, envelopes...))
 }
 
 func (p *peer) next(t *testing.T) message {
@@ -169,10 +120,23 @@ func (p *peer) next(t *testing.T) message {
 	return message{}
 }
 
-func (p *peer) expectSent(t *testing.T, id string) {
+func (p *peer) barrier(t *testing.T, id string) []message {
 	t.Helper()
-	if msg := p.next(t); msg.Type != "sent" || msg.ID != id || string(msg.Payload) != `{}` {
-		t.Fatalf("result = %+v %s, want sent %s", msg, msg.Payload, id)
+	p.write(t, pingRequest(id, 1))
+	var before []message
+	for {
+		msg := p.next(t)
+		if msg.Type == "pong" && msg.ID == id {
+			return before
+		}
+		before = append(before, msg)
+	}
+}
+
+func (p *peer) expect(t *testing.T, typ, id string) {
+	t.Helper()
+	if msg := p.next(t); msg.Type != typ || msg.ID != id {
+		t.Fatalf("result = %+v %s, want %s %s", msg, msg.Payload, typ, id)
 	}
 }
 
@@ -183,218 +147,215 @@ func (p *peer) expectError(t *testing.T, id, code string) {
 	}
 }
 
-func deliveryJSON(id string, from *peer, sender wireSession, e wireEnvelope) string {
-	s, _ := json.Marshal(sender)
-	env, _ := json.Marshal(e)
-	return `{"id":"` + id + `","from":"` + from.key.identity + `","key":"` + from.exchange + `","signature":"` + from.signature + `","sender":` + string(s) + `,"envelope":` + string(env) + `}`
-}
-
-func (p *peer) expectDelivery(t *testing.T, id string, from *peer, sender wireSession, e wireEnvelope) {
+func mustParse(t *testing.T, encoded string) identity.Identity {
 	t.Helper()
-	msg := p.next(t)
-	if msg.Type != "message" || msg.ID != "" || string(msg.Payload) != deliveryJSON(id, from, sender, e) {
-		t.Fatalf("delivery = %+v %s", msg, msg.Payload)
+	id, err := identity.Parse(encoded)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return id
 }
 
-func (p *peer) barrier(t *testing.T, id string) {
+func ratchetText(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	b[0] = protocol.RatchetVersion
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func sendFrame(request, to, id, ciphertext string) string {
+	return fmt.Sprintf(`{"type":"send","id":%q,"payload":{"to":%q,"id":%q,"ciphertext":%q}}`, request, to, id, ciphertext)
+}
+
+type delivery struct {
+	ID         string `json:"id"`
+	From       string `json:"from"`
+	Key        string `json:"key"`
+	Signature  string `json:"signature"`
+	Ciphertext string `json:"ciphertext"`
+}
+
+type receipt struct {
+	To     string `json:"to"`
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+func (p *peer) fetch(t *testing.T, request string) []message {
 	t.Helper()
-	p.write(t, pingRequest(id, 1))
-	if msg := p.next(t); msg.Type != "pong" || msg.ID != id {
-		t.Fatalf("barrier = %+v, want pong %s", msg, id)
+	p.write(t, fmt.Sprintf(`{"type":"fetch","id":%q,"payload":{}}`, request))
+	var pushed []message
+	for {
+		msg := p.next(t)
+		if msg.Type == "fetched" && msg.ID == request {
+			return pushed
+		}
+		pushed = append(pushed, msg)
 	}
 }
 
-func TestEncryptedEnvelopeRoutedToRecipientSession(t *testing.T) {
-	_, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
-	b := connectPeer(t, url, newKey(t))
-
-	first, second := envelopeFor(b.keys, 48), envelopeFor(a.keys, 64)
-	a.send(t, "m1", b.key.identity, first)
-	a.expectSent(t, "m1")
-	b.expectDelivery(t, "m1", a, a.keys, first)
-
-	b.send(t, "m2", a.key.identity, second)
-	b.expectSent(t, "m2")
-	a.expectDelivery(t, "m2", b, b.keys, second)
+func deliveries(t *testing.T, msgs []message) []delivery {
+	t.Helper()
+	var out []delivery
+	for _, m := range msgs {
+		if m.Type != "message" {
+			continue
+		}
+		var d delivery
+		if err := json.Unmarshal(m.Payload, &d); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
-func TestKeyLookupListsLiveSessionsOverWebSocket(t *testing.T) {
-	_, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
-	b := connectPeer(t, url, newKey(t))
-	b.rotate(t)
+func receipts(t *testing.T, msgs []message) []receipt {
+	t.Helper()
+	var out []receipt
+	for _, m := range msgs {
+		if m.Type != "receipt" {
+			continue
+		}
+		var r receipt
+		if err := json.Unmarshal(m.Payload, &r); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
 
-	a.write(t, `{"type":"key","id":"q1","payload":{"identity":"`+b.key.identity+`"}}`)
-	msg := a.next(t)
-	sessions, _ := json.Marshal([]wireSession{b.keys})
-	want := `{"identity":"` + b.key.identity + `","key":"` + b.exchange + `","signature":"` + b.signature + `","sessions":` + string(sessions) + `}`
-	if msg.Type != "key" || msg.ID != "q1" || string(msg.Payload) != want {
-		t.Fatalf("key = %+v %s", msg, msg.Payload)
+func TestOfflineDeliveryOverWebSocket(t *testing.T) {
+	srv, url := startServer(t)
+	aKey, bKey := newKey(t), newKey(t)
+	bExchange, bSignature := bundleFor(t, bKey)
+	b := joinPeer(t, url, bKey, bExchange, bSignature)
+	b.conn.Close()
+	a := connectPeer(t, url, aKey)
+	a.fetch(t, "fa")
+	waitUntil(t, "recipient offline", func() bool { return srv.sessions.Len() == 1 })
+
+	var sent []delivery
+	for i := range 5 {
+		id, ciphertext := randomText(protocol.MessageIDSize), ratchetText(120+i)
+		a.write(t, sendFrame(fmt.Sprintf("s%d", i), bKey.identity, id, ciphertext))
+		a.expect(t, "queued", fmt.Sprintf("s%d", i))
+		sent = append(sent, delivery{ID: id, From: aKey.identity, Key: a.exchange, Signature: a.signature, Ciphertext: ciphertext})
+	}
+	if n := srv.queue.Queued(mustParse(t, bKey.identity)); n != 5 {
+		t.Fatalf("queued %d", n)
+	}
+
+	again := connectPeerWith(t, url, bKey, bExchange, bSignature)
+	got := deliveries(t, again.fetch(t, "fb"))
+	if len(got) != len(sent) {
+		t.Fatalf("delivered %d of %d", len(got), len(sent))
+	}
+	for i := range sent {
+		if got[i] != sent[i] {
+			t.Fatalf("delivery %d = %+v, want %+v", i, got[i], sent[i])
+		}
+	}
+	for _, d := range got {
+		again.write(t, fmt.Sprintf(`{"type":"ack","id":"a-%s","payload":{"from":%q,"id":%q}}`, d.ID[:8], d.From, d.ID))
+		again.expect(t, "acked", "a-"+d.ID[:8])
+	}
+	if n := srv.queue.Queued(mustParse(t, bKey.identity)); n != 0 {
+		t.Fatalf("%d left after acknowledgment", n)
+	}
+	notes := receipts(t, a.barrier(t, "b1"))
+	if len(notes) != len(sent) {
+		t.Fatalf("receipts %+v", notes)
+	}
+	for i, r := range notes {
+		if r != (receipt{To: bKey.identity, ID: sent[i].ID, Status: "delivered"}) {
+			t.Fatalf("receipt %d = %+v", i, r)
+		}
+		a.write(t, fmt.Sprintf(`{"type":"clear","id":"c%d","payload":{"to":%q,"id":%q}}`, i, r.To, r.ID))
+		a.expect(t, "cleared", fmt.Sprintf("c%d", i))
+	}
+	if n := srv.queue.Receipts(mustParse(t, aKey.identity)); n != 0 {
+		t.Fatalf("%d receipts left", n)
 	}
 }
 
-func TestPlaintextAndStaticKeyFormatRejectedOverWebSocket(t *testing.T) {
-	_, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
-	b := connectPeer(t, url, newKey(t))
-
-	a.write(t, `{"type":"send","id":"p1","payload":{"to":"`+b.key.identity+`","body":"plaintext secret"}}`)
-	a.expectError(t, "p1", "invalid_payload")
-	e := envelopeFor(b.keys, 32)
-	a.write(t, `{"type":"send","id":"p2","payload":{"to":"`+b.key.identity+`","salt":"`+e.Salt+`","iv":"`+e.IV+`","ciphertext":"`+e.Ciphertext+`"}}`)
-	a.expectError(t, "p2", "invalid_payload")
-	b.barrier(t, "b1")
+func TestUnacknowledgedDeliveryIsRetainedAcrossRecipientCrash(t *testing.T) {
+	srv, url := startServer(t)
+	aKey, bKey := newKey(t), newKey(t)
+	bExchange, bSignature := bundleFor(t, bKey)
+	b := joinPeer(t, url, bKey, bExchange, bSignature)
+	b.fetch(t, "f0")
+	a := connectPeer(t, url, aKey)
+	id, ciphertext := randomText(protocol.MessageIDSize), ratchetText(150)
+	a.write(t, sendFrame("s1", bKey.identity, id, ciphertext))
+	a.expect(t, "queued", "s1")
+	if got := deliveries(t, b.barrier(t, "p1")); len(got) != 1 || got[0].ID != id {
+		t.Fatalf("live delivery %+v", got)
+	}
+	b.conn.Close()
+	waitUntil(t, "crashed recipient detached", func() bool { return srv.sessions.Len() == 1 })
+	if n := srv.queue.Queued(mustParse(t, bKey.identity)); n != 1 {
+		t.Fatalf("transmitted message lost after crash: %d", n)
+	}
+	again := connectPeerWith(t, url, bKey, bExchange, bSignature)
+	got := deliveries(t, again.fetch(t, "f1"))
+	if len(got) != 1 || got[0].ID != id || got[0].Ciphertext != ciphertext {
+		t.Fatalf("redelivery %+v", got)
+	}
+	again.write(t, fmt.Sprintf(`{"type":"ack","id":"a1","payload":{"from":%q,"id":%q}}`, aKey.identity, id))
+	again.expect(t, "acked", "a1")
+	again.write(t, fmt.Sprintf(`{"type":"ack","id":"a2","payload":{"from":%q,"id":%q}}`, aKey.identity, id))
+	again.expect(t, "acked", "a2")
+	if got := receipts(t, a.barrier(t, "p2")); len(got) != 0 {
+		t.Fatalf("sender not subscribed but received %+v", got)
+	}
+	notes := receipts(t, a.fetch(t, "fa"))
+	if len(notes) != 1 || notes[0].ID != id || notes[0].Status != "delivered" {
+		t.Fatalf("stored receipt %+v", notes)
+	}
 }
 
-func TestEachRecipientSessionReceivesOnlyItsEnvelope(t *testing.T) {
+func TestQueueIsMemoryOnlyAcrossServerRestart(t *testing.T) {
+	srv, url := startServer(t)
+	aKey, bKey := newKey(t), newKey(t)
+	bExchange, bSignature := bundleFor(t, bKey)
+	joinPeer(t, url, bKey, bExchange, bSignature).conn.Close()
+	a := connectPeer(t, url, aKey)
+	a.write(t, sendFrame("s1", bKey.identity, randomText(protocol.MessageIDSize), ratchetText(100)))
+	a.expect(t, "queued", "s1")
+	if n := srv.queue.Queued(mustParse(t, bKey.identity)); n != 1 {
+		t.Fatalf("queued %d", n)
+	}
+	_, restarted := startServer(t)
+	b := joinPeer(t, restarted, bKey, bExchange, bSignature)
+	if got := deliveries(t, b.fetch(t, "f1")); len(got) != 0 {
+		t.Fatalf("restarted server delivered %+v", got)
+	}
+}
+
+func TestSendValidationOverWebSocket(t *testing.T) {
 	_, url := startServer(t)
 	aKey, bKey := newKey(t), newKey(t)
-	aExchange, aSignature := bundleFor(t, aKey)
 	bExchange, bSignature := bundleFor(t, bKey)
-	a := connectPeerWith(t, url, aKey, aExchange, aSignature)
-	aOther := connectPeerWith(t, url, aKey, aExchange, aSignature)
-	b1 := connectPeerWith(t, url, bKey, bExchange, bSignature)
-	b2 := connectPeerWith(t, url, bKey, bExchange, bSignature)
-	if b1.keys.Session == b2.keys.Session || a.keys.Session == aOther.keys.Session {
-		t.Fatal("sessions share an identifier")
-	}
-
-	e1, e2 := envelopeFor(b1.keys, 40), envelopeFor(b2.keys, 41)
-	a.send(t, "m1", bKey.identity, e1, e2)
-	a.expectSent(t, "m1")
-	b1.expectDelivery(t, "m1", a, a.keys, e1)
-	b2.expectDelivery(t, "m1", a, a.keys, e2)
-
-	a.send(t, "m2", bKey.identity, envelopeFor(b1.keys, 42))
-	a.expectSent(t, "m2")
-	b1.next(t)
-	for i, p := range []*peer{b1, b2, a, aOther} {
-		p.barrier(t, fmt.Sprintf("p%d", i))
-	}
-}
-
-func TestMaximumMultiSessionSendFitsFrameLimit(t *testing.T) {
-	_, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
-	bKey := newKey(t)
-	exchange, signature := bundleFor(t, bKey)
-	var bs []*peer
-	var envelopes []wireEnvelope
-	for range 4 {
-		b := connectPeerWith(t, url, bKey, exchange, signature)
-		bs = append(bs, b)
-		envelopes = append(envelopes, envelopeFor(b.keys, protocol.MaxCiphertext))
-	}
-	a.send(t, "big", bKey.identity, envelopes...)
-	a.expectSent(t, "big")
-	for i, b := range bs {
-		b.expectDelivery(t, "big", a, a.keys, envelopes[i])
-	}
+	joinPeer(t, url, bKey, bExchange, bSignature)
 	conn := dialApp(t, url)
-	authenticateConn(t, conn, bKey)
-	if msg := roundTrip(t, conn, fmt.Sprintf(`{"type":"publish","id":"k1","payload":{"key":%q,"signature":%q}}`, exchange, signature)); msg.Type != "published" {
-		t.Fatal(msg)
-	}
-	expectError(t, roundTrip(t, conn, sessionFrame("s0", sessionFor(t, bKey, decoded(exchange), randomText(protocol.SessionIDSize), 0))), "session_limit")
-}
-
-func TestRotationOverWebSocket(t *testing.T) {
-	_, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
-	b := connectPeer(t, url, newKey(t))
-	first := b.keys
-	b.rotate(t)
-	previous := b.keys
-	b.rotate(t)
-
-	a.send(t, "m1", b.key.identity, envelopeFor(first, 32))
-	a.expectError(t, "m1", "recipient_unavailable")
-	e := envelopeFor(previous, 32)
-	a.send(t, "m2", b.key.identity, e)
-	a.expectSent(t, "m2")
-	b.expectDelivery(t, "m2", a, a.keys, e)
-
-	senderFirst := a.keys
-	a.rotate(t)
-	a.rotate(t)
-	a.write(t, sendFrame("m3", b.key.identity, senderFirst.Epoch, envelopeFor(b.keys, 32)))
-	a.expectError(t, "m3", "stale_session")
-	a.write(t, sessionFrame("bad", sessionFor(t, a.key, a.staticRaw, a.keys.Session, a.keys.Epoch)))
-	a.expectError(t, "bad", "stale_session")
-	current := envelopeFor(b.keys, 32)
-	a.send(t, "m4", b.key.identity, current)
-	a.expectSent(t, "m4")
-	b.expectDelivery(t, "m4", a, a.keys, current)
-}
-
-func TestSecondSessionCannotBindDifferentKey(t *testing.T) {
-	_, url := startServer(t)
-	bKey := newKey(t)
-	connectPeer(t, url, bKey)
-
-	conn := dialApp(t, url)
-	authenticateConn(t, conn, bKey)
-	exchange, signature := bundleFor(t, bKey)
-	expectError(t, roundTrip(t, conn, fmt.Sprintf(`{"type":"publish","id":"k1","payload":{"key":%q,"signature":%q}}`, exchange, signature)), "invalid_payload")
-}
-
-func TestEncryptedSendFailures(t *testing.T) {
-	_, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
-	b := connectPeer(t, url, newKey(t))
-	c := newKey(t)
-
-	a.send(t, "m1", c.identity, envelopeFor(b.keys, 32))
-	a.expectError(t, "m1", "recipient_unavailable")
-
-	e := envelopeFor(b.keys, 32)
-	a.send(t, "m2", b.key.identity, e)
-	a.expectSent(t, "m2")
-	a.send(t, "m2", b.key.identity, e)
-	a.expectError(t, "m2", "duplicate_message")
-	b.expectDelivery(t, "m2", a, a.keys, e)
-	b.barrier(t, "b1")
-
-	env, _ := json.Marshal(e)
-	a.write(t, `{"type":"send","id":"m3","payload":{"to":"`+b.key.identity+`","from":"`+c.identity+`","epoch":0,"envelopes":[`+string(env)+`]}}`)
-	a.expectError(t, "m3", "invalid_payload")
-	a.write(t, `{"type":"send","id":"m6","payload":{"to":"`+b.key.identity+`","epoch":0,"envelopes":[`+string(env)+`],"sender":{}}}`)
-	a.expectError(t, "m6", "invalid_payload")
-
-	a.send(t, "m4", b.key.identity, envelopeFor(b.keys, protocol.MaxCiphertext+1))
-	a.expectError(t, "m4", "message_too_large")
-	big := envelopeFor(b.keys, protocol.MaxCiphertext)
-	a.send(t, "m5", b.key.identity, big)
-	a.expectSent(t, "m5")
-	b.expectDelivery(t, "m5", a, a.keys, big)
-}
-
-func TestEncryptedSendRequiresAuthenticationAndSession(t *testing.T) {
-	_, url := startServer(t)
-	b := connectPeer(t, url, newKey(t))
-	aKey := newKey(t)
-
-	conn := dialApp(t, url)
-	expectError(t, roundTrip(t, conn, sendFrame("m1", b.key.identity, 0, envelopeFor(b.keys, 32))), "authentication_required")
-	expectError(t, roundTrip(t, conn, sessionFrame("s1", sessionFor(t, aKey, exchangeRaw(t), randomText(protocol.SessionIDSize), 0))), "authentication_required")
+	expectError(t, roundTrip(t, conn, sendFrame("m1", bKey.identity, randomText(16), ratchetText(100))), "authentication_required")
 	authenticateConn(t, conn, aKey)
-	expectError(t, roundTrip(t, conn, sendFrame("m2", b.key.identity, 0, envelopeFor(b.keys, 32))), "key_required")
-	exchange, signature := bundleFor(t, aKey)
-	if msg := roundTrip(t, conn, fmt.Sprintf(`{"type":"publish","id":"k1","payload":{"key":%q,"signature":%q}}`, exchange, signature)); msg.Type != "published" {
-		t.Fatal(msg)
-	}
-	expectError(t, roundTrip(t, conn, sendFrame("m3", b.key.identity, 0, envelopeFor(b.keys, 32))), "key_required")
-	b.barrier(t, "b1")
+	expectError(t, roundTrip(t, conn, sendFrame("m2", bKey.identity, randomText(16), ratchetText(100))), "key_required")
+	a := connectPeer(t, url, aKey)
+	a.write(t, sendFrame("m3", bKey.identity, randomText(16), base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat("plaintext ", 12)))))
+	a.expectError(t, "m3", "invalid_payload")
+	a.write(t, sendFrame("m4", newKey(t).identity, randomText(16), ratchetText(100)))
+	a.expectError(t, "m4", "recipient_unavailable")
+	a.write(t, `{"type":"session","id":"m5","payload":{}}`)
+	a.expectError(t, "m5", "unsupported_type")
 }
 
 func TestOversizedFrameClosesConnection(t *testing.T) {
 	_, url := startServer(t)
 	a := connectPeer(t, url, newKey(t))
-	huge := envelopeFor(a.keys, 1)
-	huge.Ciphertext = strings.Repeat("A", 40<<10)
-	a.write(t, sendFrame("m1", a.key.identity, 0, huge))
+	a.write(t, sendFrame("m1", a.key.identity, randomText(16), strings.Repeat("A", 40<<10)))
 	select {
 	case _, ok := <-a.messages:
 		if ok {
@@ -405,116 +366,72 @@ func TestOversizedFrameClosesConnection(t *testing.T) {
 	}
 }
 
-func TestReconnectRequiresFreshSession(t *testing.T) {
-	_, url := startServer(t)
-	aKey := newKey(t)
-	exchange, signature := bundleFor(t, aKey)
-	b := connectPeer(t, url, newKey(t))
-	first := connectPeerWith(t, url, aKey, exchange, signature)
-	old := first.keys
-	first.conn.Close()
-	waitUntil(t, "old session removed", func() bool {
-		b.write(t, `{"type":"key","id":"q","payload":{"identity":"`+aKey.identity+`"}}`)
-		msg := b.next(t)
-		return msg.Type == "error"
-	})
-
-	conn := dialApp(t, url)
-	expectError(t, roundTrip(t, conn, sendFrame("m1", b.key.identity, 0, envelopeFor(b.keys, 32))), "authentication_required")
-	authenticateConn(t, conn, aKey)
-	expectError(t, roundTrip(t, conn, sendFrame("m2", b.key.identity, 0, envelopeFor(b.keys, 32))), "key_required")
-	if msg := roundTrip(t, conn, fmt.Sprintf(`{"type":"publish","id":"k1","payload":{"key":%q,"signature":%q}}`, exchange, signature)); msg.Type != "published" {
-		t.Fatal(msg)
+func TestReconnectStormDeliversEveryMessage(t *testing.T) {
+	srv, url := startServer(t)
+	aKey, bKey := newKey(t), newKey(t)
+	bExchange, bSignature := bundleFor(t, bKey)
+	joinPeer(t, url, bKey, bExchange, bSignature).conn.Close()
+	a := connectPeer(t, url, aKey)
+	const total = 60
+	ids := make([]string, total)
+	for i := range ids {
+		ids[i] = randomText(protocol.MessageIDSize)
 	}
-	expectError(t, roundTrip(t, conn, sessionFrame("s1", sessionFor(t, aKey, decoded(exchange), randomText(protocol.SessionIDSize), 1))), "stale_session")
-	fresh := sessionFor(t, aKey, decoded(exchange), randomText(protocol.SessionIDSize), 0)
-	if msg := roundTrip(t, conn, sessionFrame("s2", fresh)); msg.Type != "established" {
-		t.Fatal(msg)
-	}
-	b.send(t, "to-old", aKey.identity, envelopeFor(old, 32))
-	b.expectError(t, "to-old", "recipient_unavailable")
-}
-
-func TestConcurrentEncryptedMessagingWithRotation(t *testing.T) {
-	_, url := startServer(t)
-	const peers = 5
-	const perPair = 8
-	all := make([]*peer, peers)
-	for i := range all {
-		all[i] = connectPeer(t, url, newKey(t))
-	}
-	targets := make([]wireSession, peers)
-	for i, p := range all {
-		targets[i] = p.keys
-	}
-
+	received := map[string]int{}
 	var wg sync.WaitGroup
-	for i, sender := range all {
-		wg.Go(func() {
-			n := 0
-			for j := range all {
-				if i == j {
-					continue
-				}
-				for range perPair {
-					n++
-					sender.write(t, sendFrame(fmt.Sprintf("m%d", n), all[j].key.identity, 0, envelopeFor(targets[j], 24)))
-				}
+	var writeErr error
+	wg.Go(func() {
+		for i, id := range ids {
+			if err := a.conn.WriteMessage(websocket.TextMessage, []byte(sendFrame(fmt.Sprintf("s%d", i), bKey.identity, id, ratchetText(100)))); err != nil {
+				writeErr = err
+				return
 			}
-			for epoch := uint32(1); epoch <= 3; epoch++ {
-				sender.write(t, sessionFrame(fmt.Sprintf("r%d", epoch), sessionFor(t, sender.key, sender.staticRaw, targets[i].Session, epoch)))
+		}
+	})
+	for round := range 15 {
+		b := connectPeerWith(t, url, bKey, bExchange, bSignature)
+		for _, d := range deliveries(t, b.fetch(t, fmt.Sprintf("f%d", round))) {
+			received[d.ID]++
+			if round%2 == 0 {
+				b.write(t, fmt.Sprintf(`{"type":"ack","id":"a","payload":{"from":%q,"id":%q}}`, d.From, d.ID))
 			}
-		})
+		}
+		b.conn.Close()
 	}
 	wg.Wait()
-
-	for _, p := range all {
-		results, rotations, received := 0, 0, 0
-		for results < (peers-1)*perPair || rotations < 3 {
-			msg := p.next(t)
-			switch msg.Type {
-			case "sent":
-				results++
-			case "error":
-				if string(msg.Payload) != `{"code":"recipient_unavailable"}` {
-					t.Fatalf("unexpected error %s", msg.Payload)
-				}
-				results++
-			case "established":
-				rotations++
-			case "message":
-				received++
-				var payload struct {
-					From     string       `json:"from"`
-					Envelope wireEnvelope `json:"envelope"`
-				}
-				json.Unmarshal(msg.Payload, &payload)
-				if payload.From == p.key.identity || payload.Envelope.Session != p.keys.Session {
-					t.Fatalf("misrouted %s", msg.Payload)
-				}
-			default:
-				t.Fatalf("unexpected %+v %s", msg, msg.Payload)
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	for i := range ids {
+		a.expect(t, "queued", fmt.Sprintf("s%d", i))
+	}
+	for range 40 {
+		if srv.queue.Queued(mustParse(t, bKey.identity)) == 0 {
+			break
+		}
+		b := connectPeerWith(t, url, bKey, bExchange, bSignature)
+		pending := deliveries(t, b.fetch(t, "drain"))
+		for round := 0; len(pending) > 0; round++ {
+			for _, d := range pending {
+				received[d.ID]++
+				b.write(t, fmt.Sprintf(`{"type":"ack","id":"a-%s","payload":{"from":%q,"id":%q}}`, d.ID[:6], d.From, d.ID))
 			}
+			pending = deliveries(t, b.barrier(t, fmt.Sprintf("d%d", round)))
+		}
+		b.conn.Close()
+	}
+	if n := srv.queue.Queued(mustParse(t, bKey.identity)); n != 0 {
+		t.Fatalf("%d messages stranded", n)
+	}
+	if len(received) != total {
+		t.Fatalf("received %d distinct of %d", len(received), total)
+	}
+	for _, id := range ids {
+		if received[id] == 0 {
+			t.Fatalf("message %s never delivered", id)
 		}
 	}
-}
-
-func TestRecipientDisconnectDuringEncryptedDelivery(t *testing.T) {
-	srv, url := startServer(t)
-	a := connectPeer(t, url, newKey(t))
-	bKey := newKey(t)
-	exchange, signature := bundleFor(t, bKey)
-
-	for i := range 20 {
-		b := connectPeerWith(t, url, bKey, exchange, signature)
-		var wg sync.WaitGroup
-		wg.Go(func() { a.send(t, fmt.Sprintf("m%d", i), bKey.identity, envelopeFor(b.keys, 24)) })
-		wg.Go(func() { b.conn.Close() })
-		wg.Wait()
-		msg := a.next(t)
-		if msg.Type != "sent" && string(msg.Payload) != `{"code":"recipient_unavailable"}` {
-			t.Fatalf("result = %+v %s", msg, msg.Payload)
-		}
+	if used, bytes, _ := srv.queue.Usage(); used != 0 || bytes != 0 {
+		t.Fatalf("queue usage %d %d", used, bytes)
 	}
-	waitUntil(t, "recipient sessions removed", func() bool { return srv.sessions.Len() == 1 })
 }

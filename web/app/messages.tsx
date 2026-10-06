@@ -23,7 +23,9 @@ const pairingLabels: Record<string, string> = {
 
 const deliveryLabels: Record<DeliveryState, string> = {
   sending: "Sending",
+  queued: "Encrypted and queued until the recipient connects",
   delivered: "Delivered",
+  expired: "Not delivered: expired before the recipient connected",
   unavailable: "Not delivered: recipient unavailable",
   failed: "Not delivered",
 };

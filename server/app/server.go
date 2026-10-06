@@ -14,6 +14,7 @@ import (
 	"github.com/Xhaann/ghost-x/server/prekey"
 	"github.com/Xhaann/ghost-x/server/presence"
 	"github.com/Xhaann/ghost-x/server/protocol"
+	"github.com/Xhaann/ghost-x/server/queue"
 	"github.com/Xhaann/ghost-x/server/socket"
 )
 
@@ -23,6 +24,7 @@ type Server struct {
 	sessions *auth.Registry
 	presence *presence.Registry
 	direct   *direct.Registry
+	queue    *queue.Registry
 	http     *http.Server
 }
 
@@ -46,6 +48,7 @@ type endpoint struct {
 	session *auth.Session
 	direct  *direct.Registry
 	prekeys *prekey.Registry
+	queue   *queue.Registry
 }
 
 func (e *endpoint) Receive(data []byte) {
@@ -56,13 +59,15 @@ func (e *endpoint) Close() {
 	e.session.Close()
 	e.direct.Detach(e.session)
 	e.prekeys.Detach(e.session)
+	e.queue.Detach(e.session)
 }
 
 func New(cfg config.Config) *Server {
 	present := presence.NewRegistry()
 	messages := direct.NewRegistry()
 	prekeys := prekey.NewRegistry()
-	sessions := auth.NewRegistry(time.Now, observers{present, messages, prekeys})
+	queued := queue.NewRegistry(time.Now)
+	sessions := auth.NewRegistry(time.Now, observers{present, messages, prekeys, queued})
 	router := protocol.NewRouter(map[string]protocol.Handler{
 		"ping":         protocol.Ping(time.Now),
 		"challenge":    protocol.Challenge(),
@@ -70,10 +75,12 @@ func New(cfg config.Config) *Server {
 	}, map[string]protocol.ProtectedHandler{
 		"whoami":   protocol.WhoAmI(),
 		"presence": protocol.Presence(present),
-		"send":     protocol.Send(messages),
+		"send":     protocol.Send(messages, prekeys, queued),
+		"fetch":    protocol.Fetch(queued),
+		"ack":      protocol.Ack(queued),
+		"clear":    protocol.Clear(queued),
 		"publish":  protocol.Publish(messages),
 		"key":      protocol.Key(messages),
-		"session":  protocol.Establish(messages),
 		"prekeys":  protocol.Prekeys(messages, prekeys),
 		"bundle":   protocol.FetchBundle(prekeys),
 		"initiate": protocol.Initiate(messages, prekeys),
@@ -84,13 +91,13 @@ func New(cfg config.Config) *Server {
 	opts.Accept = func(c *socket.Client) socket.Receiver {
 		session := sessions.Open()
 		push := func(data []byte) { _ = c.Send(data) }
-		messages.Attach(session, func(m direct.Message) bool {
-			return c.Send(protocol.EncodeMessage(m)) == nil
+		queued.Attach(session, func(p queue.Push) bool {
+			return c.Send(protocol.EncodePush(p)) == nil
 		})
 		prekeys.Attach(session, func(e prekey.Event) bool {
 			return c.Send(protocol.EncodeEvent(e)) == nil
 		})
-		return &endpoint{client: c, conn: router.Conn(session, push), session: session, direct: messages, prekeys: prekeys}
+		return &endpoint{client: c, conn: router.Conn(session, push), session: session, direct: messages, prekeys: prekeys, queue: queued}
 	}
 	hub := socket.NewHub(opts)
 
@@ -104,6 +111,7 @@ func New(cfg config.Config) *Server {
 		sessions: sessions,
 		presence: present,
 		direct:   messages,
+		queue:    queued,
 		http: &http.Server{
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,

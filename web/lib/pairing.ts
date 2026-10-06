@@ -18,7 +18,9 @@ import { type PrekeyStore, lowWater } from "./prekeys.ts";
 import {
   type ServerMessage,
   exchangeKeySize,
+  isMessageId,
   isValidBody,
+  messageIdLength,
 } from "./protocol.ts";
 import { decodeBase64Url } from "./base64.ts";
 import {
@@ -34,10 +36,24 @@ import {
 export type InitiateResult =
   "pending" | "established" | "unavailable" | "invalid_bundle" | "failed";
 
+export type OpenResult =
+  "accepted" | "deferred" | "rejected" | "failed" | "missing";
+
 export interface Channel {
-  establish(peer: string): Promise<boolean>;
-  seal(peer: string, body: string): Promise<Uint8Array<ArrayBuffer> | null>;
-  open(peer: string, data: Uint8Array<ArrayBuffer>): Promise<string | null>;
+  establish(peer: string): Promise<InitiateResult>;
+  initiate(peer: string): Promise<InitiateResult>;
+  onChange(listener: (peer: string) => void): () => void;
+  seal(
+    peer: string,
+    id: string,
+    body: string,
+  ): Promise<Uint8Array<ArrayBuffer> | null>;
+  open(
+    peer: string,
+    id: string,
+    data: Uint8Array<ArrayBuffer>,
+    record: (body: string) => Promise<boolean>,
+  ): Promise<OpenResult>;
 }
 
 type StateSource = {
@@ -52,6 +68,30 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 export const establishTimeout = 5000;
+
+export function frame(id: string, body: string): Uint8Array<ArrayBuffer> {
+  const head = encoder.encode(id);
+  const tail = encoder.encode(body);
+  const out = new Uint8Array(head.length + tail.length);
+  out.set(head);
+  out.set(tail, head.length);
+  return out;
+}
+
+export function unframe(plaintext: Uint8Array, id: string): string | null {
+  try {
+    if (
+      plaintext.length <= messageIdLength ||
+      decoder.decode(plaintext.subarray(0, messageIdLength)) !== id
+    ) {
+      return null;
+    }
+    const body = decoder.decode(plaintext.subarray(messageIdLength));
+    return isValidBody(body) ? body : null;
+  } catch {
+    return null;
+  }
+}
 
 export class Pairing implements Channel {
   readonly #client: Client;
@@ -94,6 +134,10 @@ export class Pairing implements Channel {
 
   state(peer: string): PairState {
     return this.#pairs.state(peer);
+  }
+
+  onChange(listener: (peer: string) => void): () => void {
+    return this.#pairs.onChange(listener);
   }
 
   start(source: StateSource): void {
@@ -164,9 +208,9 @@ export class Pairing implements Channel {
     return run;
   }
 
-  async establish(peer: string): Promise<boolean> {
+  async establish(peer: string): Promise<InitiateResult> {
     if (this.#pairs.state(peer) === "established") {
-      return true;
+      return "established";
     }
     const established = new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
@@ -182,49 +226,63 @@ export class Pairing implements Channel {
       });
     });
     const result = await this.#initiate(peer, true);
-    if (result === "established") {
-      return true;
-    }
     if (result !== "pending") {
-      return false;
+      return result;
     }
-    return established;
+    return (await established) ? "established" : "pending";
   }
 
   async seal(
     peer: string,
+    id: string,
     body: string,
   ): Promise<Uint8Array<ArrayBuffer> | null> {
-    if (!isValidBody(body)) {
+    if (!isValidBody(body) || !isMessageId(id)) {
       return null;
     }
     return this.#pairs.transact(peer, async (state) => {
-      const sealed = await ratchetEncrypt(state, encoder.encode(body));
+      const sealed = await ratchetEncrypt(state, frame(id, body));
       return sealed && { state: sealed.state, value: sealed.message };
     });
   }
 
   async open(
     peer: string,
+    id: string,
     data: Uint8Array<ArrayBuffer>,
-  ): Promise<string | null> {
-    if (this.#pairs.state(peer) === "none" && decodeHeader(data)) {
-      void this.initiate(peer);
-      return null;
+    record: (body: string) => Promise<boolean>,
+  ): Promise<OpenResult> {
+    const header = decodeHeader(data);
+    if (!header || !isMessageId(id)) {
+      return "rejected";
     }
-    const plaintext = await this.#pairs.transact(peer, async (state) => {
-      const opened = await ratchetDecrypt(state, data, this.#generate);
-      return opened && { state: opened.state, value: opened.plaintext };
+    const current = this.#pairs.state(peer);
+    if (current === "none") {
+      return "missing";
+    }
+    if (current === "pending") {
+      return header.session === this.#pairs.id(peer) ? "deferred" : "rejected";
+    }
+    let recorded = false;
+    let failed = false;
+    const opened = await this.#pairs.transact(peer, async (state) => {
+      const result = await ratchetDecrypt(state, data, this.#generate);
+      const body = result && unframe(result.plaintext, id);
+      if (!result || body === null) {
+        return null;
+      }
+      const stored = await record(body).catch(() => false);
+      if (!stored) {
+        failed = true;
+        return null;
+      }
+      recorded = true;
+      return { state: result.state, value: true };
     });
-    if (!plaintext) {
-      return null;
+    if (opened) {
+      return "accepted";
     }
-    try {
-      const body = decoder.decode(plaintext);
-      return isValidBody(body) ? body : null;
-    } catch {
-      return null;
-    }
+    return recorded || failed ? "failed" : "rejected";
   }
 
   async #initiate(peer: string, replace: boolean): Promise<InitiateResult> {

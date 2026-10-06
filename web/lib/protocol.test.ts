@@ -7,8 +7,12 @@ import {
   encode,
   isValidBody,
   maxBodySize,
-  maxCiphertextSize,
-  maxSessions,
+  createMessageId,
+  isMessage,
+  isMessageId,
+  maxDevices,
+  maxMessageSize,
+  minMessageSize,
   parse,
 } from "./protocol.ts";
 
@@ -189,76 +193,57 @@ function b64(size: number): string {
   return encodeBase64Url(crypto.getRandomValues(new Uint8Array(size)));
 }
 
-function sessionBundle(overrides: Record<string, unknown> = {}) {
-  return {
-    session: b64(16),
-    epoch: 0,
-    key: b64(32),
-    signature: b64(64),
-    ...overrides,
-  };
+function sealed(size: number, version = 1): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(size));
+  bytes[0] = version;
+  return encodeBase64Url(bytes);
 }
 
-function envelope(overrides: Record<string, unknown> = {}) {
+function delivery(overrides: Record<string, unknown> = {}) {
   return {
-    session: b64(16),
-    epoch: 3,
-    salt: b64(32),
-    iv: b64(12),
-    ciphertext: b64(40),
-    ...overrides,
-  };
-}
-
-function delivery(
-  overrides: Record<string, unknown> = {},
-  sender: Record<string, unknown> = {},
-  sealed: Record<string, unknown> = {},
-) {
-  return {
-    id: "m1",
+    id: createMessageId(),
     from: "B".repeat(42) + "A",
     key: b64(32),
     signature: b64(64),
-    sender: sessionBundle(sender),
-    envelope: envelope(sealed),
+    ciphertext: sealed(120),
     ...overrides,
   };
 }
 
-test("parses messaging replies, key bundles, and encrypted deliveries", () => {
+test("parses queue replies, key bundles, deliveries, and receipts", () => {
   const identity = "B".repeat(42) + "A";
-  for (const type of ["sent", "published", "established"]) {
+  for (const type of ["queued", "fetched", "acked", "cleared", "published"]) {
     assert.deepEqual(parse(JSON.stringify({ type, id: "m1", payload: {} })), {
       type,
       id: "m1",
       payload: {},
     });
   }
-  for (const sessions of [
-    [],
-    [sessionBundle()],
-    [sessionBundle(), sessionBundle({ epoch: 2 ** 31 - 1 })],
-    Array.from({ length: maxSessions }, () => sessionBundle()),
-  ]) {
-    const bundle = { identity, key: b64(32), signature: b64(64), sessions };
-    assert.deepEqual(
-      parse(JSON.stringify({ type: "key", id: "q1", payload: bundle })),
-      { type: "key", id: "q1", payload: bundle },
-    );
+  const bundle = { identity, key: b64(32), signature: b64(64) };
+  assert.deepEqual(
+    parse(JSON.stringify({ type: "key", id: "q1", payload: bundle })),
+    { type: "key", id: "q1", payload: bundle },
+  );
+  for (const size of [minMessageSize, 200, maxMessageSize]) {
+    const payload = delivery({ ciphertext: sealed(size) });
+    assert.deepEqual(parse(JSON.stringify({ type: "message", payload })), {
+      type: "message",
+      payload,
+    });
   }
-  const payload = delivery();
-  assert.deepEqual(parse(JSON.stringify({ type: "message", payload })), {
-    type: "message",
-    payload,
-  });
+  for (const status of ["delivered", "expired"]) {
+    const payload = { to: identity, id: createMessageId(), status };
+    assert.deepEqual(parse(JSON.stringify({ type: "receipt", payload })), {
+      type: "receipt",
+      payload,
+    });
+  }
   for (const code of [
     "recipient_unavailable",
     "message_too_large",
     "key_required",
     "duplicate_message",
-    "stale_session",
-    "session_limit",
+    "queue_full",
   ]) {
     assert.deepEqual(
       parse(JSON.stringify({ type: "error", id: "m1", payload: { code } })),
@@ -267,103 +252,84 @@ test("parses messaging replies, key bundles, and encrypted deliveries", () => {
   }
 });
 
-test("rejects malformed key bundles and deliveries", () => {
+test("rejects malformed key bundles, deliveries, and receipts", () => {
   const identity = "B".repeat(42) + "A";
-  const bundle = { identity, key: b64(32), signature: b64(64), sessions: [] };
-  const twin = sessionBundle();
-  const badEpochs = [-1, 0.5, 2 ** 31, "0", null, Number.MAX_SAFE_INTEGER + 2];
+  const bundle = { identity, key: b64(32), signature: b64(64) };
+  const receipt = { to: identity, id: createMessageId(), status: "delivered" };
   for (const message of [
     { type: "key", payload: bundle },
     { type: "key", id: "q1", payload: { ...bundle, key: b64(31) } },
     { type: "key", id: "q1", payload: { ...bundle, signature: b64(63) } },
     { type: "key", id: "q1", payload: { ...bundle, identity: "short" } },
     { type: "key", id: "q1", payload: { ...bundle, private: b64(32) } },
-    {
-      type: "key",
-      id: "q1",
-      payload: { identity, key: b64(32), signature: b64(64) },
-    },
-    { type: "key", id: "q1", payload: { ...bundle, sessions: null } },
-    {
-      type: "key",
-      id: "q1",
-      payload: { ...bundle, sessions: sessionBundle() },
-    },
-    { type: "key", id: "q1", payload: { ...bundle, sessions: [twin, twin] } },
-    {
-      type: "key",
-      id: "q1",
-      payload: {
-        ...bundle,
-        sessions: Array.from({ length: maxSessions + 1 }, () =>
-          sessionBundle(),
-        ),
-      },
-    },
-    ...[
-      { session: b64(15) },
-      { session: b64(16) + "=" },
-      { key: b64(31) },
-      { signature: "x" },
-      { private: b64(32) },
-      ...badEpochs.map((epoch) => ({ epoch })),
-    ].map((field) => ({
-      type: "key",
-      id: "q1",
-      payload: { ...bundle, sessions: [sessionBundle(field)] },
-    })),
+    { type: "key", id: "q1", payload: { ...bundle, sessions: [] } },
     { type: "published", payload: {} },
-    { type: "established", id: "k1", payload: { epoch: 1 } },
+    { type: "queued", id: "s1", payload: { delivered: true } },
+    { type: "sent", id: "s1", payload: {} },
+    { type: "established", id: "k1", payload: {} },
     { type: "message", id: "m1", payload: delivery() },
     { type: "message", payload: delivery({ body: "plaintext" }) },
-    {
-      type: "message",
-      payload: delivery({ salt: b64(32), iv: b64(12), ciphertext: b64(40) }),
-    },
-    { type: "message", payload: delivery({ id: "bad id" }) },
+    { type: "message", payload: delivery({ id: "m1" }) },
+    { type: "message", payload: delivery({ id: b64(15) }) },
+    { type: "message", payload: delivery({ id: b64(16) + "=" }) },
     { type: "message", payload: delivery({ from: "short" }) },
     { type: "message", payload: delivery({ key: b64(33) }) },
     { type: "message", payload: delivery({ signature: "x" }) },
-    { type: "message", payload: delivery({ sender: undefined }) },
-    { type: "message", payload: delivery({ envelope: undefined }) },
-    { type: "message", payload: delivery({ envelope: [envelope()] }) },
-    ...badEpochs.map((epoch) => ({
-      type: "message",
-      payload: delivery({}, { epoch }),
-    })),
-    ...badEpochs.map((epoch) => ({
-      type: "message",
-      payload: delivery({}, {}, { epoch }),
-    })),
-    { type: "message", payload: delivery({}, { session: b64(17) }) },
-    { type: "message", payload: delivery({}, { key: b64(31) }) },
-    { type: "message", payload: delivery({}, { extra: 1 }) },
-    { type: "message", payload: delivery({}, {}, { session: "" }) },
-    { type: "message", payload: delivery({}, {}, { salt: b64(31) }) },
-    { type: "message", payload: delivery({}, {}, { iv: b64(16) }) },
-    { type: "message", payload: delivery({}, {}, { iv: b64(12) + "=" }) },
-    { type: "message", payload: delivery({}, {}, { ciphertext: "" }) },
-    { type: "message", payload: delivery({}, {}, { ciphertext: b64(16) }) },
+    { type: "message", payload: delivery({ ciphertext: undefined }) },
+    { type: "message", payload: delivery({ ciphertext: 7 }) },
+    { type: "message", payload: delivery({ ciphertext: "" }) },
     {
       type: "message",
-      payload: delivery({}, {}, { ciphertext: b64(maxCiphertextSize + 1) }),
+      payload: delivery({ ciphertext: sealed(minMessageSize - 1) }),
     },
-    { type: "message", payload: delivery({}, {}, { ciphertext: 7 }) },
-    { type: "message", payload: delivery({}, {}, { body: "plaintext" }) },
+    {
+      type: "message",
+      payload: delivery({ ciphertext: sealed(maxMessageSize + 1) }),
+    },
+    { type: "message", payload: delivery({ ciphertext: sealed(120, 0) }) },
+    { type: "message", payload: delivery({ ciphertext: sealed(120, 2) }) },
+    { type: "message", payload: delivery({ ciphertext: sealed(120) + "=" }) },
+    { type: "message", payload: delivery({ envelope: {} }) },
+    { type: "message", payload: delivery({ status: "delivered" }) },
     { type: "message", payload: delivery(), extra: 1 },
+    { type: "receipt", id: "r1", payload: receipt },
+    { type: "receipt", payload: { ...receipt, status: "read" } },
+    { type: "receipt", payload: { ...receipt, status: "queued" } },
+    { type: "receipt", payload: { ...receipt, id: "m1" } },
+    { type: "receipt", payload: { ...receipt, to: "short" } },
+    { type: "receipt", payload: { ...receipt, from: identity } },
+    { type: "receipt", payload: { to: identity, id: receipt.id } },
   ]) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
   }
-  for (const ciphertext of [b64(17), b64(maxCiphertextSize)]) {
-    assert.ok(
-      parse(
-        JSON.stringify({
-          type: "message",
-          payload: delivery({}, {}, { ciphertext }),
-        }),
-      ),
-    );
+});
+
+test("message identifiers are 128-bit random and strictly validated", () => {
+  const ids = new Set(Array.from({ length: 2000 }, createMessageId));
+  assert.equal(ids.size, 2000);
+  for (const id of ids) {
+    assert.match(id, /^[A-Za-z0-9_-]{22}$/);
+    assert.equal(isMessageId(id), true);
   }
+  for (const bad of [
+    "",
+    "m1",
+    createId(),
+    b64(15),
+    b64(17),
+    b64(16) + "=",
+    b64(16).slice(0, 21) + "B",
+    "!".repeat(22),
+    null,
+    16,
+  ]) {
+    assert.equal(isMessageId(bad), false, String(bad));
+  }
+  assert.equal(isMessage(sealed(minMessageSize)), true);
+  assert.equal(isMessage(sealed(maxMessageSize)), true);
+  assert.equal(isMessage(sealed(maxMessageSize + 1)), false);
+  assert.equal(isMessage(sealed(minMessageSize - 1)), false);
+  assert.equal(isMessage(sealed(200, 0)), false);
 });
 
 test("validates message bodies like the server", () => {
@@ -581,5 +547,67 @@ test("rejects malformed prekey bundles and handshake messages", () => {
       null,
       JSON.stringify(message).slice(0, 120),
     );
+  }
+});
+
+test("fuzzed delivery and receipt frames parse only into valid queue messages", () => {
+  const identity = "B".repeat(42) + "A";
+  const bases = [
+    JSON.stringify({ type: "message", payload: delivery() }),
+    JSON.stringify({
+      type: "receipt",
+      payload: { to: identity, id: createMessageId(), status: "delivered" },
+    }),
+    JSON.stringify({ type: "queued", id: "s1", payload: {} }),
+  ];
+  let seed = 0x7a11;
+  const random = (n: number) => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    return (seed >>> 0) % n;
+  };
+  const alphabet = '{}[]":,0123456789abcdefABCDEF-_=null truefalse';
+  const iterations = Number(process.env.FUZZ_ITERATIONS ?? 20000);
+  for (let i = 0; i < iterations; i++) {
+    let text = bases[random(bases.length)];
+    for (let k = 0, n = 1 + random(4); k < n; k++) {
+      const at = random(text.length);
+      const op = random(3);
+      const ch = alphabet[random(alphabet.length)];
+      text =
+        op === 0
+          ? text.slice(0, at) + text.slice(at + 1)
+          : op === 1
+            ? text.slice(0, at) + ch + text.slice(at)
+            : text.slice(0, at) + ch + text.slice(at + 1);
+    }
+    const parsed = parse(text);
+    if (parsed?.type === "message") {
+      assert.ok(isMessageId(parsed.payload.id));
+      assert.ok(isMessage(parsed.payload.ciphertext));
+      assert.deepEqual(Object.keys(parsed.payload).sort(), [
+        "ciphertext",
+        "from",
+        "id",
+        "key",
+        "signature",
+      ]);
+    } else if (parsed?.type === "receipt") {
+      assert.ok(isMessageId(parsed.payload.id));
+      assert.ok(["delivered", "expired"].includes(parsed.payload.status));
+    } else if (parsed) {
+      assert.ok(
+        [
+          "queued",
+          "error",
+          "fetched",
+          "acked",
+          "cleared",
+          "published",
+        ].includes(parsed.type),
+        parsed.type,
+      );
+    }
   }
 });

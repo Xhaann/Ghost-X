@@ -1,4 +1,8 @@
-import { decodeBase64Url, decodeBase64UrlRange } from "./base64.ts";
+import {
+  decodeBase64Url,
+  decodeBase64UrlRange,
+  encodeBase64Url,
+} from "./base64.ts";
 import { isIdentity } from "./identity.ts";
 
 export type ErrorCode =
@@ -14,6 +18,7 @@ export type ErrorCode =
   | "stale_session"
   | "session_limit"
   | "pending_limit"
+  | "queue_full"
   | "internal_error";
 
 export type ClientMessage =
@@ -25,18 +30,12 @@ export type ClientMessage =
   | { type: "publish"; payload: { key: string; signature: string } }
   | { type: "key"; payload: { identity: string } }
   | {
-      type: "session";
-      payload: {
-        session: string;
-        epoch: number;
-        key: string;
-        signature: string;
-      };
-    }
-  | {
       type: "send";
-      payload: { to: string; epoch: number; envelopes: WireEnvelope[] };
+      payload: { to: string; id: string; ciphertext: string };
     }
+  | { type: "fetch"; payload: Record<string, never> }
+  | { type: "ack"; payload: { from: string; id: string } }
+  | { type: "clear"; payload: { to: string; id: string } }
   | {
       type: "prekeys";
       payload: { device: string; signed: WirePrekey; onetime: WirePrekey[] };
@@ -69,20 +68,7 @@ export type WireDeviceBundle = {
   onetime: WirePrekey | null;
 };
 
-export type WireSession = {
-  session: string;
-  epoch: number;
-  key: string;
-  signature: string;
-};
-
-export type WireEnvelope = {
-  session: string;
-  epoch: number;
-  salt: string;
-  iv: string;
-  ciphertext: string;
-};
+export type ReceiptStatus = "delivered" | "expired";
 
 export type ServerMessage =
   | {
@@ -94,9 +80,11 @@ export type ServerMessage =
   | { type: "authenticated"; id: string; payload: { identity: string } }
   | { type: "whoami"; id: string; payload: { identity: string } }
   | { type: "presence"; id: string; payload: Record<string, never> }
-  | { type: "sent"; id: string; payload: Record<string, never> }
-  | { type: "published"; id: string; payload: Record<string, never> }
-  | { type: "established"; id: string; payload: Record<string, never> }
+  | {
+      type: "queued" | "fetched" | "acked" | "cleared" | "published";
+      id: string;
+      payload: Record<string, never>;
+    }
   | { type: "initiated"; id: string; payload: Record<string, never> }
   | { type: "accepted"; id: string; payload: Record<string, never> }
   | { type: "prekeys"; id: string; payload: { available: number } }
@@ -136,12 +124,7 @@ export type ServerMessage =
   | {
       type: "key";
       id: string;
-      payload: {
-        identity: string;
-        key: string;
-        signature: string;
-        sessions: WireSession[];
-      };
+      payload: { identity: string; key: string; signature: string };
     }
   | {
       type: "message";
@@ -151,9 +134,13 @@ export type ServerMessage =
         from: string;
         key: string;
         signature: string;
-        sender: WireSession;
-        envelope: WireEnvelope;
+        ciphertext: string;
       };
+    }
+  | {
+      type: "receipt";
+      id?: undefined;
+      payload: { to: string; id: string; status: ReceiptStatus };
     }
   | {
       type: "present" | "absent";
@@ -170,16 +157,19 @@ export const signatureSize = 64;
 export const saltSize = 32;
 export const ivSize = 12;
 export const tagSize = 16;
-export const minCiphertextSize = 1 + tagSize;
-export const sessionIdSize = 16;
+export const minSealedSize = 1 + tagSize;
+export const maxSealedSize = maxBodySize + tagSize;
 export const maxEpoch = 2 ** 31 - 1;
-export const maxSessions = 4;
+export const maxDevices = 4;
 export const deviceIdSize = 16;
 export const confirmSize = 32;
 export const maxOnetimePublish = 100;
 export const ratchetHeaderSize = 1 + 16 + 32 + 4 + 4;
-export const maxCiphertextSize =
-  maxBodySize + ratchetHeaderSize + tagSize + tagSize;
+export const messageIdSize = 16;
+export const messageIdLength = 22;
+export const minMessageSize = ratchetHeaderSize + messageIdLength + 1 + tagSize;
+export const maxMessageSize =
+  ratchetHeaderSize + messageIdLength + maxBodySize + tagSize;
 
 const encoder = new TextEncoder();
 
@@ -209,6 +199,7 @@ const errorCodes: readonly string[] = [
   "stale_session",
   "session_limit",
   "pending_limit",
+  "queue_full",
   "internal_error",
 ];
 
@@ -240,25 +231,6 @@ export function isEpoch(value: unknown): value is number {
   );
 }
 
-function parseSession(value: unknown): WireSession | null {
-  if (
-    isObject(value) &&
-    hasOnly(value, ["session", "epoch", "key", "signature"]) &&
-    isFixed(value.session, sessionIdSize) &&
-    isEpoch(value.epoch) &&
-    isFixed(value.key, exchangeKeySize) &&
-    isFixed(value.signature, signatureSize)
-  ) {
-    return {
-      session: value.session,
-      epoch: value.epoch,
-      key: value.key,
-      signature: value.signature,
-    };
-  }
-  return null;
-}
-
 function parsePrekey(value: unknown): WirePrekey | null {
   if (
     isObject(value) &&
@@ -288,38 +260,25 @@ function parseDeviceBundle(value: unknown): WireDeviceBundle | null {
   return { device: value.device, signed, onetime };
 }
 
-function parseEnvelope(value: unknown): WireEnvelope | null {
-  if (
-    isObject(value) &&
-    hasOnly(value, ["session", "epoch", "salt", "iv", "ciphertext"]) &&
-    isFixed(value.session, sessionIdSize) &&
-    isEpoch(value.epoch) &&
-    isFixed(value.salt, saltSize) &&
-    isFixed(value.iv, ivSize) &&
-    typeof value.ciphertext === "string" &&
-    decodeBase64UrlRange(
-      value.ciphertext,
-      minCiphertextSize,
-      maxCiphertextSize,
-    ) !== null
-  ) {
-    return {
-      session: value.session,
-      epoch: value.epoch,
-      salt: value.salt,
-      iv: value.iv,
-      ciphertext: value.ciphertext,
-    };
-  }
-  return null;
-}
-
 export function isFixed(value: unknown, size: number): value is string {
   return decodeBase64Url(value, size) !== null;
 }
 
 export function isValidId(value: unknown): value is string {
   return typeof value === "string" && idPattern.test(value);
+}
+
+export function isMessageId(value: unknown): value is string {
+  return isFixed(value, messageIdSize);
+}
+
+export function createMessageId(): string {
+  return encodeBase64Url(crypto.getRandomValues(new Uint8Array(messageIdSize)));
+}
+
+export function isMessage(value: unknown): value is string {
+  const bytes = decodeBase64UrlRange(value, minMessageSize, maxMessageSize);
+  return bytes !== null && bytes[0] === 1;
 }
 
 export function createId(): string {
@@ -401,18 +360,13 @@ export function parse(data: unknown): ServerMessage | null {
     return null;
   }
 
-  if (type === "sent") {
-    if (
-      hasOnly(value, ["type", "id", "payload"]) &&
-      isValidId(id) &&
-      hasOnly(payload, [])
-    ) {
-      return { type, id, payload: {} };
-    }
-    return null;
-  }
-
-  if (type === "published" || type === "established") {
+  if (
+    type === "queued" ||
+    type === "fetched" ||
+    type === "acked" ||
+    type === "cleared" ||
+    type === "published"
+  ) {
     if (
       hasOnly(value, ["type", "id", "payload"]) &&
       isValidId(id) &&
@@ -427,20 +381,11 @@ export function parse(data: unknown): ServerMessage | null {
     if (
       hasOnly(value, ["type", "id", "payload"]) &&
       isValidId(id) &&
-      hasOnly(payload, ["identity", "key", "signature", "sessions"]) &&
+      hasOnly(payload, ["identity", "key", "signature"]) &&
       isIdentity(payload.identity) &&
       isFixed(payload.key, exchangeKeySize) &&
-      isFixed(payload.signature, signatureSize) &&
-      Array.isArray(payload.sessions) &&
-      payload.sessions.length <= maxSessions
+      isFixed(payload.signature, signatureSize)
     ) {
-      const sessions = payload.sessions.map(parseSession);
-      if (
-        sessions.some((s) => s === null) ||
-        new Set(sessions.map((s) => s?.session)).size !== sessions.length
-      ) {
-        return null;
-      }
       return {
         type,
         id,
@@ -448,7 +393,6 @@ export function parse(data: unknown): ServerMessage | null {
           identity: payload.identity,
           key: payload.key,
           signature: payload.signature,
-          sessions: sessions as WireSession[],
         },
       };
     }
@@ -458,24 +402,13 @@ export function parse(data: unknown): ServerMessage | null {
   if (type === "message") {
     if (
       hasOnly(value, ["type", "payload"]) &&
-      hasOnly(payload, [
-        "id",
-        "from",
-        "key",
-        "signature",
-        "sender",
-        "envelope",
-      ]) &&
-      isValidId(payload.id) &&
+      hasOnly(payload, ["id", "from", "key", "signature", "ciphertext"]) &&
+      isMessageId(payload.id) &&
       isIdentity(payload.from) &&
       isFixed(payload.key, exchangeKeySize) &&
-      isFixed(payload.signature, signatureSize)
+      isFixed(payload.signature, signatureSize) &&
+      isMessage(payload.ciphertext)
     ) {
-      const sender = parseSession(payload.sender);
-      const envelope = parseEnvelope(payload.envelope);
-      if (!sender || !envelope) {
-        return null;
-      }
       return {
         type,
         payload: {
@@ -483,9 +416,24 @@ export function parse(data: unknown): ServerMessage | null {
           from: payload.from,
           key: payload.key,
           signature: payload.signature,
-          sender,
-          envelope,
+          ciphertext: payload.ciphertext,
         },
+      };
+    }
+    return null;
+  }
+
+  if (type === "receipt") {
+    if (
+      hasOnly(value, ["type", "payload"]) &&
+      hasOnly(payload, ["to", "id", "status"]) &&
+      isIdentity(payload.to) &&
+      isMessageId(payload.id) &&
+      (payload.status === "delivered" || payload.status === "expired")
+    ) {
+      return {
+        type,
+        payload: { to: payload.to, id: payload.id, status: payload.status },
       };
     }
     return null;
@@ -533,7 +481,7 @@ export function parse(data: unknown): ServerMessage | null {
       isFixed(payload.signature, signatureSize) &&
       Array.isArray(payload.bundles) &&
       payload.bundles.length >= 1 &&
-      payload.bundles.length <= maxSessions
+      payload.bundles.length <= maxDevices
     ) {
       const bundles = payload.bundles.map(parseDeviceBundle);
       if (

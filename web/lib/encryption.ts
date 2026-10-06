@@ -8,8 +8,8 @@ import { type IdentityKey, parseIdentity, verify } from "./identity.ts";
 import {
   exchangeKeySize,
   ivSize,
-  maxCiphertextSize,
-  minCiphertextSize,
+  maxSealedSize,
+  minSealedSize,
   saltSize,
 } from "./protocol.ts";
 
@@ -244,8 +244,8 @@ export class ExchangeKey {
       const iv = decodeBase64Url(sealed.iv, ivSize);
       const ciphertext = decodeBase64UrlRange(
         sealed.ciphertext,
-        minCiphertextSize,
-        maxCiphertextSize,
+        minSealedSize,
+        maxSealedSize,
       );
       const additionalData = associatedData(parties);
       if (!salt || !iv || !ciphertext || !additionalData) {

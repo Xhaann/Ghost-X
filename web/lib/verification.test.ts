@@ -3,7 +3,6 @@ import { test } from "node:test";
 import { Conversations } from "./conversations.ts";
 import { ExchangeKey } from "./encryption.ts";
 import { fingerprint } from "./fingerprint.ts";
-import type { MessengerOptions } from "./messenger.ts";
 import {
   freePort,
   memoryStore,
@@ -28,12 +27,8 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
   }
 }
 
-async function device(
-  port: number,
-  store: Store,
-  options: MessengerOptions = {},
-) {
-  const secure = await secureDevice(port, { store, messenger: options });
+async function device(port: number, store: Store) {
+  const secure = await secureDevice(port, { store, inbox: false });
   const { restored } = await secure.history.restore();
   const conversations = new Conversations(secure.messenger, secure.id, {
     history: secure.history,
@@ -110,7 +105,7 @@ test("verify, detect a key change, and re-verify with a real server", async () =
   const first = a.conversations.send("verified hello");
   assert.ok(first.accepted);
   if (first.accepted) {
-    assert.equal(await first.delivery, "delivered");
+    assert.equal(await first.delivery, "queued");
   }
   await until(() => thread(b.conversations, idA).length === 1, "b receives");
   assert.deepEqual(thread(b.conversations, idA), ["verified hello"]);
@@ -181,7 +176,7 @@ test("verify, detect a key change, and re-verify with a real server", async () =
   const after = a.conversations.send("after re-verification");
   assert.ok(after.accepted);
   if (after.accepted) {
-    assert.equal(await after.delivery, "delivered");
+    assert.equal(await after.delivery, "queued");
   }
   await until(() => thread(b.conversations, idA).length === 1, "b2 receives");
 
@@ -254,13 +249,12 @@ test("another client's verification never changes local trust", async () => {
   );
 });
 
-test("verification survives ephemeral rotation and fresh sessions but not a key change", async () => {
+test("verification survives ratchet advancement and reconnects but not a key change", async () => {
   const port = await freePort();
   await startServer(port);
   const a = await device(port, memoryStore());
   const bStore = await identityStore();
-  const options = { rotationLimit: 2, previousLimit: 1 };
-  let b = await device(port, bStore, options);
+  let b = await device(port, bStore);
   const bKeys = b.keys;
   const idA = a.keys.identity.identity;
   const idB = bKeys.identity.identity;
@@ -270,40 +264,27 @@ test("verification survives ephemeral rotation and fresh sessions but not a key 
 
   b.conversations.open(idA);
   for (let i = 0; i < 8; i++) {
-    const attempt = b.conversations.send(`rotating ${i}`);
+    const attempt = b.conversations.send(`advancing ${i}`);
     assert.ok(attempt.accepted);
     if (attempt.accepted) {
-      assert.equal(await attempt.delivery, "delivered");
+      assert.equal(await attempt.delivery, "queued");
     }
     await until(() => thread(a.conversations, idB).length === i + 1, `rx ${i}`);
     assert.equal(a.trust.view(idB).state, "verified");
   }
-  const offers = b.frames
-    .map((f) => JSON.parse(f))
-    .filter((f) => f.type === "session")
-    .map((f) => f.payload);
-  assert.ok(offers.length >= 4);
-  assert.equal(new Set(offers.map((o) => o.key)).size, offers.length);
-  assert.ok(offers.every((o) => o.session === offers[0].session));
-
-  const firstSession = offers[0].session;
+  const sessionBefore = a.pairs.id(idB);
   await b.shutdown();
-  b = await device(port, bStore, options);
-  const fresh = b.frames
-    .map((f) => JSON.parse(f))
-    .filter((f) => f.type === "session")
-    .map((f) => f.payload);
-  assert.notEqual(fresh[0].session, firstSession);
-  assert.equal(fresh[0].epoch, 0);
+  b = await device(port, bStore);
   b.conversations.open(idA);
-  const again = b.conversations.send("fresh session");
+  const again = b.conversations.send("after reconnect");
   assert.ok(again.accepted);
-  await until(() => thread(a.conversations, idB).length === 9, "fresh rx");
+  await until(() => thread(a.conversations, idB).length === 9, "reconnect rx");
+  assert.equal(a.pairs.id(idB), sessionBefore);
   await a.messenger.lookup(idB);
   assert.equal(a.trust.view(idB).state, "verified");
 
   await b.shutdown();
-  b = await device(port, await withNewKey(bStore), options);
+  b = await device(port, await withNewKey(bStore));
   const changed = b.keys;
   await a.messenger.lookup(idB);
   await until(() => a.trust.view(idB).state === "changed", "changed");
@@ -333,14 +314,14 @@ test("ratchet key changes and session resets never alter verification; real key 
         ok: true,
       });
       await until(
-        () => b.inbox.some((m) => m.body === `${label} a${i}`),
+        () => thread(b.conversations, a.id).includes(`${label} a${i}`),
         `b rx ${label}`,
       );
       assert.deepEqual(await b.messenger.send(a.id, `${label} b${i}`), {
         ok: true,
       });
       await until(
-        () => a.inbox.some((m) => m.body === `${label} b${i}`),
+        () => thread(a.conversations, idB).includes(`${label} b${i}`),
         "a rx",
       );
     }
@@ -361,8 +342,10 @@ test("ratchet key changes and session resets never alter verification; real key 
   assert.deepEqual(await a.messenger.send(idB, "lost before recovery"), {
     ok: true,
   });
-  await until(() => b.inbox.length === 1, "undecryptable arrives");
-  assert.equal(b.inbox[0].body, null);
+  await until(
+    () => thread(b.conversations, a.id).includes(null),
+    "undecryptable arrives",
+  );
   await until(
     () =>
       a.pairs.state(idB) === "established" && a.pairs.id(idB) !== sessionBefore,
@@ -378,7 +361,7 @@ test("ratchet key changes and session resets never alter verification; real key 
     ok: true,
   });
   await until(
-    () => a.inbox.some((m) => m.body === "new long-term key hello"),
+    () => thread(a.conversations, idB).includes("new long-term key hello"),
     "a rx from new key",
   );
   await exchange(1, "new long-term key");

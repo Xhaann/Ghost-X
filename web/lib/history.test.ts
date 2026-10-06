@@ -18,7 +18,12 @@ import {
   parseRecord,
 } from "./history.ts";
 import { Listeners } from "./listeners.ts";
-import type { Incoming, MessengerState, SendResult } from "./messenger.ts";
+import type {
+  MessengerState,
+  Receipt,
+  Receiver,
+  SendResult,
+} from "./messenger.ts";
 import { maxBodySize } from "./protocol.ts";
 import {
   type LegacyParty,
@@ -116,10 +121,12 @@ async function identity(): Promise<string> {
   return (await party()).keys.identity.identity;
 }
 
+type Incoming = { id: string; from: string; body: string | null };
+
 class Source implements MessageSource {
   state: MessengerState = { active: true };
   readonly states = new Listeners<MessengerState>();
-  readonly messages = new Listeners<Incoming>();
+  receiver: Receiver | null = null;
   readonly pending: { id: string; resolve: (result: SendResult) => void }[] =
     [];
 
@@ -127,12 +134,33 @@ class Source implements MessageSource {
     return this.states.add(listener);
   }
 
-  onMessage(listener: (message: Incoming) => void) {
-    return this.messages.add(listener);
+  receive(receiver: Receiver) {
+    this.receiver = receiver;
+    return () => {
+      this.receiver = null;
+    };
   }
 
   send(_to: string, _body: string, id: string): Promise<SendResult> {
     return new Promise((resolve) => this.pending.push({ id, resolve }));
+  }
+
+  async deliver(message: Incoming): Promise<boolean> {
+    if (!this.receiver) {
+      return false;
+    }
+    if (message.body === null) {
+      this.receiver.reject(message);
+      return true;
+    }
+    if (this.receiver.has(message.from, message.id)) {
+      return true;
+    }
+    return this.receiver.accept({ ...message, body: message.body });
+  }
+
+  async receipt(receipt: Receipt): Promise<boolean> {
+    return this.receiver ? this.receiver.settle(receipt) : false;
   }
 }
 
@@ -397,13 +425,13 @@ test("restores conversations, ordering, unread, and settled delivery state", asy
   store.start();
 
   const deliver = (from: string, id: string, body: string) =>
-    source.messages.emit({ id, from, body });
-  deliver(peerA, "a1", "from a one");
-  deliver(peerC, "c1", "from c one");
+    source.deliver({ id, from, body });
+  await deliver(peerA, "a1", "from a one");
+  await deliver(peerC, "c1", "from c one");
   store.open(peerA);
-  deliver(peerA, "a2", "from a two while active");
+  await deliver(peerA, "a2", "from a two while active");
   for (const [body, result] of [
-    ["to a delivered", { ok: true }],
+    ["to a queued", { ok: true }],
     ["to a unavailable", { ok: false, reason: "recipient_unavailable" }],
     ["to a failed", { ok: false, reason: "internal_error" }],
   ] as [string, SendResult][]) {
@@ -415,13 +443,13 @@ test("restores conversations, ordering, unread, and settled delivery state", asy
     }
   }
   assert.equal(store.send("still sending at reload").accepted, true);
-  deliver(peerC, "c2", "from c two");
+  await deliver(peerC, "c2", "from c two");
   await first.flush();
   assertNoPlaintext(b.store, [
     "from a one",
     "from c one",
     "from a two while active",
-    "to a delivered",
+    "to a queued",
     "to a unavailable",
     "to a failed",
     "still sending at reload",
@@ -453,7 +481,7 @@ test("restores conversations, ordering, unread, and settled delivery state", asy
     [
       "received:from a one",
       "received:from a two while active",
-      "sent:delivered:to a delivered",
+      "sent:queued:to a queued",
       "sent:unavailable:to a unavailable",
       "sent:failed:to a failed",
     ],
@@ -489,7 +517,7 @@ test("live duplicates of restored messages are ignored", async () => {
   });
   store.start();
   const writes = b.store.writes;
-  source.messages.emit({ id: "m1", from: a, body: "first secret" });
+  await source.deliver({ id: "m1", from: a, body: "first secret" });
   await h.flush();
   assert.equal(b.store.writes, writes);
   assert.deepEqual(summary(store.state.conversations[0].messages), [
@@ -497,7 +525,7 @@ test("live duplicates of restored messages are ignored", async () => {
     "r1:sent:delivered:reply secret",
     "m2:received:second secret",
   ]);
-  source.messages.emit({ id: "m3", from: a, body: "third secret" });
+  await source.deliver({ id: "m3", from: a, body: "third secret" });
   await h.flush();
   const next = await (await open(await reload(b))).restore();
   assert.deepEqual(
@@ -520,7 +548,7 @@ test("undecryptable live messages are never persisted", async () => {
     history: h,
   });
   store.start();
-  source.messages.emit({ id: "x1", from: a, body: null });
+  await source.deliver({ id: "x1", from: a, body: null });
   await h.flush();
   assert.equal(records(b.store).length, 0);
   assert.equal(store.state.conversations[0].messages[0].body, null);
