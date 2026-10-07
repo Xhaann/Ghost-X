@@ -102,6 +102,7 @@ test("establishes a session with an offline recipient that completes on reconnec
   assert.deepEqual(await a.messenger.send(idB, "after async setup"), {
     ok: true,
     devices: 1,
+    pending: 0,
   });
 
   for (const frame of [...a.frames, ...b.frames]) {

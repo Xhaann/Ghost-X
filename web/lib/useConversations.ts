@@ -98,6 +98,7 @@ export function useConversations(
           keys.identity,
           pairing,
           rosters,
+          session.outbox,
         );
         const conversations = new Conversations(messenger, keys.identity, {
           history,

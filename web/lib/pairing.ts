@@ -46,11 +46,13 @@ export type OpenResult =
 export type Establishment = {
   result: InitiateResult;
   devices: string[];
+  pending: string[];
 };
 
 export interface Channel {
   establish(peer: string): Promise<Establishment>;
   initiate(peer: string, device?: string): Promise<InitiateResult>;
+  state(peer: string, device: string): PairState;
   onChange(listener: (address: string) => void): () => void;
   seal(
     peer: string,
@@ -241,17 +243,28 @@ export class Pairing implements Channel {
   async establish(peer: string): Promise<Establishment> {
     const roster = await this.#rosters.fetch(peer);
     if (!roster) {
-      return { result: "unavailable", devices: [] };
+      return { result: "unavailable", devices: [], pending: [] };
     }
-    const ready = this.established(peer);
-    const missing = roster.devices.some(
-      (d) => this.#pairs.state(pairAddress(peer, d.id)) === "none",
-    );
-    if (ready.length > 0) {
-      if (missing) {
+    const outcome = (result: InitiateResult): Establishment => {
+      const devices = this.established(peer);
+      const pending = (this.#rosters.cached(peer) ?? roster).devices
+        .map((d) => d.id)
+        .filter((id) => !devices.includes(id));
+      return {
+        result: devices.length > 0 ? "established" : result,
+        devices,
+        pending,
+      };
+    };
+    if (this.established(peer).length > 0) {
+      if (
+        roster.devices.some(
+          (d) => this.#pairs.state(pairAddress(peer, d.id)) === "none",
+        )
+      ) {
         void this.initiate(peer);
       }
-      return { result: "established", devices: ready };
+      return outcome("established");
     }
     const established = new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
@@ -272,13 +285,12 @@ export class Pairing implements Channel {
     });
     const result = await this.#initiate(peer, null, true);
     if (result !== "pending" && result !== "established") {
-      return { result, devices: [] };
+      return { result, devices: [], pending: [] };
     }
-    if (result === "pending" && !(await established)) {
-      return { result: "pending", devices: [] };
+    if (result === "pending") {
+      await established;
     }
-    const devices = this.established(peer);
-    return { result: devices.length > 0 ? "established" : "pending", devices };
+    return outcome("pending");
   }
 
   async seal(
@@ -401,7 +413,20 @@ export class Pairing implements Channel {
       if (!bundle) {
         continue;
       }
-      const result = await this.#start(peer, entry, bundle);
+      const address = pairAddress(peer, entry.id);
+      const result = await this.#serial(() => {
+        const state = this.#pairs.state(address);
+        const replaceable =
+          state === "pending" &&
+          replace &&
+          device === null &&
+          this.established(peer).length === 0;
+        return state === "none" || replaceable
+          ? this.#start(peer, entry, bundle)
+          : Promise.resolve<InitiateResult>(
+              state === "established" ? "established" : "pending",
+            );
+      }).catch((): InitiateResult => "failed");
       if (
         result === "established" ||
         (result === "pending" && outcome !== "established")
@@ -484,7 +509,16 @@ export class Pairing implements Channel {
   }
 
   #enqueue(task: () => Promise<void>): void {
-    this.#queue = this.#queue.then(task).catch(() => {});
+    void this.#serial(task).catch(() => {});
+  }
+
+  #serial<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(task);
+    this.#queue = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
   }
 
   async #respond(initiation: Initiation): Promise<void> {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Devices } from "./devices.ts";
 import { History } from "./history.ts";
+import { Outbox } from "./outbox.ts";
 import { Pairs } from "./pairs.ts";
 import { PrekeyStore } from "./prekeys.ts";
 import { openIndexedStore } from "./storage.ts";
@@ -20,6 +21,7 @@ export type LocalSession = {
   trust: Trust;
   prekeys: PrekeyStore | null;
   pairs: Pairs;
+  outbox: Outbox;
   created: boolean;
 };
 
@@ -80,13 +82,20 @@ export function useIdentity(): {
         }
         return;
       }
-      const [history, trust, prekeys, pairs, devices] = await Promise.all([
-        History.open(store, vault.keys, vault.integrity, vault.storage),
-        Trust.open(store, vault.integrity),
-        PrekeyStore.open(store, vault.keys, vault.integrity),
-        Pairs.open(store, vault.integrity, vault.storage, vault.keys.identity),
-        Devices.open(store, vault.keys),
-      ]);
+      const [history, trust, prekeys, pairs, devices, outbox] =
+        await Promise.all([
+          History.open(store, vault.keys, vault.integrity, vault.storage),
+          Trust.open(store, vault.integrity),
+          PrekeyStore.open(store, vault.keys, vault.integrity),
+          Pairs.open(
+            store,
+            vault.integrity,
+            vault.storage,
+            vault.keys.identity,
+          ),
+          Devices.open(store, vault.keys),
+          Outbox.open(store, vault.storage),
+        ]);
       if (!devices) {
         if (active) {
           setLocal({ status: "corrupted" });
@@ -100,6 +109,7 @@ export function useIdentity(): {
         trust,
         prekeys,
         pairs,
+        outbox,
         created: vault.created,
       };
       if (active) {

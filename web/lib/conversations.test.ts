@@ -299,8 +299,8 @@ test("orders messages deterministically by arrival", async () => {
   const first = accepted(store, "1");
   await source.deliver({ id: "r", from: b, body: "2" });
   const third = accepted(store, "3");
-  source.sent[1].resolve({ ok: true, devices: 1 });
-  source.sent[0].resolve({ ok: true, devices: 1 });
+  source.sent[1].resolve({ ok: true, devices: 1, pending: 0 });
+  source.sent[0].resolve({ ok: true, devices: 1, pending: 0 });
   await Promise.all([first.delivery, third.delivery]);
 
   const messages = conversation(store, b)?.messages ?? [];
@@ -323,7 +323,7 @@ test("server acceptance is queued and only a receipt marks a message delivered",
   const second = accepted(store, "second");
   const third = accepted(store, "third");
 
-  source.sent[1].resolve({ ok: true, devices: 1 });
+  source.sent[1].resolve({ ok: true, devices: 1, pending: 0 });
   assert.equal(await second.delivery, "queued");
 
   const delivery = () =>
@@ -362,7 +362,7 @@ test("server acceptance is queued and only a receipt marks a message delivered",
     id: third.id,
     status: "delivered",
   });
-  source.sent[2].resolve({ ok: true, devices: 1 });
+  source.sent[2].resolve({ ok: true, devices: 1, pending: 0 });
   assert.equal(await third.delivery, "delivered");
 
   source.sent[0].resolve({ ok: false, reason: "recipient_unavailable" });
@@ -381,7 +381,7 @@ test("an expiry receipt marks a queued message not delivered", async () => {
   const { store, source, b } = await setup();
   store.open(b);
   const attempt = accepted(store, "late");
-  source.sent[0].resolve({ ok: true, devices: 1 });
+  source.sent[0].resolve({ ok: true, devices: 1, pending: 0 });
   assert.equal(await attempt.delivery, "queued");
   await source.receipt({
     to: b,
@@ -408,7 +408,7 @@ test("maps other failures to failed without touching other messages", async () =
   const attempts = results.map((_, i) => accepted(store, `b${i}`));
   results.forEach((result, i) => source.sent[i + 1].resolve(result));
   await Promise.all(attempts.map((a) => a.delivery));
-  source.sent[0].resolve({ ok: true, devices: 1 });
+  source.sent[0].resolve({ ok: true, devices: 1, pending: 0 });
   await toC.delivery;
 
   const states = (id: string) =>
@@ -491,7 +491,7 @@ test("ignores results that settle after stop", async () => {
 
   store.stop();
   const emitted = log.length;
-  source.sent[0].resolve({ ok: true, devices: 1 });
+  source.sent[0].resolve({ ok: true, devices: 1, pending: 0 });
   assert.equal(await attempt.delivery, "queued");
 
   assert.equal(log.length, emitted);
@@ -512,7 +512,7 @@ test("ignores results from before a restart of the same store", async () => {
   store.open(b);
   const emitted = log.length;
   const snapshot = store.state;
-  source.sent[0].resolve({ ok: true, devices: 1 });
+  source.sent[0].resolve({ ok: true, devices: 1, pending: 0 });
   await attempt.delivery;
 
   assert.equal(log.length, emitted);

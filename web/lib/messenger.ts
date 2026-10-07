@@ -2,7 +2,9 @@ import { decodeBase64UrlRange, encodeBase64Url } from "./base64.ts";
 import type { Client } from "./client.ts";
 import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
+import { type Path, type Outbox, outboxLifetime } from "./outbox.ts";
 import type { Channel } from "./pairing.ts";
+import { pairAddress, splitAddress } from "./pairs.ts";
 import type { AuthSource } from "./presence.ts";
 import {
   type ErrorCode,
@@ -20,7 +22,7 @@ import {
 import type { Rosters } from "./rosters.ts";
 
 export type SendResult =
-  | { ok: true; devices: number }
+  | { ok: true; devices: number; pending: number }
   | {
       ok: false;
       reason: ErrorCode | "not_sent" | "encryption_failed" | "session_pending";
@@ -52,6 +54,10 @@ export class Messenger {
   readonly #self: string;
   readonly #channel: Channel;
   readonly #rosters: Rosters;
+  readonly #outbox: Outbox;
+  readonly #now: () => number;
+  readonly #flushing = new Map<string, Promise<void>>();
+  readonly #ready = new Set<string>();
   readonly #states = new Listeners<MessengerState>();
   readonly #deferred = new Map<string, Delivery[]>();
   #receiver: Receiver | null = null;
@@ -66,12 +72,16 @@ export class Messenger {
     self: string,
     channel: Channel,
     rosters: Rosters,
+    outbox: Outbox,
+    now: () => number = Date.now,
   ) {
     this.#client = client;
     this.#auth = auth;
     this.#self = self;
     this.#channel = channel;
     this.#rosters = rosters;
+    this.#outbox = outbox;
+    this.#now = now;
   }
 
   get state(): MessengerState {
@@ -114,7 +124,30 @@ export class Messenger {
           this.#deactivate();
         }
       }),
-      this.#channel.onChange((address) => this.#resume(address)),
+      this.#channel.onChange((address) => {
+        this.#resume(address);
+        const target = splitAddress(address);
+        if (!target) {
+          return;
+        }
+        if (this.#channel.state(target.peer, target.device) !== "established") {
+          this.#ready.delete(address);
+        } else if (!this.#ready.has(address)) {
+          this.#ready.add(address);
+          void this.#flush(target.peer, target.device);
+        }
+      }),
+      this.#rosters.onUpdate((roster) => {
+        void this.#outbox.remove(
+          this.#outbox
+            .paths()
+            .filter(
+              (p) =>
+                p.peer === roster.identity &&
+                !roster.devices.some((d) => d.id === p.device),
+            ),
+        );
+      }),
     ];
     this.#detach = () => detach.forEach((release) => release());
     if (this.#auth.state === "authenticated") {
@@ -157,24 +190,50 @@ export class Messenger {
     if (session.result === "unavailable") {
       return { ok: false, reason: "recipient_unavailable" };
     }
-    if (session.devices.length === 0) {
+    if (session.devices.length === 0 && session.pending.length === 0) {
       return { ok: false, reason: "session_pending" };
+    }
+    if (!this.#outbox.fits(session.pending.length)) {
+      return { ok: false, reason: "queue_full" };
     }
     if (generation !== this.#generation) {
       return { ok: false, reason: "not_sent" };
     }
+    const deferred: Path[] = session.pending.map((device) => ({
+      peer: to,
+      device,
+      id,
+    }));
+    if (!(await this.#outbox.add(deferred, body, this.#now()))) {
+      return { ok: false, reason: "not_sent" };
+    }
+    for (const device of session.pending) {
+      if (this.#channel.state(to, device) === "established") {
+        void this.#flush(to, device);
+      }
+    }
+    if (session.devices.length === 0) {
+      return { ok: true, devices: 0, pending: deferred.length };
+    }
     const envelopes: WireEnvelope[] = [];
     for (const device of session.devices) {
+      await this.#flush(to, device);
       const sealed = await this.#channel.seal(to, device, id, body);
       if (sealed) {
         envelopes.push({ device, ciphertext: encodeBase64Url(sealed) });
       }
     }
+    const failed = async (
+      reason: Extract<SendResult, { ok: false }>["reason"],
+    ): Promise<SendResult> => {
+      await this.#outbox.remove(deferred);
+      return { ok: false, reason };
+    };
     if (envelopes.length === 0) {
-      return { ok: false, reason: "encryption_failed" };
+      return failed("encryption_failed");
     }
     if (generation !== this.#generation) {
-      return { ok: false, reason: "not_sent" };
+      return failed("not_sent");
     }
     let delivered = envelopes;
     let reply = await this.#client.request({
@@ -187,7 +246,7 @@ export class Messenger {
         roster?.devices.some((d) => d.id === e.device),
       );
       if (delivered.length === 0 || delivered.length === envelopes.length) {
-        return { ok: false, reason: "stale_devices" };
+        return failed("stale_devices");
       }
       reply = await this.#client.request({
         type: "send",
@@ -195,12 +254,108 @@ export class Messenger {
       });
     }
     if (reply?.type === "queued") {
-      return { ok: true, devices: delivered.length };
+      return { ok: true, devices: delivered.length, pending: deferred.length };
     }
     if (reply?.type === "error") {
-      return { ok: false, reason: reply.payload.code };
+      return failed(reply.payload.code);
     }
-    return { ok: false, reason: "not_sent" };
+    return failed("not_sent");
+  }
+
+  #flush(peer: string, device: string): Promise<void> {
+    const address = pairAddress(peer, device);
+    const run = (this.#flushing.get(address) ?? Promise.resolve())
+      .then(() => this.#drain(peer, device))
+      .catch(() => {});
+    this.#flushing.set(address, run);
+    void run.then(() => {
+      if (this.#flushing.get(address) === run) {
+        this.#flushing.delete(address);
+      }
+    });
+    return run;
+  }
+
+  async #drain(peer: string, device: string): Promise<void> {
+    const generation = this.#generation;
+    if (
+      !this.#state.active ||
+      this.#channel.state(peer, device) !== "established"
+    ) {
+      return;
+    }
+    for (const pending of await this.#outbox.take(peer, device)) {
+      if (generation !== this.#generation) {
+        return;
+      }
+      if (this.#now() - pending.created >= outboxLifetime) {
+        await this.#expire([pending]);
+        continue;
+      }
+      const sealed = await this.#channel.seal(
+        peer,
+        device,
+        pending.id,
+        pending.body,
+      );
+      if (!sealed) {
+        return;
+      }
+      const reply = await this.#client.request({
+        type: "send",
+        payload: {
+          to: peer,
+          id: pending.id,
+          envelopes: [{ device, ciphertext: encodeBase64Url(sealed) }],
+        },
+      });
+      const code = reply?.type === "error" ? reply.payload.code : null;
+      if (
+        reply?.type === "queued" ||
+        code === "duplicate_message" ||
+        code === "stale_devices"
+      ) {
+        await this.#outbox.remove([pending]);
+      } else if (
+        code === "invalid_payload" ||
+        code === "recipient_unavailable" ||
+        code === "message_too_large"
+      ) {
+        await this.#expire([pending]);
+      } else {
+        return;
+      }
+    }
+  }
+
+  async #expire(paths: readonly Path[]): Promise<void> {
+    await this.#outbox.remove(paths);
+    for (const path of paths) {
+      await this.#receiver?.settle({
+        to: path.peer,
+        device: path.device,
+        id: path.id,
+        status: "expired",
+      });
+    }
+  }
+
+  #retry(): void {
+    const now = this.#now();
+    const paths = this.#outbox.paths();
+    void this.#expire(paths.filter((p) => now - p.created >= outboxLifetime));
+    for (const address of this.#outbox.addresses()) {
+      const target = splitAddress(address);
+      if (!target) {
+        continue;
+      }
+      const state = this.#channel.state(target.peer, target.device);
+      if (state === "established") {
+        void this.#flush(target.peer, target.device);
+      } else if (state === "none") {
+        void this.#channel.initiate(target.peer, target.device);
+      }
+    }
   }
 
   #activate(): void {
@@ -210,6 +365,7 @@ export class Messenger {
     if (this.#receiver) {
       void this.#fetch(generation);
     }
+    this.#retry();
   }
 
   async #fetch(generation: number): Promise<void> {

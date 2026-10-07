@@ -26,6 +26,7 @@ import {
   type Receipt,
   type Receiver,
 } from "./messenger.ts";
+import { Outbox } from "./outbox.ts";
 import { Pairing } from "./pairing.ts";
 import { Pairs } from "./pairs.ts";
 import { PrekeyStore } from "./prekeys.ts";
@@ -379,6 +380,7 @@ export async function secureDevice(
     drop?: string[];
     inbox?: boolean;
     link?: string;
+    now?: () => number;
   } = {},
 ) {
   const store = options.store ?? memoryStore();
@@ -392,11 +394,12 @@ export async function secureDevice(
   const { keys, integrity, storage } = vault as Unlocked;
   const prekeys = await PrekeyStore.open(store, keys, integrity);
   assert.ok(prekeys);
-  const [pairs, trust, history, devices] = await Promise.all([
+  const [pairs, trust, history, devices, outbox] = await Promise.all([
     Pairs.open(store, integrity, storage, keys.identity),
     Trust.open(store, integrity),
     History.open(store, keys, integrity, storage),
     Devices.open(store, keys),
+    Outbox.open(store, storage),
   ]);
   assert.ok(devices);
   const transport = track(
@@ -453,6 +456,8 @@ export async function secureDevice(
     keys.identity,
     pairing,
     rosters,
+    outbox,
+    options.now,
   );
   const sink = memoryReceiver();
   const states: MessengerState[] = [];
@@ -497,6 +502,7 @@ export async function secureDevice(
     storage,
     prekeys,
     pairs,
+    outbox,
     trust,
     history,
     client,

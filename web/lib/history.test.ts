@@ -431,7 +431,7 @@ test("restores conversations, ordering, unread, and settled delivery state", asy
   store.open(peerA);
   await deliver(peerA, "a2", "from a two while active");
   for (const [body, result] of [
-    ["to a queued", { ok: true, devices: 1 }],
+    ["to a queued", { ok: true, devices: 1, pending: 0 }],
     ["to a unavailable", { ok: false, reason: "recipient_unavailable" }],
     ["to a failed", { ok: false, reason: "internal_error" }],
   ] as [string, SendResult][]) {
@@ -724,7 +724,7 @@ test("results that settle after the store stops are not persisted", async () => 
   const attempt = store.send("settles late");
   assert.equal(attempt.accepted, true);
   store.stop();
-  source.pending[0].resolve({ ok: true, devices: 1 });
+  source.pending[0].resolve({ ok: true, devices: 1, pending: 0 });
   if (attempt.accepted) {
     await attempt.delivery;
   }
