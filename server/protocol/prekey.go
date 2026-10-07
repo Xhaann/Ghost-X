@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/Xhaann/ghost-x/server/direct"
+	"github.com/Xhaann/ghost-x/server/device"
 	"github.com/Xhaann/ghost-x/server/identity"
 	"github.com/Xhaann/ghost-x/server/prekey"
 )
@@ -13,14 +13,14 @@ import (
 const (
 	DeviceIDSize     = 16
 	ConfirmSize      = 32
-	HandshakeVersion = 2
+	HandshakeVersion = 3
 )
 
 const (
-	signedContext     = "ghostx/prekey/signed/v1\x00"
-	onetimeContext    = "ghostx/prekey/onetime/v1\x00"
-	transcriptContext = "ghostx/x3dh/v2\x00"
-	proofContext      = "ghostx/x3dh/initiate/v2\x00"
+	signedContext     = "ghostx/prekey/signed/v2\x00"
+	onetimeContext    = "ghostx/prekey/onetime/v2\x00"
+	transcriptContext = "ghostx/x3dh/v3\x00"
+	proofContext      = "ghostx/x3dh/initiate/v3\x00"
 )
 
 type prekeyPayload struct {
@@ -36,18 +36,14 @@ type deviceBundlePayload struct {
 }
 
 type prekeyBundlePayload struct {
-	Version   int                   `json:"version"`
-	Identity  string                `json:"identity"`
-	Key       string                `json:"key"`
-	Signature string                `json:"signature"`
-	Bundles   []deviceBundlePayload `json:"bundles"`
+	Version  int                   `json:"version"`
+	Identity string                `json:"identity"`
+	Bundles  []deviceBundlePayload `json:"bundles"`
 }
 
 type initiationPayload struct {
 	Version   int     `json:"version"`
 	From      string  `json:"from"`
-	Key       string  `json:"key"`
-	Signature string  `json:"signature"`
 	Device    string  `json:"device"`
 	Signed    uint32  `json:"signed"`
 	Onetime   *uint32 `json:"onetime"`
@@ -59,32 +55,33 @@ type initiationPayload struct {
 
 type acceptancePayload struct {
 	From      string `json:"from"`
+	Device    string `json:"device"`
 	Ephemeral string `json:"ephemeral"`
 	Confirm   string `json:"confirm"`
 }
 
-func prekeyMessage(context string, owner, static, device []byte, id uint32, key []byte) []byte {
-	out := make([]byte, 0, len(context)+32+32+16+4+32)
+func prekeyMessage(context string, owner, deviceID, exchange []byte, id uint32, key []byte) []byte {
+	out := make([]byte, 0, len(context)+32+16+32+4+32)
 	out = append(out, context...)
 	out = append(out, owner...)
-	out = append(out, static...)
-	out = append(out, device...)
+	out = append(out, deviceID...)
+	out = append(out, exchange...)
 	out = binary.BigEndian.AppendUint32(out, id)
 	return append(out, key...)
 }
 
-func SignedPrekeyMessage(owner, static, device []byte, id uint32, key []byte) []byte {
-	return prekeyMessage(signedContext, owner, static, device, id, key)
+func SignedPrekeyMessage(owner, deviceID, exchange []byte, id uint32, key []byte) []byte {
+	return prekeyMessage(signedContext, owner, deviceID, exchange, id, key)
 }
 
-func OnetimePrekeyMessage(owner, static, device []byte, id uint32, key []byte) []byte {
-	return prekeyMessage(onetimeContext, owner, static, device, id, key)
+func OnetimePrekeyMessage(owner, deviceID, exchange []byte, id uint32, key []byte) []byte {
+	return prekeyMessage(onetimeContext, owner, deviceID, exchange, id, key)
 }
 
 type Transcript struct {
-	Initiator, Responder             []byte
+	Initiator, InitiatorDevice       []byte
+	Responder, ResponderDevice       []byte
 	InitiatorStatic, ResponderStatic []byte
-	Device                           []byte
 	Signed                           uint32
 	SignedKey                        []byte
 	Onetime                          *uint32
@@ -95,10 +92,11 @@ type Transcript struct {
 
 func (t Transcript) Bytes() []byte {
 	out := append([]byte(transcriptContext), t.Initiator...)
+	out = append(out, t.InitiatorDevice...)
 	out = append(out, t.Responder...)
+	out = append(out, t.ResponderDevice...)
 	out = append(out, t.InitiatorStatic...)
 	out = append(out, t.ResponderStatic...)
-	out = append(out, t.Device...)
 	out = binary.BigEndian.AppendUint32(out, t.Signed)
 	out = append(out, t.SignedKey...)
 	if t.Onetime != nil {
@@ -141,27 +139,28 @@ func ownerRaw(id identity.Identity) []byte {
 	return raw
 }
 
-func Prekeys(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHandler {
+func Prekeys(devices *device.Registry, prekeys *prekey.Registry) ProtectedHandler {
 	return func(c *Conn, id identity.Identity, payload []byte) (Reply, error) {
 		fields, err := decodeObject(payload, "device", "signed", "onetime")
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		device, deviceRaw, err := decodeFixed(fields["device"], DeviceIDSize)
+		deviceID, deviceRaw, err := decodeFixed(fields["device"], DeviceIDSize)
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		static, ok := registry.Static(c.session)
+		own, _ := c.session.Device()
+		if deviceID != own {
+			return Reply{}, &Error{Code: CodeInvalidPayload}
+		}
+		key, entry, ok := devices.Key(id.String(), deviceID)
 		if !ok {
-			return Reply{}, &Error{Code: CodeKeyRequired}
+			return Reply{}, &Error{Code: CodeRevoked}
 		}
-		staticRaw, err := strict.DecodeString(static.Key)
-		if err != nil {
-			return Reply{}, err
-		}
+		exchange := decodedText(entry.Exchange)
 		owner := ownerRaw(id)
 		signed, signedRaw, err := decodePrekey(fields["signed"])
-		if err != nil || id.Verify(SignedPrekeyMessage(owner, staticRaw, deviceRaw, signed.ID, signedRaw), signed.Signature) != nil {
+		if err != nil || key.Verify(SignedPrekeyMessage(owner, deviceRaw, exchange, signed.ID, signedRaw), signed.Signature) != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
 		var items []json.RawMessage
@@ -172,7 +171,7 @@ func Prekeys(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHandl
 		seen := make(map[uint32]struct{}, len(items))
 		for _, item := range items {
 			p, keyRaw, err := decodePrekey(item)
-			if err != nil || id.Verify(OnetimePrekeyMessage(owner, staticRaw, deviceRaw, p.ID, keyRaw), p.Signature) != nil {
+			if err != nil || key.Verify(OnetimePrekeyMessage(owner, deviceRaw, exchange, p.ID, keyRaw), p.Signature) != nil {
 				return Reply{}, &Error{Code: CodeInvalidPayload}
 			}
 			if _, dup := seen[p.ID]; dup || p.Key == signed.Key {
@@ -181,10 +180,12 @@ func Prekeys(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHandl
 			seen[p.ID] = struct{}{}
 			onetime = append(onetime, p)
 		}
-		available, err := prekeys.Publish(c.session, prekey.Static{Key: static.Key, Signature: static.Signature}, device, signed, onetime)
+		available, err := prekeys.Publish(c.session, deviceID, signed, onetime)
 		switch {
 		case errors.Is(err, prekey.ErrUnauthenticated):
 			return Reply{}, &Error{Code: CodeAuthRequired}
+		case errors.Is(err, prekey.ErrRevoked):
+			return Reply{}, &Error{Code: CodeRevoked}
 		case errors.Is(err, prekey.ErrInvalid):
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		case errors.Is(err, prekey.ErrLimit):
@@ -216,11 +217,11 @@ func FetchBundle(prekeys *prekey.Registry) ProtectedHandler {
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		static, bundles, ok := prekeys.Fetch(owner)
+		bundles, ok := prekeys.Fetch(owner)
 		if !ok {
 			return Reply{}, &Error{Code: CodeUnavailable}
 		}
-		out := prekeyBundlePayload{Version: HandshakeVersion, Identity: owner.String(), Key: static.Key, Signature: static.Signature, Bundles: make([]deviceBundlePayload, 0, len(bundles))}
+		out := prekeyBundlePayload{Version: HandshakeVersion, Identity: owner.String(), Bundles: make([]deviceBundlePayload, 0, len(bundles))}
 		for _, b := range bundles {
 			d := deviceBundlePayload{Device: b.Device, Signed: encodePrekey(b.Signed)}
 			if b.Onetime != nil {
@@ -244,21 +245,17 @@ func decodeOptionalID(raw json.RawMessage) (*uint32, error) {
 	return &id, nil
 }
 
-func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHandler {
+func Initiate(devices *device.Registry, prekeys *prekey.Registry) ProtectedHandler {
 	return func(c *Conn, id identity.Identity, payload []byte) (Reply, error) {
 		fields, err := decodeObject(payload, "version", "to", "device", "signed", "onetime", "ephemeral", "ratchet", "proof", "confirm")
-		if err != nil || string(fields["version"]) != "2" {
+		if err != nil || string(fields["version"]) != "3" {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		encoded, err := decodeString(fields["to"])
+		to, err := decodeIdentity(fields["to"])
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		to, err := identity.Parse(encoded)
-		if err != nil {
-			return Reply{}, &Error{Code: CodeInvalidPayload}
-		}
-		device, deviceRaw, err := decodeFixed(fields["device"], DeviceIDSize)
+		target, targetRaw, err := decodeFixed(fields["device"], DeviceIDSize)
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
@@ -286,11 +283,16 @@ func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHand
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		sender, ok := registry.Static(c.session)
+		own, _ := c.session.Device()
+		senderKey, sender, ok := devices.Key(id.String(), own)
 		if !ok {
-			return Reply{}, &Error{Code: CodeKeyRequired}
+			return Reply{}, &Error{Code: CodeRevoked}
 		}
-		static, current, previous, ok := prekeys.Device(to, device)
+		_, recipient, ok := devices.Key(to.String(), target)
+		if !ok {
+			return Reply{}, &Error{Code: CodeUnavailable}
+		}
+		current, previous, ok := prekeys.Device(to, target)
 		if !ok {
 			return Reply{}, &Error{Code: CodeUnavailable}
 		}
@@ -303,10 +305,11 @@ func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHand
 		}
 		t := Transcript{
 			Initiator:       ownerRaw(id),
+			InitiatorDevice: decodedText(own),
 			Responder:       ownerRaw(to),
-			InitiatorStatic: decodedText(sender.Key),
-			ResponderStatic: decodedText(static.Key),
-			Device:          deviceRaw,
+			ResponderDevice: targetRaw,
+			InitiatorStatic: decodedText(sender.Exchange),
+			ResponderStatic: decodedText(recipient.Exchange),
 			Signed:          signed,
 			SignedKey:       decodedText(spk.Key),
 			Onetime:         onetime,
@@ -314,18 +317,17 @@ func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHand
 			Ratchet:         ratchetRaw,
 		}
 		if onetime != nil {
-			key, ok := prekeys.Onetime(to, device, *onetime)
+			key, ok := prekeys.Onetime(to, target, *onetime)
 			if !ok {
 				return Reply{}, &Error{Code: CodeStaleSession}
 			}
 			t.OnetimeKey = decodedText(key)
 		}
-		if err := id.Verify(ProofMessage(t), proof); err != nil {
+		if err := senderKey.Verify(ProofMessage(t), proof); err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
 		init := prekey.Initiation{
-			Sender:    prekey.Static{Key: sender.Key, Signature: sender.Signature},
-			Device:    device,
+			Device:    target,
 			Signed:    signed,
 			Onetime:   onetime,
 			Ephemeral: ephemeral,
@@ -333,9 +335,11 @@ func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHand
 			Proof:     proof,
 			Confirm:   confirm,
 		}
-		switch err := prekeys.Initiate(c.session, to, init, static); {
+		switch err := prekeys.Initiate(c.session, to, init, spk.Key); {
 		case errors.Is(err, prekey.ErrUnauthenticated):
 			return Reply{}, &Error{Code: CodeAuthRequired}
+		case errors.Is(err, prekey.ErrRevoked):
+			return Reply{}, &Error{Code: CodeRevoked}
 		case errors.Is(err, prekey.ErrUnavailable):
 			return Reply{}, &Error{Code: CodeUnavailable}
 		case errors.Is(err, prekey.ErrInvalid):
@@ -353,15 +357,15 @@ func Initiate(registry *direct.Registry, prekeys *prekey.Registry) ProtectedHand
 
 func Accept(prekeys *prekey.Registry) ProtectedHandler {
 	return func(c *Conn, _ identity.Identity, payload []byte) (Reply, error) {
-		fields, err := decodeObject(payload, "to", "ephemeral", "confirm")
+		fields, err := decodeObject(payload, "to", "device", "ephemeral", "confirm")
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		encoded, err := decodeString(fields["to"])
+		to, err := decodeIdentity(fields["to"])
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		to, err := identity.Parse(encoded)
+		target, _, err := decodeFixed(fields["device"], DeviceIDSize)
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
@@ -373,11 +377,11 @@ func Accept(prekeys *prekey.Registry) ProtectedHandler {
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		switch err := prekeys.Accept(c.session, to, ephemeral, confirm); {
+		switch err := prekeys.Accept(c.session, to, target, ephemeral, confirm); {
 		case errors.Is(err, prekey.ErrUnauthenticated):
 			return Reply{}, &Error{Code: CodeAuthRequired}
-		case errors.Is(err, prekey.ErrNoKey):
-			return Reply{}, &Error{Code: CodeKeyRequired}
+		case errors.Is(err, prekey.ErrRevoked):
+			return Reply{}, &Error{Code: CodeRevoked}
 		case errors.Is(err, prekey.ErrInvalid):
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		case errors.Is(err, prekey.ErrLimit):
@@ -397,15 +401,13 @@ func decodedText(text string) []byte {
 func EncodeEvent(e prekey.Event) []byte {
 	if e.Acceptance != nil {
 		a := e.Acceptance
-		return encode("acceptance", "", acceptancePayload{From: a.From, Ephemeral: a.Ephemeral, Confirm: a.Confirm})
+		return encode("acceptance", "", acceptancePayload{From: a.From, Device: a.FromDevice, Ephemeral: a.Ephemeral, Confirm: a.Confirm})
 	}
 	i := e.Initiation
 	return encode("initiation", "", initiationPayload{
 		Version:   HandshakeVersion,
 		From:      i.From,
-		Key:       i.Sender.Key,
-		Signature: i.Sender.Signature,
-		Device:    i.Device,
+		Device:    i.FromDevice,
 		Signed:    i.Signed,
 		Onetime:   i.Onetime,
 		Ephemeral: i.Ephemeral,

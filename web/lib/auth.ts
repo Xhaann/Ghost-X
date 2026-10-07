@@ -1,32 +1,61 @@
 import { decodeBase64Url } from "./base64.ts";
 import type { Client } from "./client.ts";
-import type { IdentityKey } from "./identity.ts";
+import type { DeviceStatus } from "./devices.ts";
+import { parseIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
-import { nonceSize } from "./protocol.ts";
+import { deviceIdSize, nonceSize } from "./protocol.ts";
+import type { Keys } from "./vault.ts";
 
 export type AuthState =
-  "unauthenticated" | "authenticating" | "authenticated" | "failed";
+  | "unauthenticated"
+  | "authenticating"
+  | "authenticated"
+  | "failed"
+  | "pending"
+  | "revoked";
 
-const context = new TextEncoder().encode("ghostx/session/authenticate/v1\0");
+export interface DeviceSync {
+  sync(client: Client): Promise<DeviceStatus>;
+}
 
-export function authMessage(nonce: Uint8Array): Uint8Array<ArrayBuffer> {
-  const message = new Uint8Array(context.length + nonce.length);
+export const pendingRetry = 2000;
+
+const context = new TextEncoder().encode("ghostx/session/authenticate/v2\0");
+
+export function authMessage(
+  nonce: Uint8Array,
+  identity: string,
+  device: string,
+): Uint8Array<ArrayBuffer> | null {
+  const owner = parseIdentity(identity);
+  const deviceRaw = decodeBase64Url(device, deviceIdSize);
+  if (!owner || !deviceRaw) {
+    return null;
+  }
+  const message = new Uint8Array(
+    context.length + nonce.length + owner.length + deviceRaw.length,
+  );
   message.set(context);
   message.set(nonce, context.length);
+  message.set(owner, context.length + nonce.length);
+  message.set(deviceRaw, context.length + nonce.length + owner.length);
   return message;
 }
 
 export class Authenticator {
   readonly #client: Client;
-  readonly #key: IdentityKey;
+  readonly #keys: Keys;
+  readonly #devices: DeviceSync;
   readonly #states = new Listeners<AuthState>();
   #state: AuthState = "unauthenticated";
   #attempt = 0;
+  #timer: ReturnType<typeof setTimeout> | null = null;
   #detach: (() => void) | null = null;
 
-  constructor(client: Client, key: IdentityKey) {
+  constructor(client: Client, keys: Keys, devices: DeviceSync) {
     this.#client = client;
-    this.#key = key;
+    this.#keys = keys;
+    this.#devices = devices;
   }
 
   get state(): AuthState {
@@ -71,45 +100,72 @@ export class Authenticator {
 
   #reset(): void {
     this.#attempt += 1;
+    if (this.#timer) {
+      clearTimeout(this.#timer);
+      this.#timer = null;
+    }
     this.#setState("unauthenticated");
   }
 
   #run(): void {
     const attempt = ++this.#attempt;
+    if (this.#timer) {
+      clearTimeout(this.#timer);
+      this.#timer = null;
+    }
     this.#setState("authenticating");
     this.#authenticate(attempt).then(
-      (ok) => this.#finish(attempt, ok),
-      () => this.#finish(attempt, false),
+      (state) => this.#finish(attempt, state),
+      () => this.#finish(attempt, "failed"),
     );
   }
 
-  #finish(attempt: number, ok: boolean): void {
-    if (attempt === this.#attempt) {
-      this.#setState(ok ? "authenticated" : "failed");
+  #finish(attempt: number, state: AuthState): void {
+    if (attempt !== this.#attempt) {
+      return;
+    }
+    this.#setState(state);
+    if (state === "pending" && this.#detach) {
+      this.#timer = setTimeout(() => {
+        this.#timer = null;
+        if (attempt === this.#attempt && this.#client.state === "connected") {
+          this.#run();
+        }
+      }, pendingRetry);
     }
   }
 
-  async #authenticate(attempt: number): Promise<boolean> {
+  async #authenticate(attempt: number): Promise<AuthState> {
+    const status = await this.#devices.sync(this.#client);
+    if (attempt !== this.#attempt) {
+      return "failed";
+    }
+    if (status !== "authorized") {
+      return status;
+    }
     const challenge = await this.#client.request({
       type: "challenge",
       payload: {},
     });
     if (attempt !== this.#attempt || challenge?.type !== "challenge") {
-      return false;
+      return "failed";
     }
+    const { identity, deviceId, device } = this.#keys;
     const nonce = decodeBase64Url(challenge.payload.nonce, nonceSize);
-    const signature = nonce && (await this.#key.sign(authMessage(nonce)));
+    const message = nonce && authMessage(nonce, identity, deviceId);
+    const signature = message && (await device.sign(message));
     if (attempt !== this.#attempt || !signature) {
-      return false;
+      return "failed";
     }
     const reply = await this.#client.request({
       type: "authenticate",
-      payload: { identity: this.#key.identity, signature },
+      payload: { identity, device: deviceId, signature },
     });
-    return (
-      reply?.type === "authenticated" &&
-      reply.payload.identity === this.#key.identity
-    );
+    return reply?.type === "authenticated" &&
+      reply.payload.identity === identity &&
+      reply.payload.device === deviceId
+      ? "authenticated"
+      : "failed";
   }
 
   #setState(state: AuthState): void {

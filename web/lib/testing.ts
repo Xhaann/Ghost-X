@@ -31,7 +31,9 @@ import { Pairs } from "./pairs.ts";
 import { PrekeyStore } from "./prekeys.ts";
 import { WebSocketTransport } from "./socket.ts";
 import { Trust } from "./trust.ts";
-import { type Unlocked, loadVault } from "./vault.ts";
+import { Devices } from "./devices.ts";
+import { Rosters } from "./rosters.ts";
+import { type Unlocked, createVault, linkVault, loadVault } from "./vault.ts";
 
 const NativeWebSocket = globalThis.WebSocket;
 export const created: WebSocket[] = [];
@@ -98,7 +100,11 @@ export async function freePort(): Promise<number> {
 
 export async function startServer(port: number): Promise<ChildProcess> {
   const server = spawn(binary, [], {
-    env: { ...process.env, SERVER_ADDR: `127.0.0.1:${port}` },
+    env: {
+      ...process.env,
+      SERVER_ADDR: `127.0.0.1:${port}`,
+      DEVICE_STORE: join(workdir, `devices-${port}.json`),
+    },
     stdio: "ignore",
   });
   servers.add(server);
@@ -372,19 +378,27 @@ export async function secureDevice(
     wait?: boolean;
     drop?: string[];
     inbox?: boolean;
+    link?: string;
   } = {},
 ) {
   const store = options.store ?? memoryStore();
-  const vault = await loadVault(store);
+  let vault = await loadVault(store);
+  if (vault.status === "empty") {
+    vault = options.link
+      ? await linkVault(store, options.link)
+      : await createVault(store);
+  }
   assert.equal(vault.status, "ready");
   const { keys, integrity, storage } = vault as Unlocked;
   const prekeys = await PrekeyStore.open(store, keys, integrity);
   assert.ok(prekeys);
-  const [pairs, trust, history] = await Promise.all([
-    Pairs.open(store, integrity, storage, keys.identity.identity),
+  const [pairs, trust, history, devices] = await Promise.all([
+    Pairs.open(store, integrity, storage, keys.identity),
     Trust.open(store, integrity),
     History.open(store, keys, integrity, storage),
+    Devices.open(store, keys),
   ]);
+  assert.ok(devices);
   const transport = track(
     new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
   );
@@ -430,20 +444,15 @@ export async function secureDevice(
     });
   };
   const client = track(new Client(transport));
-  const auth = new Authenticator(client, keys.identity);
-  const pairing = new Pairing(
-    client,
-    keys.identity,
-    keys.exchange,
-    prekeys,
-    pairs,
-  );
+  const auth = new Authenticator(client, keys, devices);
+  const rosters = new Rosters(client, trust);
+  const pairing = new Pairing(client, keys, rosters, prekeys, pairs);
   const messenger = new Messenger(
     client,
     auth,
     keys.identity,
-    keys.exchange,
     pairing,
+    rosters,
   );
   const sink = memoryReceiver();
   const states: MessengerState[] = [];
@@ -451,8 +460,6 @@ export async function secureDevice(
     messenger.receive(sink.receiver);
   }
   messenger.onState((state) => states.push(state));
-  pairing.onKey((bundle) => void trust.observe(bundle));
-  messenger.onKey((bundle) => void trust.observe(bundle));
   let stopped = false;
   const shutdown = async () => {
     if (stopped) {
@@ -479,8 +486,11 @@ export async function secureDevice(
     }
   }
   return {
-    id: keys.identity.identity,
+    id: keys.identity,
+    deviceId: keys.deviceId,
     created: (vault as Unlocked).created,
+    devices,
+    rosters,
     store,
     keys,
     integrity,
@@ -527,3 +537,29 @@ export async function secureDevice(
 }
 
 export type SecureDevice = Awaited<ReturnType<typeof secureDevice>>;
+
+export async function linkedDevice(
+  port: number,
+  root: SecureDevice,
+  options: { store?: MemoryStore; inbox?: boolean } = {},
+): Promise<SecureDevice> {
+  const device = await secureDevice(port, {
+    ...options,
+    link: root.id,
+    wait: false,
+  });
+  const deadline = Date.now() + 5000;
+  while (device.auth.state !== "pending") {
+    assert.ok(Date.now() < deadline, "linking device never became pending");
+    await sleep(5);
+  }
+  const request = await device.devices.linkRequest();
+  assert.ok(request);
+  const result = await root.devices.authorize(root.client, request);
+  assert.ok(result.ok, JSON.stringify(result));
+  while (!(device.messenger.state.active && device.pairing.published)) {
+    assert.ok(Date.now() < deadline + 5000, "linked device never became ready");
+    await sleep(5);
+  }
+  return device;
+}

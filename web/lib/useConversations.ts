@@ -10,6 +10,7 @@ import { requestDeviceLock } from "./lock.ts";
 import { Messenger } from "./messenger.ts";
 import type { PairState } from "./pairs.ts";
 import { type InitiateResult, Pairing } from "./pairing.ts";
+import { Rosters } from "./rosters.ts";
 import type { TrustState, TrustView } from "./trust.ts";
 import type { LocalSession } from "./useIdentity.ts";
 
@@ -83,10 +84,11 @@ export function useConversations(
           return;
         }
         setRejected(rejected);
+        const rosters = new Rosters(client, trust);
         const pairing = new Pairing(
           client,
-          keys.identity,
-          keys.exchange,
+          keys,
+          rosters,
           prekeys,
           session.pairs,
         );
@@ -94,27 +96,22 @@ export function useConversations(
           client,
           authenticator,
           keys.identity,
-          keys.exchange,
           pairing,
+          rosters,
         );
-        const conversations = new Conversations(
-          messenger,
-          keys.identity.identity,
-          { history, restored },
-        );
+        const conversations = new Conversations(messenger, keys.identity, {
+          history,
+          restored,
+        });
         store.current = conversations;
         messengerRef.current = messenger;
         pairingRef.current = pairing;
-        const unkey = messenger.onKey((bundle) => void trust.observe(bundle));
-        const unpairKey = pairing.onKey((bundle) => void trust.observe(bundle));
         const unsubscribe = conversations.onState(setState);
         messenger.start();
         pairing.start(messenger);
         conversations.start();
         teardown = () => {
           unsubscribe();
-          unkey();
-          unpairKey();
           pairing.stop();
           conversations.stop();
           messenger.stop();
@@ -157,7 +154,7 @@ export function useConversations(
     void messengerRef.current?.lookup(state.active);
     const peer = state.active;
     const pairing = pairingRef.current;
-    if (pairing && session.pairs.state(peer) === "none") {
+    if (pairing && pairing.summary(peer) === "none") {
       void pairing.initiate(peer).then((result) => {
         if (pairingRef.current === pairing) {
           setAttempt({ peer, result });
@@ -170,7 +167,7 @@ export function useConversations(
     if (!session || !state.active || pairVersion < 0) {
       return null;
     }
-    const current = session.pairs.state(state.active);
+    const current = pairingRef.current?.summary(state.active) ?? "none";
     if (current !== "none") {
       return current;
     }

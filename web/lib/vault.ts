@@ -1,8 +1,9 @@
+import { deriveDeviceId } from "./device.ts";
 import { ExchangeKey } from "./encryption.ts";
-import { IdentityKey } from "./identity.ts";
+import { IdentityKey, isIdentity } from "./identity.ts";
 import type { KeyValueStore } from "./storage.ts";
 
-export const vaultVersion = 2;
+export const vaultVersion = 3;
 
 const vaultKey = "keys";
 const integrityAlgorithm = { name: "HMAC", hash: "SHA-256", length: 256 };
@@ -15,9 +16,26 @@ const legacyFields = [
   "exchange",
   "integrity",
 ];
-const recordFields = [...legacyFields, "storage"];
+const previousFields = [...legacyFields, "storage"];
+const recordFields = [
+  "v",
+  "identity",
+  "root",
+  "device",
+  "deviceKey",
+  "exchangeKey",
+  "exchange",
+  "integrity",
+  "storage",
+];
 
-export type Keys = { identity: IdentityKey; exchange: ExchangeKey };
+export type Keys = {
+  identity: string;
+  root: IdentityKey | null;
+  device: IdentityKey;
+  deviceId: string;
+  exchange: ExchangeKey;
+};
 
 export type Unlocked = {
   keys: Keys;
@@ -27,9 +45,11 @@ export type Unlocked = {
 };
 
 export type VaultState =
-  ({ status: "ready" } & Unlocked) | { status: "corrupted" };
+  | ({ status: "ready" } & Unlocked)
+  | { status: "empty" }
+  | { status: "corrupted" };
 
-type Restored = Omit<Unlocked, "created">;
+type Fields = Record<string, unknown>;
 
 function isIntegrityKey(key: unknown): key is CryptoKey {
   if (
@@ -58,117 +78,197 @@ function isStorageKey(key: unknown): key is CryptoKey {
   );
 }
 
-function fieldsOf(record: unknown): Record<string, unknown> | null {
+function fieldsOf(record: unknown): Fields | null {
   if (typeof record !== "object" || record === null || Array.isArray(record)) {
     return null;
   }
-  const fields = record as Record<string, unknown>;
-  const expected = fields.v === 1 ? legacyFields : recordFields;
+  const fields = record as Fields;
+  const expected =
+    fields.v === 1
+      ? legacyFields
+      : fields.v === 2
+        ? previousFields
+        : fields.v === vaultVersion
+          ? recordFields
+          : null;
   const names = Object.keys(fields);
   if (
-    (fields.v !== 1 && fields.v !== vaultVersion) ||
+    !expected ||
     names.length !== expected.length ||
     !expected.every((name) => names.includes(name)) ||
     !isIntegrityKey(fields.integrity) ||
-    (fields.v === vaultVersion && !isStorageKey(fields.storage))
+    (fields.v !== 1 && !isStorageKey(fields.storage)) ||
+    !isIdentity(fields.identity)
   ) {
     return null;
   }
   return fields;
 }
 
+function generateSecrets(): Promise<[CryptoKey, CryptoKey]> {
+  return Promise.all([
+    crypto.subtle.generateKey(integrityAlgorithm, false, ["sign", "verify"]),
+    crypto.subtle.generateKey(storageAlgorithm, false, ["encrypt", "decrypt"]),
+  ]) as Promise<[CryptoKey, CryptoKey]>;
+}
+
 async function unlock(
-  fields: Record<string, unknown>,
-): Promise<Omit<Restored, "storage"> | null> {
-  const [identity, exchange] = await Promise.all([
-    IdentityKey.restore(fields.identity, fields.signing),
+  fields: Fields,
+): Promise<Omit<Unlocked, "created"> | null> {
+  const identity = fields.identity as string;
+  const [root, device, exchange] = await Promise.all([
+    fields.root === null
+      ? Promise.resolve(null)
+      : IdentityKey.restore(identity, fields.root),
+    IdentityKey.restore(fields.deviceKey, fields.device),
     ExchangeKey.restore(fields.exchangeKey, fields.exchange),
   ]);
-  if (!identity || !exchange) {
-    identity?.release();
+  const deviceId = device && (await deriveDeviceId(identity, device.identity));
+  if (
+    !device ||
+    !exchange ||
+    !deviceId ||
+    (fields.root !== null && !root) ||
+    device.identity === identity
+  ) {
+    root?.release();
+    device?.release();
     exchange?.release();
     return null;
   }
   return {
-    keys: { identity, exchange },
+    keys: { identity, root, device, deviceId, exchange },
     integrity: fields.integrity as CryptoKey,
+    storage: fields.storage as CryptoKey,
   };
 }
 
-async function restore(
+async function upgrade(
   store: KeyValueStore,
-  record: unknown,
-): Promise<Restored | null> {
-  const fields = fieldsOf(record);
-  const unlocked = fields && (await unlock(fields));
-  if (!fields || !unlocked) {
+  fields: Fields,
+): Promise<Omit<Unlocked, "created"> | null> {
+  const [root, exchange] = await Promise.all([
+    IdentityKey.restore(fields.identity, fields.signing),
+    ExchangeKey.restore(fields.exchangeKey, fields.exchange),
+  ]);
+  root?.release();
+  exchange?.release();
+  if (!root || !exchange) {
     return null;
   }
-  if (fields.v === vaultVersion) {
-    return { ...unlocked, storage: fields.storage as CryptoKey };
-  }
-  const storage = await crypto.subtle.generateKey(storageAlgorithm, false, [
-    "encrypt",
-    "decrypt",
-  ]);
+  const device = await IdentityKey.create();
+  const storage =
+    fields.v === 1
+      ? await crypto.subtle.generateKey(storageAlgorithm, false, [
+          "encrypt",
+          "decrypt",
+        ])
+      : fields.storage;
   const upgraded = await store.swap(
     "vault",
     vaultKey,
     (current) => {
       const now = fieldsOf(current);
-      return now?.v === 1 && now.identity === fields.identity;
+      return now?.v === fields.v && now?.identity === fields.identity;
     },
-    { ...fields, v: vaultVersion, storage },
+    {
+      v: vaultVersion,
+      identity: fields.identity,
+      root: fields.signing,
+      device: device.privateKey,
+      deviceKey: device.key.identity,
+      exchangeKey: fields.exchangeKey,
+      exchange: fields.exchange,
+      integrity: fields.integrity,
+      storage,
+    },
   );
-  if (upgraded) {
-    return { ...unlocked, storage };
-  }
-  unlocked.keys.identity.release();
-  unlocked.keys.exchange.release();
+  device.key.release();
   const winner = fieldsOf(await store.get("vault", vaultKey));
-  if (winner?.v !== vaultVersion || winner.identity !== fields.identity) {
+  if (
+    !winner ||
+    winner.v !== vaultVersion ||
+    winner.identity !== fields.identity
+  ) {
     return null;
   }
-  return restore(store, winner);
+  return upgraded || winner.identity === fields.identity
+    ? unlock(winner)
+    : null;
 }
 
 export async function loadVault(store: KeyValueStore): Promise<VaultState> {
   const existing = await store.get("vault", vaultKey);
-  if (existing !== undefined) {
-    const restored = await restore(store, existing);
-    return restored
-      ? { status: "ready", ...restored, created: false }
-      : { status: "corrupted" };
+  if (existing === undefined) {
+    return { status: "empty" };
   }
+  const fields = fieldsOf(existing);
+  const unlocked =
+    fields &&
+    (fields.v === vaultVersion
+      ? await unlock(fields)
+      : await upgrade(store, fields));
+  return unlocked
+    ? { status: "ready", ...unlocked, created: false }
+    : { status: "corrupted" };
+}
 
-  const [identity, exchange, integrity, storage] = await Promise.all([
+async function install(
+  store: KeyValueStore,
+  identity: string,
+  root: { key: IdentityKey; privateKey: CryptoKey } | null,
+): Promise<VaultState> {
+  const [device, exchange, [integrity, storage]] = await Promise.all([
     IdentityKey.create(),
     ExchangeKey.create(),
-    crypto.subtle.generateKey(integrityAlgorithm, false, ["sign", "verify"]),
-    crypto.subtle.generateKey(storageAlgorithm, false, ["encrypt", "decrypt"]),
+    generateSecrets(),
   ]);
-  const added = await store.add("vault", vaultKey, {
-    v: vaultVersion,
-    identity: identity.key.identity,
-    signing: identity.privateKey,
-    exchangeKey: exchange.key.publicKey,
-    exchange: exchange.privateKey,
-    integrity,
-    storage,
-  });
-  if (added) {
+  const deviceId = await deriveDeviceId(identity, device.key.identity);
+  const added =
+    deviceId !== null &&
+    (await store.add("vault", vaultKey, {
+      v: vaultVersion,
+      identity,
+      root: root?.privateKey ?? null,
+      device: device.privateKey,
+      deviceKey: device.key.identity,
+      exchangeKey: exchange.key.publicKey,
+      exchange: exchange.privateKey,
+      integrity,
+      storage,
+    }));
+  if (added && deviceId) {
     return {
       status: "ready",
-      keys: { identity: identity.key, exchange: exchange.key },
+      keys: {
+        identity,
+        root: root?.key ?? null,
+        device: device.key,
+        deviceId,
+        exchange: exchange.key,
+      },
       integrity,
       storage,
       created: true,
     };
   }
-  identity.key.release();
+  root?.key.release();
+  device.key.release();
   exchange.key.release();
-  const winner = await restore(store, await store.get("vault", vaultKey));
-  return winner
-    ? { status: "ready", ...winner, created: false }
-    : { status: "corrupted" };
+  return loadVault(store);
+}
+
+export async function createVault(store: KeyValueStore): Promise<VaultState> {
+  const root = await IdentityKey.create();
+  return install(store, root.key.identity, root);
+}
+
+export async function linkVault(
+  store: KeyValueStore,
+  identity: string,
+): Promise<VaultState> {
+  if (!isIdentity(identity)) {
+    return { status: "corrupted" };
+  }
+  return install(store, identity, null);
 }

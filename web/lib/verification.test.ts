@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Conversations } from "./conversations.ts";
-import { ExchangeKey } from "./encryption.ts";
-import { fingerprint } from "./fingerprint.ts";
+import { rosterFingerprint } from "./device.ts";
+import { pairAddress } from "./pairs.ts";
 import {
+  type SecureDevice,
   freePort,
+  linkedDevice,
   memoryStore,
   secureDevice,
   startServer,
   stopServer,
   useServer,
 } from "./testing.ts";
-import { type Keys, loadVault } from "./vault.ts";
+import { createVault } from "./vault.ts";
 
 useServer();
 
@@ -28,7 +30,14 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
 }
 
 async function device(port: number, store: Store) {
-  const secure = await secureDevice(port, { store, inbox: false });
+  return wrap(await secureDevice(port, { store, inbox: false }));
+}
+
+async function linked(port: number, root: SecureDevice) {
+  return wrap(await linkedDevice(port, root, { inbox: false }));
+}
+
+async function wrap(secure: SecureDevice) {
   const { restored } = await secure.history.restore();
   const conversations = new Conversations(secure.messenger, secure.id, {
     history: secure.history,
@@ -48,28 +57,19 @@ async function device(port: number, store: Store) {
 
 async function identityStore(): Promise<Store> {
   const store = memoryStore();
-  assert.equal((await loadVault(store)).status, "ready");
+  assert.equal((await createVault(store)).status, "ready");
   return store;
 }
 
-async function withNewKey(source: Store): Promise<Store> {
-  const store = memoryStore();
-  const fresh = await ExchangeKey.create();
-  store.data.set("vault:keys", {
-    ...(source.data.get("vault:keys") as Record<string, unknown>),
-    exchangeKey: fresh.key.publicKey,
-    exchange: fresh.privateKey,
-  });
-  return store;
-}
-
-async function own(keys: Keys) {
-  const print = await fingerprint(
-    keys.identity.identity,
-    keys.exchange.publicKey,
-  );
+async function own(d: SecureDevice) {
+  assert.ok(d.devices.roster);
+  const print = await rosterFingerprint(d.devices.roster);
   assert.ok(print);
   return print;
+}
+
+function address(d: SecureDevice): string {
+  return pairAddress(d.id, d.deviceId);
 }
 
 function thread(conversations: Conversations, peer: string): (string | null)[] {
@@ -80,7 +80,7 @@ function thread(conversations: Conversations, peer: string): (string | null)[] {
   );
 }
 
-test("verify, detect a key change, and re-verify with a real server", async () => {
+test("verify, detect a device change, and re-verify with a real server", async () => {
   const port = await freePort();
   const server = await startServer(port);
   const storeA = memoryStore();
@@ -88,13 +88,13 @@ test("verify, detect a key change, and re-verify with a real server", async () =
   const bStore = await identityStore();
   let b = await device(port, bStore);
   const bKeys = b.keys;
-  const idB = bKeys.identity.identity;
-  const idA = a.keys.identity.identity;
+  const idB = bKeys.identity;
+  const idA = a.keys.identity;
 
   assert.equal(a.trust.view(idB).state, "unavailable");
   assert.equal(await a.messenger.lookup(idB), true);
   await until(() => a.trust.view(idB).state === "unverified", "unverified");
-  const bPrint = await own(bKeys);
+  const bPrint = await own(b);
   assert.deepEqual(a.trust.view(idB).current, bPrint);
   assert.equal(b.conversations.state.connected, true);
 
@@ -133,13 +133,12 @@ test("verify, detect a key change, and re-verify with a real server", async () =
   assert.equal(await a.messenger.lookup(idB), true);
   assert.equal(a.trust.view(idB).state, "verified");
 
-  await b.shutdown();
-  b = await device(port, await withNewKey(bStore));
-  const rotated = await own(b.keys);
+  const b2 = await linked(port, b);
+  const rotated = await own(b);
   assert.notEqual(rotated.value, bPrint.value);
 
-  b.conversations.open(idA);
-  const changedMessage = b.conversations.send("from the new key");
+  b2.conversations.open(idA);
+  const changedMessage = b2.conversations.send("from the new device");
   assert.ok(changedMessage.accepted);
   await until(
     () => thread(a.conversations, idB).length === 3,
@@ -167,7 +166,7 @@ test("verify, detect a key change, and re-verify with a real server", async () =
   assert.deepEqual(thread(a.conversations, idB), [
     "verified hello",
     "reply",
-    "from the new key",
+    "from the new device",
   ]);
 
   assert.equal(await a.trust.verify(idB, rotated.value), true);
@@ -178,12 +177,17 @@ test("verify, detect a key change, and re-verify with a real server", async () =
   if (after.accepted) {
     assert.equal(await after.delivery, "queued");
   }
-  await until(() => thread(b.conversations, idA).length === 1, "b2 receives");
+  for (const d of [b, b2]) {
+    await until(
+      () => thread(d.conversations, idA).includes("after re-verification"),
+      "every device of b receives",
+    );
+  }
 
-  for (const frame of [...a.frames, ...b.frames]) {
+  for (const frame of [...a.frames, ...b.frames, ...b2.frames]) {
     for (const secret of [
       "verified hello",
-      "from the new key",
+      "from the new device",
       "after re-verification",
     ]) {
       assert.ok(!frame.includes(secret), "plaintext crossed the wire");
@@ -206,19 +210,16 @@ test("verification is independent of sessions, connections, and presence", async
   const b1 = await device(port, bStore);
   const b2 = await device(port, bStore);
   const bKeys = b1.keys;
-  const idB = bKeys.identity.identity;
+  const idB = bKeys.identity;
 
   await a.messenger.lookup(idB);
   await until(() => a.trust.view(idB).state === "unverified", "observed");
-  assert.equal(await a.trust.verify(idB, (await own(bKeys)).value), true);
+  assert.equal(await a.trust.verify(idB, (await own(b1)).value), true);
   await b1.shutdown();
   await a.messenger.lookup(idB);
   assert.equal(a.trust.view(idB).state, "verified");
   await b2.shutdown();
-  const deadline = Date.now() + 5000;
-  while (await a.messenger.lookup(idB)) {
-    assert.ok(Date.now() < deadline);
-  }
+  assert.equal(await a.messenger.lookup(idB), true);
   assert.equal(a.trust.view(idB).state, "verified");
   const b3 = await device(port, bStore);
   assert.equal(await a.messenger.lookup(idB), true);
@@ -232,9 +233,9 @@ test("another client's verification never changes local trust", async () => {
   const a = await device(port, memoryStore());
   const c = await device(port, memoryStore());
   const bStore = await identityStore();
-  const bKeys = (await device(port, bStore)).keys;
-  const idB = bKeys.identity.identity;
-  const bPrint = await own(bKeys);
+  const b = await device(port, bStore);
+  const idB = b.id;
+  const bPrint = await own(b);
 
   await c.messenger.lookup(idB);
   await until(() => c.trust.view(idB).state === "unverified", "c observed");
@@ -242,25 +243,25 @@ test("another client's verification never changes local trust", async () => {
   await a.messenger.lookup(idB);
   await until(() => a.trust.view(idB).state === "unverified", "a observed");
   assert.equal(a.trust.view(idB).state, "unverified");
-  await a.messenger.lookup(c.keys.identity.identity);
+  await a.messenger.lookup(c.keys.identity);
   await until(
-    () => a.trust.view(c.keys.identity.identity).state === "unverified",
+    () => a.trust.view(c.keys.identity).state === "unverified",
     "a sees c unverified",
   );
 });
 
-test("verification survives ratchet advancement and reconnects but not a key change", async () => {
+test("verification survives ratchet advancement and reconnects but not a device change", async () => {
   const port = await freePort();
   await startServer(port);
   const a = await device(port, memoryStore());
   const bStore = await identityStore();
   let b = await device(port, bStore);
   const bKeys = b.keys;
-  const idA = a.keys.identity.identity;
-  const idB = bKeys.identity.identity;
+  const idA = a.keys.identity;
+  const idB = bKeys.identity;
   await a.messenger.lookup(idB);
   await until(() => a.trust.view(idB).state === "unverified", "observed");
-  assert.equal(await a.trust.verify(idB, (await own(bKeys)).value), true);
+  assert.equal(await a.trust.verify(idB, (await own(b)).value), true);
 
   b.conversations.open(idA);
   for (let i = 0; i < 8; i++) {
@@ -272,27 +273,25 @@ test("verification survives ratchet advancement and reconnects but not a key cha
     await until(() => thread(a.conversations, idB).length === i + 1, `rx ${i}`);
     assert.equal(a.trust.view(idB).state, "verified");
   }
-  const sessionBefore = a.pairs.id(idB);
+  const sessionBefore = a.pairs.id(address(b));
   await b.shutdown();
   b = await device(port, bStore);
   b.conversations.open(idA);
   const again = b.conversations.send("after reconnect");
   assert.ok(again.accepted);
   await until(() => thread(a.conversations, idB).length === 9, "reconnect rx");
-  assert.equal(a.pairs.id(idB), sessionBefore);
+  assert.equal(a.pairs.id(address(b)), sessionBefore);
   await a.messenger.lookup(idB);
   assert.equal(a.trust.view(idB).state, "verified");
 
-  await b.shutdown();
-  b = await device(port, await withNewKey(bStore));
-  const changed = b.keys;
+  await linked(port, b);
   await a.messenger.lookup(idB);
   await until(() => a.trust.view(idB).state === "changed", "changed");
-  assert.equal(await a.trust.verify(idB, (await own(changed)).value), true);
+  assert.equal(await a.trust.verify(idB, (await own(b)).value), true);
   assert.equal(a.trust.view(idB).state, "verified");
 });
 
-test("ratchet key changes and session resets never alter verification; real key changes do", async () => {
+test("ratchet key changes and session resets never alter verification; device changes do", async () => {
   const port = await freePort();
   await startServer(port);
   const a = await device(port, memoryStore());
@@ -301,25 +300,21 @@ test("ratchet key changes and session resets never alter verification; real key 
   const idB = b.id;
   await a.messenger.lookup(idB);
   await until(() => a.trust.view(idB).state === "unverified", "observed");
-  assert.equal(await a.trust.verify(idB, (await own(b.keys)).value), true);
+  assert.equal(await a.trust.verify(idB, (await own(b)).value), true);
 
   const ratchetKey = async () =>
-    a.pairs.transact(idB, async (state) => ({
+    a.pairs.transact(address(b), async (state) => ({
       state,
       value: Buffer.from(state.own.publicKey).toString("base64url"),
     }));
   const exchange = async (rounds: number, label: string) => {
     for (let i = 0; i < rounds; i++) {
-      assert.deepEqual(await a.messenger.send(idB, `${label} a${i}`), {
-        ok: true,
-      });
+      assert.equal((await a.messenger.send(idB, `${label} a${i}`)).ok, true);
       await until(
         () => thread(b.conversations, a.id).includes(`${label} a${i}`),
         `b rx ${label}`,
       );
-      assert.deepEqual(await b.messenger.send(a.id, `${label} b${i}`), {
-        ok: true,
-      });
+      assert.equal((await b.messenger.send(a.id, `${label} b${i}`)).ok, true);
       await until(
         () => thread(a.conversations, idB).includes(`${label} b${i}`),
         "a rx",
@@ -335,40 +330,36 @@ test("ratchet key changes and session resets never alter verification; real key 
   assert.equal(keys.size, 5);
   assert.equal(a.trust.view(idB).state, "verified");
 
-  const sessionBefore = a.pairs.id(idB);
+  const sessionBefore = a.pairs.id(address(b));
   await b.shutdown();
-  bStore.data.delete(`pairs:${a.id}`);
+  bStore.data.delete(`pairs:${pairAddress(a.id, a.deviceId)}`);
   b = await device(port, bStore);
-  assert.deepEqual(await a.messenger.send(idB, "lost before recovery"), {
-    ok: true,
-  });
+  assert.equal((await a.messenger.send(idB, "lost before recovery")).ok, true);
   await until(
     () => thread(b.conversations, a.id).includes(null),
     "undecryptable arrives",
   );
   await until(
     () =>
-      a.pairs.state(idB) === "established" && a.pairs.id(idB) !== sessionBefore,
+      a.pairs.state(address(b)) === "established" &&
+      a.pairs.id(address(b)) !== sessionBefore,
     "recovered session",
   );
   await exchange(1, "after reset");
-  assert.notEqual(a.pairs.id(idB), sessionBefore);
+  assert.notEqual(a.pairs.id(address(b)), sessionBefore);
   assert.equal(a.trust.view(idB).state, "verified");
 
-  await b.shutdown();
-  b = await device(port, await withNewKey(bStore));
-  assert.deepEqual(await b.messenger.send(a.id, "new long-term key hello"), {
-    ok: true,
-  });
+  const b2 = await linked(port, b);
+  assert.equal((await b2.messenger.send(a.id, "new device hello")).ok, true);
   await until(
-    () => thread(a.conversations, idB).includes("new long-term key hello"),
-    "a rx from new key",
+    () => thread(a.conversations, idB).includes("new device hello"),
+    "a rx from new device",
   );
   await exchange(1, "new long-term key");
   await a.messenger.lookup(idB);
   await until(() => a.trust.view(idB).state === "changed", "changed");
   await exchange(2, "still changed");
   assert.equal(a.trust.view(idB).state, "changed");
-  assert.equal(await a.trust.verify(idB, (await own(b.keys)).value), true);
+  assert.equal(await a.trust.verify(idB, (await own(b)).value), true);
   assert.equal(a.trust.view(idB).state, "verified");
 });

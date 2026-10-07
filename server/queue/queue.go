@@ -3,6 +3,7 @@ package queue
 import (
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +33,7 @@ var (
 	ErrInvalid         = errors.New("queue: invalid request")
 	ErrDuplicate       = errors.New("queue: duplicate message")
 	ErrFull            = errors.New("queue: limit reached")
+	ErrRevoked         = errors.New("queue: device not authorized")
 )
 
 type Status string
@@ -44,15 +46,26 @@ const (
 type Message struct {
 	ID         string
 	From       string
-	Key        string
-	Signature  string
+	FromDevice string
 	Ciphertext string
 }
 
 type Receipt struct {
 	To     string
+	Device string
 	ID     string
 	Status Status
+}
+
+type Authorizer func(owner, device string) bool
+
+func Address(owner, device string) string {
+	return owner + "/" + device
+}
+
+func split(address string) (string, string) {
+	owner, device, _ := strings.Cut(address, "/")
+	return owner, device
 }
 
 type Push struct {
@@ -64,6 +77,7 @@ type Deliver func(Push) bool
 
 type entry struct {
 	message  Message
+	from     string
 	to       string
 	size     int
 	queued   time.Time
@@ -95,6 +109,7 @@ type pair struct {
 type Registry struct {
 	mu         sync.Mutex
 	now        func() time.Time
+	authorized Authorizer
 	endpoints  map[*auth.Session]*endpoint
 	identities map[*auth.Session]string
 	listeners  map[string]map[*auth.Session]struct{}
@@ -110,9 +125,10 @@ type Registry struct {
 	swept      time.Time
 }
 
-func NewRegistry(now func() time.Time) *Registry {
+func NewRegistry(now func() time.Time, authorized Authorizer) *Registry {
 	return &Registry{
 		now:        now,
+		authorized: authorized,
 		endpoints:  make(map[*auth.Session]*endpoint),
 		identities: make(map[*auth.Session]string),
 		listeners:  make(map[string]map[*auth.Session]struct{}),
@@ -140,11 +156,11 @@ func (r *Registry) Detach(s *auth.Session) {
 	delete(r.identities, s)
 }
 
-func (r *Registry) Authenticated(s *auth.Session, id identity.Identity) {
+func (r *Registry) Authenticated(s *auth.Session, id identity.Identity, device string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.identities[s]; !ok {
-		r.identities[s] = id.String()
+		r.identities[s] = Address(id.String(), device)
 	}
 }
 
@@ -164,6 +180,9 @@ func (r *Registry) Subscribe(s *auth.Session) error {
 	if !ok || e == nil {
 		return ErrUnauthenticated
 	}
+	if !r.authorized(split(owner)) {
+		return ErrRevoked
+	}
 	r.release(s)
 	e.subscribed = true
 	if r.listeners[owner] == nil {
@@ -175,47 +194,107 @@ func (r *Registry) Subscribe(s *auth.Session) error {
 	return nil
 }
 
-func (r *Registry) Enqueue(s *auth.Session, to identity.Identity, m Message) error {
+type Envelope struct {
+	Device     string
+	Ciphertext string
+}
+
+func (r *Registry) Enqueue(s *auth.Session, to identity.Identity, id string, envelopes []Envelope) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	from, ok := r.identities[s]
 	if !ok {
 		return ErrUnauthenticated
 	}
-	recipient := to.String()
-	if recipient == from || m.ID == "" || m.Ciphertext == "" {
+	sender, senderDevice := split(from)
+	if !r.authorized(sender, senderDevice) {
+		return ErrRevoked
+	}
+	if to.String() == sender || id == "" || len(envelopes) == 0 {
 		return ErrInvalid
 	}
-	m.From = from
-	k := seenKey(from, recipient, m.ID)
-	if _, dup := r.seen[k]; dup {
-		return ErrDuplicate
+	recipients := make([]string, 0, len(envelopes))
+	size := 0
+	for _, e := range envelopes {
+		recipient := Address(to.String(), e.Device)
+		if e.Ciphertext == "" || slices.Contains(recipients, recipient) {
+			return ErrInvalid
+		}
+		if !r.authorized(to.String(), e.Device) {
+			return ErrRevoked
+		}
+		if _, dup := r.seen[seenKey(from, recipient, id)]; dup {
+			return ErrDuplicate
+		}
+		recipients = append(recipients, recipient)
+		size += len(e.Ciphertext) + Overhead
 	}
-	size := len(m.Ciphertext) + Overhead
 	r.sweep(false)
-	if !r.fits(from, recipient, size) {
+	if !r.fitsAll(from, recipients, envelopes) {
 		r.sweep(true)
-		if !r.fits(from, recipient, size) {
+		if !r.fitsAll(from, recipients, envelopes) {
 			return ErrFull
 		}
 	}
-	box := r.inboxes[recipient]
-	if box == nil {
-		box = &inbox{}
-		r.inboxes[recipient] = box
+	for i, e := range envelopes {
+		recipient := recipients[i]
+		entrySize := len(e.Ciphertext) + Overhead
+		box := r.inboxes[recipient]
+		if box == nil {
+			box = &inbox{}
+			r.inboxes[recipient] = box
+		}
+		m := Message{ID: id, From: sender, FromDevice: senderDevice, Ciphertext: e.Ciphertext}
+		box.entries = append(box.entries, &entry{message: m, from: from, to: recipient, size: entrySize, queued: r.now()})
+		box.bytes += entrySize
+		r.senders[from]++
+		r.pairs[pair{from, recipient}]++
+		r.total++
+		r.bytes += entrySize
+		r.remember(seenKey(from, recipient, id))
 	}
-	box.entries = append(box.entries, &entry{message: m, to: recipient, size: size, queued: r.now()})
-	box.bytes += size
-	r.senders[from]++
-	r.pairs[pair{from, recipient}]++
-	r.total++
-	r.bytes += size
-	r.remember(k)
-	r.pump(recipient)
+	for _, recipient := range recipients {
+		r.pump(recipient)
+	}
 	return nil
 }
 
-func (r *Registry) Ack(s *auth.Session, from identity.Identity, id string) error {
+func (r *Registry) fitsAll(from string, recipients []string, envelopes []Envelope) bool {
+	total := 0
+	for i, e := range envelopes {
+		size := len(e.Ciphertext) + Overhead
+		total += size
+		if !r.fits(from, recipients[i], size) {
+			return false
+		}
+	}
+	return r.senders[from]+len(envelopes) <= MaxPerSender &&
+		r.total+len(envelopes) <= MaxTotal &&
+		r.bytes+total <= MaxBytesTotal
+}
+
+func (r *Registry) RemoveDevice(owner, device string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	gone := Address(owner, device)
+	if box := r.inboxes[gone]; box != nil {
+		for i := len(box.entries) - 1; i >= 0; i-- {
+			r.remove(box, i)
+		}
+	}
+	for _, box := range r.inboxes {
+		for i := len(box.entries) - 1; i >= 0; i-- {
+			if box.entries[i].from == gone {
+				r.remove(box, i)
+			}
+		}
+	}
+	for len(r.outboxes[gone]) > 0 {
+		r.drop(gone, 0)
+	}
+}
+
+func (r *Registry) Ack(s *auth.Session, from identity.Identity, fromDevice, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	recipient, ok := r.identities[s]
@@ -226,9 +305,9 @@ func (r *Registry) Ack(s *auth.Session, from identity.Identity, id string) error
 	if box == nil {
 		return nil
 	}
-	sender := from.String()
+	sender := Address(from.String(), fromDevice)
 	i := slices.IndexFunc(box.entries, func(e *entry) bool {
-		return e.message.From == sender && e.message.ID == id
+		return e.from == sender && e.message.ID == id
 	})
 	if i < 0 {
 		return nil
@@ -238,13 +317,14 @@ func (r *Registry) Ack(s *auth.Session, from identity.Identity, id string) error
 		return ErrInvalid
 	}
 	r.remove(box, i)
-	r.notify(sender, Receipt{To: recipient, ID: id, Status: Delivered})
+	owner, device := split(recipient)
+	r.notify(sender, Receipt{To: owner, Device: device, ID: id, Status: Delivered})
 	r.pump(sender)
 	r.pump(recipient)
 	return nil
 }
 
-func (r *Registry) Clear(s *auth.Session, to identity.Identity, id string) error {
+func (r *Registry) Clear(s *auth.Session, to identity.Identity, device, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	sender, ok := r.identities[s]
@@ -254,7 +334,7 @@ func (r *Registry) Clear(s *auth.Session, to identity.Identity, id string) error
 	recipient := to.String()
 	notes := r.outboxes[sender]
 	i := slices.IndexFunc(notes, func(n *note) bool {
-		return n.receipt.To == recipient && n.receipt.ID == id
+		return n.receipt.To == recipient && n.receipt.Device == device && n.receipt.ID == id
 	})
 	if i < 0 {
 		return nil
@@ -264,19 +344,19 @@ func (r *Registry) Clear(s *auth.Session, to identity.Identity, id string) error
 	return nil
 }
 
-func (r *Registry) Queued(id identity.Identity) int {
+func (r *Registry) Queued(address string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if box := r.inboxes[id.String()]; box != nil {
+	if box := r.inboxes[address]; box != nil {
 		return len(box.entries)
 	}
 	return 0
 }
 
-func (r *Registry) Receipts(id identity.Identity) int {
+func (r *Registry) Receipts(address string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.outboxes[id.String()])
+	return len(r.outboxes[address])
 }
 
 func (r *Registry) Usage() (messages, bytes, receipts int) {
@@ -306,11 +386,11 @@ func (r *Registry) remove(box *inbox, i int) {
 	box.bytes -= e.size
 	r.total--
 	r.bytes -= e.size
-	r.senders[e.message.From]--
-	if r.senders[e.message.From] == 0 {
-		delete(r.senders, e.message.From)
+	r.senders[e.from]--
+	if r.senders[e.from] == 0 {
+		delete(r.senders, e.from)
 	}
-	p := pair{e.message.From, e.to}
+	p := pair{e.from, e.to}
 	r.pairs[p]--
 	if r.pairs[p] == 0 {
 		delete(r.pairs, p)
@@ -443,9 +523,10 @@ func (r *Registry) sweep(force bool) {
 			if e.holder != nil || (now.Sub(e.queued) < TTL && e.attempts < MaxAttempts) {
 				continue
 			}
-			sender := e.message.From
+			sender := e.from
 			r.remove(box, i)
-			r.notify(sender, Receipt{To: recipient, ID: e.message.ID, Status: Expired})
+			owner, device := split(recipient)
+			r.notify(sender, Receipt{To: owner, Device: device, ID: e.message.ID, Status: Expired})
 			affected[sender] = struct{}{}
 		}
 	}

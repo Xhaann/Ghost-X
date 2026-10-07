@@ -5,7 +5,7 @@ import { exchangeKeySize } from "./protocol.ts";
 export const fingerprintSize = 64;
 export const digitGroups = 8;
 
-const context = new TextEncoder().encode("ghostx/fingerprint/v1\0");
+const context = new TextEncoder().encode("ghostx/fingerprint/v2\0");
 const groupBytes = 5;
 const groupModulus = 100000;
 
@@ -61,26 +61,52 @@ function digitsOf(hash: Uint8Array): string {
   return groups.join(" ");
 }
 
+export type FingerprintDevice = {
+  id: string;
+  signing: string;
+  exchange: string;
+};
+
 export async function fingerprint(
   identity: unknown,
-  key: unknown,
+  devices: readonly FingerprintDevice[],
 ): Promise<Fingerprint | null> {
   const identityRaw = parseIdentity(identity);
-  const keyRaw = decodeBase64Url(key, exchangeKeySize);
   if (
     !identityRaw ||
-    !keyRaw ||
     !isCanonicalIdentityKey(identityRaw) ||
-    !isCanonicalExchangeKey(keyRaw)
+    devices.length === 0 ||
+    devices.length > 255
   ) {
     return null;
   }
-  const input = new Uint8Array(context.length + 64);
-  input.set(context);
-  input.set(identityRaw, context.length);
-  input.set(keyRaw, context.length + 32);
+  const parts: Uint8Array[] = [
+    context,
+    identityRaw,
+    Uint8Array.of(devices.length),
+  ];
+  for (const device of devices) {
+    const id = decodeBase64Url(device.id, 16);
+    const signing = decodeBase64Url(device.signing, 32);
+    const exchange = decodeBase64Url(device.exchange, exchangeKeySize);
+    if (!id || !signing || !exchange || !isCanonicalExchangeKey(exchange)) {
+      return null;
+    }
+    parts.push(id, signing, exchange);
+  }
+  const input = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    input.set(part, offset);
+    offset += part.length;
+  }
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-512", input));
   return { value: encodeBase64Url(hash), digits: digitsOf(hash) };
+}
+
+export function fingerprintOf(value: unknown): Fingerprint | null {
+  const hash = decodeBase64Url(value, fingerprintSize);
+  return hash ? { value: value as string, digits: digitsOf(hash) } : null;
 }
 
 export function isFingerprintValue(value: unknown): value is string {

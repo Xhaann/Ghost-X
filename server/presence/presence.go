@@ -32,7 +32,7 @@ func NewRegistry() *Registry {
 	}
 }
 
-func (r *Registry) Authenticated(s *auth.Session, id identity.Identity) {
+func (r *Registry) Authenticated(s *auth.Session, id identity.Identity, _ string) {
 	key := id.String()
 	r.mu.Lock()
 	defer r.mu.Unlock()

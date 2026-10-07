@@ -84,6 +84,8 @@ test("rejects malformed messages", () => {
   }
 });
 
+const device = "C".repeat(21) + "A";
+
 test("parses challenge and authenticated messages", () => {
   const nonce = "A".repeat(43);
   const identity = "B".repeat(42) + "A";
@@ -96,10 +98,10 @@ test("parses challenge and authenticated messages", () => {
       JSON.stringify({
         type: "authenticated",
         id: "p1",
-        payload: { identity },
+        payload: { identity, device },
       }),
     ),
-    { type: "authenticated", id: "p1", payload: { identity } },
+    { type: "authenticated", id: "p1", payload: { identity, device } },
   );
   assert.deepEqual(
     parse(
@@ -122,12 +124,36 @@ test("rejects malformed challenge and authenticated messages", () => {
     { type: "challenge", id: "c1", payload: { nonce: 1 } },
     { type: "challenge", id: "c1", payload: { nonce, extra: 1 } },
     { type: "challenge", id: "c1", payload: { nonce }, extra: 1 },
-    { type: "authenticated", payload: { identity } },
+    { type: "authenticated", payload: { identity, device } },
     { type: "authenticated", id: "p1", payload: {} },
-    { type: "authenticated", id: "p1", payload: { identity: identity + "A" } },
-    { type: "authenticated", id: "p1", payload: { identity: "B".repeat(43) } },
-    { type: "authenticated", id: "p1", payload: { identity: null } },
-    { type: "authenticated", id: "p1", payload: { identity, extra: 1 } },
+    { type: "authenticated", id: "p1", payload: { identity } },
+    {
+      type: "authenticated",
+      id: "p1",
+      payload: { identity: identity + "A", device },
+    },
+    {
+      type: "authenticated",
+      id: "p1",
+      payload: { identity: "B".repeat(43), device },
+    },
+    { type: "authenticated", id: "p1", payload: { identity: null, device } },
+    {
+      type: "authenticated",
+      id: "p1",
+      payload: { identity, device: device + "A" },
+    },
+    {
+      type: "authenticated",
+      id: "p1",
+      payload: { identity, device: "C".repeat(22) },
+    },
+    { type: "authenticated", id: "p1", payload: { identity, device: null } },
+    {
+      type: "authenticated",
+      id: "p1",
+      payload: { identity, device, extra: 1 },
+    },
   ];
   for (const message of invalid) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
@@ -137,8 +163,14 @@ test("rejects malformed challenge and authenticated messages", () => {
 test("parses whoami and authentication_required", () => {
   const identity = "B".repeat(42) + "A";
   assert.deepEqual(
-    parse(JSON.stringify({ type: "whoami", id: "w1", payload: { identity } })),
-    { type: "whoami", id: "w1", payload: { identity } },
+    parse(
+      JSON.stringify({
+        type: "whoami",
+        id: "w1",
+        payload: { identity, device },
+      }),
+    ),
+    { type: "whoami", id: "w1", payload: { identity, device } },
   );
   assert.deepEqual(
     parse(
@@ -147,10 +179,12 @@ test("parses whoami and authentication_required", () => {
     { type: "error", id: "w1", payload: { code: "authentication_required" } },
   );
   for (const message of [
-    { type: "whoami", payload: { identity } },
+    { type: "whoami", payload: { identity, device } },
     { type: "whoami", id: "w1", payload: {} },
-    { type: "whoami", id: "w1", payload: { identity: "short" } },
-    { type: "whoami", id: "w1", payload: { identity, extra: 1 } },
+    { type: "whoami", id: "w1", payload: { identity } },
+    { type: "whoami", id: "w1", payload: { identity: "short", device } },
+    { type: "whoami", id: "w1", payload: { identity, device: "short" } },
+    { type: "whoami", id: "w1", payload: { identity, device, extra: 1 } },
   ]) {
     assert.equal(parse(JSON.stringify(message)), null);
   }
@@ -203,27 +237,21 @@ function delivery(overrides: Record<string, unknown> = {}) {
   return {
     id: createMessageId(),
     from: "B".repeat(42) + "A",
-    key: b64(32),
-    signature: b64(64),
+    device: b64(16),
     ciphertext: sealed(120),
     ...overrides,
   };
 }
 
-test("parses queue replies, key bundles, deliveries, and receipts", () => {
+test("parses queue replies, device deliveries, and device receipts", () => {
   const identity = "B".repeat(42) + "A";
-  for (const type of ["queued", "fetched", "acked", "cleared", "published"]) {
+  for (const type of ["queued", "fetched", "acked", "cleared"]) {
     assert.deepEqual(parse(JSON.stringify({ type, id: "m1", payload: {} })), {
       type,
       id: "m1",
       payload: {},
     });
   }
-  const bundle = { identity, key: b64(32), signature: b64(64) };
-  assert.deepEqual(
-    parse(JSON.stringify({ type: "key", id: "q1", payload: bundle })),
-    { type: "key", id: "q1", payload: bundle },
-  );
   for (const size of [minMessageSize, 200, maxMessageSize]) {
     const payload = delivery({ ciphertext: sealed(size) });
     assert.deepEqual(parse(JSON.stringify({ type: "message", payload })), {
@@ -232,7 +260,7 @@ test("parses queue replies, key bundles, deliveries, and receipts", () => {
     });
   }
   for (const status of ["delivered", "expired"]) {
-    const payload = { to: identity, id: createMessageId(), status };
+    const payload = { to: identity, device, id: createMessageId(), status };
     assert.deepEqual(parse(JSON.stringify({ type: "receipt", payload })), {
       type: "receipt",
       payload,
@@ -241,9 +269,13 @@ test("parses queue replies, key bundles, deliveries, and receipts", () => {
   for (const code of [
     "recipient_unavailable",
     "message_too_large",
-    "key_required",
     "duplicate_message",
     "queue_full",
+    "stale_roster",
+    "stale_devices",
+    "registry_full",
+    "rate_limited",
+    "device_revoked",
   ]) {
     assert.deepEqual(
       parse(JSON.stringify({ type: "error", id: "m1", payload: { code } })),
@@ -252,18 +284,22 @@ test("parses queue replies, key bundles, deliveries, and receipts", () => {
   }
 });
 
-test("rejects malformed key bundles, deliveries, and receipts", () => {
+test("rejects removed message types and malformed deliveries and receipts", () => {
   const identity = "B".repeat(42) + "A";
-  const bundle = { identity, key: b64(32), signature: b64(64) };
-  const receipt = { to: identity, id: createMessageId(), status: "delivered" };
+  const receipt = {
+    to: identity,
+    device,
+    id: createMessageId(),
+    status: "delivered",
+  };
   for (const message of [
-    { type: "key", payload: bundle },
-    { type: "key", id: "q1", payload: { ...bundle, key: b64(31) } },
-    { type: "key", id: "q1", payload: { ...bundle, signature: b64(63) } },
-    { type: "key", id: "q1", payload: { ...bundle, identity: "short" } },
-    { type: "key", id: "q1", payload: { ...bundle, private: b64(32) } },
-    { type: "key", id: "q1", payload: { ...bundle, sessions: [] } },
-    { type: "published", payload: {} },
+    {
+      type: "key",
+      id: "q1",
+      payload: { identity, key: b64(32), signature: b64(64) },
+    },
+    { type: "published", id: "p1", payload: {} },
+    { type: "error", id: "e1", payload: { code: "key_required" } },
     { type: "queued", id: "s1", payload: { delivered: true } },
     { type: "sent", id: "s1", payload: {} },
     { type: "established", id: "k1", payload: {} },
@@ -273,8 +309,11 @@ test("rejects malformed key bundles, deliveries, and receipts", () => {
     { type: "message", payload: delivery({ id: b64(15) }) },
     { type: "message", payload: delivery({ id: b64(16) + "=" }) },
     { type: "message", payload: delivery({ from: "short" }) },
-    { type: "message", payload: delivery({ key: b64(33) }) },
-    { type: "message", payload: delivery({ signature: "x" }) },
+    { type: "message", payload: delivery({ device: b64(15) }) },
+    { type: "message", payload: delivery({ device: b64(17) }) },
+    { type: "message", payload: delivery({ device: undefined }) },
+    { type: "message", payload: delivery({ key: b64(32) }) },
+    { type: "message", payload: delivery({ signature: b64(64) }) },
     { type: "message", payload: delivery({ ciphertext: undefined }) },
     { type: "message", payload: delivery({ ciphertext: 7 }) },
     { type: "message", payload: delivery({ ciphertext: "" }) },
@@ -299,6 +338,8 @@ test("rejects malformed key bundles, deliveries, and receipts", () => {
     { type: "receipt", payload: { ...receipt, to: "short" } },
     { type: "receipt", payload: { ...receipt, from: identity } },
     { type: "receipt", payload: { to: identity, id: receipt.id } },
+    { type: "receipt", payload: { ...receipt, device: undefined } },
+    { type: "receipt", payload: { ...receipt, device: "short" } },
   ]) {
     assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
   }
@@ -392,10 +433,8 @@ function deviceBundle(overrides: Record<string, unknown> = {}) {
 
 function initiationPayload(overrides: Record<string, unknown> = {}) {
   return {
-    version: 2,
+    version: 3,
     from: "B".repeat(42) + "A",
-    key: b64(32),
-    signature: b64(64),
     device: b64(16),
     signed: 7,
     onetime: 9,
@@ -410,10 +449,8 @@ function initiationPayload(overrides: Record<string, unknown> = {}) {
 test("parses prekey bundles, handshake pushes, and replies", () => {
   const identity = "B".repeat(42) + "A";
   const bundle = {
-    version: 2,
+    version: 3,
     identity,
-    key: b64(32),
-    signature: b64(64),
     bundles: [deviceBundle(), deviceBundle({ onetime: null })],
   };
   assert.deepEqual(
@@ -442,7 +479,12 @@ test("parses prekey bundles, handshake pushes, and replies", () => {
       payload,
     });
   }
-  const acceptance = { from: identity, ephemeral: b64(32), confirm: b64(32) };
+  const acceptance = {
+    from: identity,
+    device: b64(16),
+    ephemeral: b64(32),
+    confirm: b64(32),
+  };
   assert.deepEqual(
     parse(JSON.stringify({ type: "acceptance", payload: acceptance })),
     { type: "acceptance", payload: acceptance },
@@ -462,16 +504,19 @@ test("parses prekey bundles, handshake pushes, and replies", () => {
 test("rejects malformed prekey bundles and handshake messages", () => {
   const identity = "B".repeat(42) + "A";
   const bundle = {
-    version: 2,
+    version: 3,
     identity,
-    key: b64(32),
-    signature: b64(64),
     bundles: [deviceBundle()],
   };
   const twin = deviceBundle();
   for (const message of [
     { type: "bundle", payload: bundle },
-    { type: "bundle", id: "b", payload: { ...bundle, version: 1 } },
+    { type: "bundle", id: "b", payload: { ...bundle, version: 2 } },
+    {
+      type: "bundle",
+      id: "b",
+      payload: { ...bundle, key: b64(32), signature: b64(64) },
+    },
     { type: "bundle", id: "b", payload: { ...bundle, version: "1" } },
     { type: "bundle", id: "b", payload: { ...bundle, bundles: [] } },
     { type: "bundle", id: "b", payload: { ...bundle, bundles: [twin, twin] } },
@@ -508,11 +553,13 @@ test("rejects malformed prekey bundles and handshake messages", () => {
     { type: "initiated", payload: {} },
     { type: "initiation", id: "x", payload: initiationPayload() },
     ...[
-      { version: 1 },
+      { version: 2 },
+      { device: undefined },
       { ratchet: b64(31) },
       { ratchet: undefined },
       { from: "x" },
-      { key: b64(31) },
+      { key: b64(32) },
+      { signature: b64(64) },
       { device: b64(17) },
       { signed: -1 },
       { signed: "7" },
@@ -527,15 +574,37 @@ test("rejects malformed prekey bundles and handshake messages", () => {
       type: "initiation",
       payload: initiationPayload(field),
     })),
-    { type: "acceptance", payload: { from: identity, ephemeral: b64(32) } },
     {
       type: "acceptance",
-      payload: { from: identity, ephemeral: b64(32), confirm: b64(31) },
+      payload: { from: identity, device: b64(16), ephemeral: b64(32) },
+    },
+    {
+      type: "acceptance",
+      payload: { from: identity, ephemeral: b64(32), confirm: b64(32) },
     },
     {
       type: "acceptance",
       payload: {
         from: identity,
+        device: b64(15),
+        ephemeral: b64(32),
+        confirm: b64(32),
+      },
+    },
+    {
+      type: "acceptance",
+      payload: {
+        from: identity,
+        device: b64(16),
+        ephemeral: b64(32),
+        confirm: b64(31),
+      },
+    },
+    {
+      type: "acceptance",
+      payload: {
+        from: identity,
+        device: b64(16),
         ephemeral: b64(32),
         confirm: b64(32),
         root: b64(32),
@@ -556,7 +625,12 @@ test("fuzzed delivery and receipt frames parse only into valid queue messages", 
     JSON.stringify({ type: "message", payload: delivery() }),
     JSON.stringify({
       type: "receipt",
-      payload: { to: identity, id: createMessageId(), status: "delivered" },
+      payload: {
+        to: identity,
+        device,
+        id: createMessageId(),
+        status: "delivered",
+      },
     }),
     JSON.stringify({ type: "queued", id: "s1", payload: {} }),
   ];
@@ -588,26 +662,82 @@ test("fuzzed delivery and receipt frames parse only into valid queue messages", 
       assert.ok(isMessage(parsed.payload.ciphertext));
       assert.deepEqual(Object.keys(parsed.payload).sort(), [
         "ciphertext",
+        "device",
         "from",
         "id",
-        "key",
-        "signature",
       ]);
     } else if (parsed?.type === "receipt") {
       assert.ok(isMessageId(parsed.payload.id));
       assert.ok(["delivered", "expired"].includes(parsed.payload.status));
     } else if (parsed) {
       assert.ok(
-        [
-          "queued",
-          "error",
-          "fetched",
-          "acked",
-          "cleared",
-          "published",
-        ].includes(parsed.type),
+        ["queued", "error", "fetched", "acked", "cleared"].includes(
+          parsed.type,
+        ),
         parsed.type,
       );
     }
+  }
+});
+
+test("parses registration replies and device rosters strictly", () => {
+  const identity = "B".repeat(42) + "A";
+  const entry = (n: number) => ({
+    id: encodeBase64Url(new Uint8Array(16).fill(n)),
+    signing: encodeBase64Url(new Uint8Array(32).fill(n)),
+    exchange: encodeBase64Url(new Uint8Array(32).fill(n)),
+  });
+  const roster = {
+    identity,
+    version: 2,
+    devices: [entry(1), entry(2)],
+    signature: b64(64),
+  };
+  assert.deepEqual(
+    parse(
+      JSON.stringify({ type: "registered", id: "r", payload: { version: 2 } }),
+    ),
+    { type: "registered", id: "r", payload: { version: 2 } },
+  );
+  assert.deepEqual(
+    parse(JSON.stringify({ type: "devices", id: "d", payload: roster })),
+    { type: "devices", id: "d", payload: roster },
+  );
+  for (const message of [
+    { type: "registered", payload: { version: 2 } },
+    { type: "registered", id: "r", payload: { version: 0 } },
+    { type: "registered", id: "r", payload: { version: 2 ** 31 } },
+    { type: "registered", id: "r", payload: { version: 1.5 } },
+    { type: "registered", id: "r", payload: { version: 1, extra: 1 } },
+    { type: "devices", payload: roster },
+    { type: "devices", id: "d", payload: { ...roster, version: 0 } },
+    { type: "devices", id: "d", payload: { ...roster, devices: [] } },
+    {
+      type: "devices",
+      id: "d",
+      payload: {
+        ...roster,
+        devices: Array.from({ length: maxDevices + 1 }, (_, i) => entry(i)),
+      },
+    },
+    {
+      type: "devices",
+      id: "d",
+      payload: { ...roster, devices: [entry(1), entry(1)] },
+    },
+    {
+      type: "devices",
+      id: "d",
+      payload: { ...roster, devices: [{ ...entry(1), id: b64(15) }] },
+    },
+    {
+      type: "devices",
+      id: "d",
+      payload: { ...roster, devices: [{ ...entry(1), private: b64(32) }] },
+    },
+    { type: "devices", id: "d", payload: { ...roster, signature: b64(63) } },
+    { type: "devices", id: "d", payload: { ...roster, revoked: [] } },
+  ]) {
+    assert.equal(parse(JSON.stringify(message)), null, JSON.stringify(message));
   }
 });

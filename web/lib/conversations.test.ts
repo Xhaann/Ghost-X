@@ -1,3 +1,4 @@
+import { encodeBase64Url } from "./base64.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Client } from "./client.ts";
@@ -29,6 +30,8 @@ import {
 } from "./testing.ts";
 
 useServer();
+
+const DEVICE = encodeBase64Url(new Uint8Array(16));
 
 type Incoming = { id: string; from: string; body: string | null };
 
@@ -296,8 +299,8 @@ test("orders messages deterministically by arrival", async () => {
   const first = accepted(store, "1");
   await source.deliver({ id: "r", from: b, body: "2" });
   const third = accepted(store, "3");
-  source.sent[1].resolve({ ok: true });
-  source.sent[0].resolve({ ok: true });
+  source.sent[1].resolve({ ok: true, devices: 1 });
+  source.sent[0].resolve({ ok: true, devices: 1 });
   await Promise.all([first.delivery, third.delivery]);
 
   const messages = conversation(store, b)?.messages ?? [];
@@ -320,7 +323,7 @@ test("server acceptance is queued and only a receipt marks a message delivered",
   const second = accepted(store, "second");
   const third = accepted(store, "third");
 
-  source.sent[1].resolve({ ok: true });
+  source.sent[1].resolve({ ok: true, devices: 1 });
   assert.equal(await second.delivery, "queued");
 
   const delivery = () =>
@@ -330,22 +333,47 @@ test("server acceptance is queued and only a receipt marks a message delivered",
   assert.deepEqual(delivery(), ["sending", "queued", "sending"]);
 
   assert.equal(
-    await source.receipt({ to: b, id: second.id, status: "delivered" }),
+    await source.receipt({
+      to: b,
+      device: DEVICE,
+      id: second.id,
+      status: "delivered",
+    }),
     true,
   );
   assert.deepEqual(delivery(), ["sending", "delivered", "sending"]);
-  await source.receipt({ to: c, id: second.id, status: "expired" });
-  await source.receipt({ to: b, id: second.id, status: "expired" });
+  await source.receipt({
+    to: c,
+    device: DEVICE,
+    id: second.id,
+    status: "expired",
+  });
+  await source.receipt({
+    to: b,
+    device: DEVICE,
+    id: second.id,
+    status: "expired",
+  });
   assert.deepEqual(delivery(), ["sending", "delivered", "sending"]);
 
-  await source.receipt({ to: b, id: third.id, status: "delivered" });
-  source.sent[2].resolve({ ok: true });
+  await source.receipt({
+    to: b,
+    device: DEVICE,
+    id: third.id,
+    status: "delivered",
+  });
+  source.sent[2].resolve({ ok: true, devices: 1 });
   assert.equal(await third.delivery, "delivered");
 
   source.sent[0].resolve({ ok: false, reason: "recipient_unavailable" });
   assert.equal(await first.delivery, "unavailable");
   assert.deepEqual(delivery(), ["unavailable", "delivered", "delivered"]);
-  await source.receipt({ to: b, id: first.id, status: "delivered" });
+  await source.receipt({
+    to: b,
+    device: DEVICE,
+    id: first.id,
+    status: "delivered",
+  });
   assert.deepEqual(delivery(), ["delivered", "delivered", "delivered"]);
 });
 
@@ -353,9 +381,14 @@ test("an expiry receipt marks a queued message not delivered", async () => {
   const { store, source, b } = await setup();
   store.open(b);
   const attempt = accepted(store, "late");
-  source.sent[0].resolve({ ok: true });
+  source.sent[0].resolve({ ok: true, devices: 1 });
   assert.equal(await attempt.delivery, "queued");
-  await source.receipt({ to: b, id: attempt.id, status: "expired" });
+  await source.receipt({
+    to: b,
+    device: DEVICE,
+    id: attempt.id,
+    status: "expired",
+  });
   const [message] = conversation(store, b)?.messages ?? [];
   assert.ok(message.direction === "sent");
   assert.equal(message.delivery, "expired");
@@ -375,7 +408,7 @@ test("maps other failures to failed without touching other messages", async () =
   const attempts = results.map((_, i) => accepted(store, `b${i}`));
   results.forEach((result, i) => source.sent[i + 1].resolve(result));
   await Promise.all(attempts.map((a) => a.delivery));
-  source.sent[0].resolve({ ok: true });
+  source.sent[0].resolve({ ok: true, devices: 1 });
   await toC.delivery;
 
   const states = (id: string) =>
@@ -458,7 +491,7 @@ test("ignores results that settle after stop", async () => {
 
   store.stop();
   const emitted = log.length;
-  source.sent[0].resolve({ ok: true });
+  source.sent[0].resolve({ ok: true, devices: 1 });
   assert.equal(await attempt.delivery, "queued");
 
   assert.equal(log.length, emitted);
@@ -479,7 +512,7 @@ test("ignores results from before a restart of the same store", async () => {
   store.open(b);
   const emitted = log.length;
   const snapshot = store.state;
-  source.sent[0].resolve({ ok: true });
+  source.sent[0].resolve({ ok: true, devices: 1 });
   await attempt.delivery;
 
   assert.equal(log.length, emitted);
@@ -542,7 +575,7 @@ test("lists conversations by most recent activity", async () => {
 });
 
 type Peer = {
-  key: IdentityKey;
+  key: { identity: string };
   client: Client;
   messenger: Messenger;
   store: Conversations;
@@ -566,7 +599,7 @@ async function peer(port: number): Promise<Peer> {
   store.start();
   await until(() => store.state.connected, "connected store");
   return {
-    key: device.keys.identity,
+    key: { identity: device.id },
     client: device.client,
     messenger: device.messenger,
     store,

@@ -1,22 +1,24 @@
 import type { Client } from "./client.ts";
+import type { DeviceEntry } from "./device.ts";
 import {
-  type ExchangeKey,
-  type KeyBundle,
-  verifyBundle,
-} from "./encryption.ts";
-import {
+  type ResponderKeys,
   handshakeVersion,
   initiate,
   respond,
   verifyPrekey,
 } from "./handshake.ts";
-import { type IdentityKey, isIdentity } from "./identity.ts";
-import { Listeners } from "./listeners.ts";
+import { isIdentity } from "./identity.ts";
 import type { MessengerState } from "./messenger.ts";
-import type { PairState, Pairs } from "./pairs.ts";
+import {
+  type PairState,
+  type Pairs,
+  pairAddress,
+  splitAddress,
+} from "./pairs.ts";
 import { type PrekeyStore, lowWater } from "./prekeys.ts";
 import {
   type ServerMessage,
+  type WireDeviceBundle,
   exchangeKeySize,
   isMessageId,
   isValidBody,
@@ -32,6 +34,8 @@ import {
   ratchetEncrypt,
   responderState,
 } from "./ratchet.ts";
+import type { Rosters } from "./rosters.ts";
+import type { Keys } from "./vault.ts";
 
 export type InitiateResult =
   "pending" | "established" | "unavailable" | "invalid_bundle" | "failed";
@@ -39,17 +43,24 @@ export type InitiateResult =
 export type OpenResult =
   "accepted" | "deferred" | "rejected" | "failed" | "missing";
 
+export type Establishment = {
+  result: InitiateResult;
+  devices: string[];
+};
+
 export interface Channel {
-  establish(peer: string): Promise<InitiateResult>;
-  initiate(peer: string): Promise<InitiateResult>;
-  onChange(listener: (peer: string) => void): () => void;
+  establish(peer: string): Promise<Establishment>;
+  initiate(peer: string, device?: string): Promise<InitiateResult>;
+  onChange(listener: (address: string) => void): () => void;
   seal(
     peer: string,
+    device: string,
     id: string,
     body: string,
   ): Promise<Uint8Array<ArrayBuffer> | null>;
   open(
     peer: string,
+    device: string,
     id: string,
     data: Uint8Array<ArrayBuffer>,
     record: (body: string) => Promise<boolean>,
@@ -95,12 +106,11 @@ export function unframe(plaintext: Uint8Array, id: string): string | null {
 
 export class Pairing implements Channel {
   readonly #client: Client;
-  readonly #identity: IdentityKey;
-  readonly #exchange: ExchangeKey;
+  readonly #keys: Keys;
+  readonly #rosters: Rosters;
   readonly #prekeys: PrekeyStore;
   readonly #pairs: Pairs;
   readonly #generate: Generate;
-  readonly #bundles = new Listeners<KeyBundle>();
   readonly #inflight = new Map<string, Promise<InitiateResult>>();
   #source: StateSource | null = null;
   #queue: Promise<void> = Promise.resolve();
@@ -110,15 +120,15 @@ export class Pairing implements Channel {
 
   constructor(
     client: Client,
-    identity: IdentityKey,
-    exchange: ExchangeKey,
+    keys: Keys,
+    rosters: Rosters,
     prekeys: PrekeyStore,
     pairs: Pairs,
     generate: Generate = generateRatchetKey,
   ) {
     this.#client = client;
-    this.#identity = identity;
-    this.#exchange = exchange;
+    this.#keys = keys;
+    this.#rosters = rosters;
     this.#prekeys = prekeys;
     this.#pairs = pairs;
     this.#generate = generate;
@@ -128,15 +138,11 @@ export class Pairing implements Channel {
     return this.#published;
   }
 
-  onKey(listener: (bundle: KeyBundle) => void): () => void {
-    return this.#bundles.add(listener);
+  state(peer: string, device: string): PairState {
+    return this.#pairs.state(pairAddress(peer, device));
   }
 
-  state(peer: string): PairState {
-    return this.#pairs.state(peer);
-  }
-
-  onChange(listener: (peer: string) => void): () => void {
+  onChange(listener: (address: string) => void): () => void {
     return this.#pairs.onChange(listener);
   }
 
@@ -196,21 +202,53 @@ export class Pairing implements Channel {
     return true;
   }
 
-  initiate(peer: string): Promise<InitiateResult> {
-    const existing = this.#inflight.get(peer);
+  initiate(peer: string, device?: string): Promise<InitiateResult> {
+    const key = device ? pairAddress(peer, device) : peer;
+    const existing = this.#inflight.get(key);
     if (existing) {
       return existing;
     }
-    const run = this.#initiate(peer, false).finally(() =>
-      this.#inflight.delete(peer),
+    const run = this.#initiate(peer, device ?? null, false).finally(() =>
+      this.#inflight.delete(key),
     );
-    this.#inflight.set(peer, run);
+    this.#inflight.set(key, run);
     return run;
   }
 
-  async establish(peer: string): Promise<InitiateResult> {
-    if (this.#pairs.state(peer) === "established") {
-      return "established";
+  summary(peer: string): PairState {
+    const states = (this.#rosters.cached(peer)?.devices ?? []).map((d) =>
+      this.#pairs.state(pairAddress(peer, d.id)),
+    );
+    return states.includes("established")
+      ? "established"
+      : states.includes("pending")
+        ? "pending"
+        : "none";
+  }
+
+  established(peer: string): string[] {
+    const roster = this.#rosters.cached(peer);
+    return (roster?.devices ?? [])
+      .map((d) => d.id)
+      .filter(
+        (id) => this.#pairs.state(pairAddress(peer, id)) === "established",
+      );
+  }
+
+  async establish(peer: string): Promise<Establishment> {
+    const roster = await this.#rosters.fetch(peer);
+    if (!roster) {
+      return { result: "unavailable", devices: [] };
+    }
+    const ready = this.established(peer);
+    const missing = roster.devices.some(
+      (d) => this.#pairs.state(pairAddress(peer, d.id)) === "none",
+    );
+    if (ready.length > 0) {
+      if (missing) {
+        void this.initiate(peer);
+      }
+      return { result: "established", devices: ready };
     }
     const established = new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
@@ -218,29 +256,38 @@ export class Pairing implements Channel {
         resolve(false);
       }, establishTimeout);
       const release = this.#pairs.onChange((changed) => {
-        if (changed === peer && this.#pairs.state(peer) === "established") {
+        const target = splitAddress(changed);
+        if (
+          target?.peer === peer &&
+          this.#pairs.state(changed) === "established"
+        ) {
           clearTimeout(timer);
           release();
           resolve(true);
         }
       });
     });
-    const result = await this.#initiate(peer, true);
-    if (result !== "pending") {
-      return result;
+    const result = await this.#initiate(peer, null, true);
+    if (result !== "pending" && result !== "established") {
+      return { result, devices: [] };
     }
-    return (await established) ? "established" : "pending";
+    if (result === "pending" && !(await established)) {
+      return { result: "pending", devices: [] };
+    }
+    const devices = this.established(peer);
+    return { result: devices.length > 0 ? "established" : "pending", devices };
   }
 
   async seal(
     peer: string,
+    device: string,
     id: string,
     body: string,
   ): Promise<Uint8Array<ArrayBuffer> | null> {
     if (!isValidBody(body) || !isMessageId(id)) {
       return null;
     }
-    return this.#pairs.transact(peer, async (state) => {
+    return this.#pairs.transact(pairAddress(peer, device), async (state) => {
       const sealed = await ratchetEncrypt(state, frame(id, body));
       return sealed && { state: sealed.state, value: sealed.message };
     });
@@ -248,24 +295,31 @@ export class Pairing implements Channel {
 
   async open(
     peer: string,
+    device: string,
     id: string,
     data: Uint8Array<ArrayBuffer>,
     record: (body: string) => Promise<boolean>,
   ): Promise<OpenResult> {
     const header = decodeHeader(data);
-    if (!header || !isMessageId(id)) {
+    if (!header || !isMessageId(id) || !isIdentity(peer)) {
       return "rejected";
     }
-    const current = this.#pairs.state(peer);
+    const address = pairAddress(peer, device);
+    if (!splitAddress(address)) {
+      return "rejected";
+    }
+    const current = this.#pairs.state(address);
     if (current === "none") {
       return "missing";
     }
     if (current === "pending") {
-      return header.session === this.#pairs.id(peer) ? "deferred" : "rejected";
+      return header.session === this.#pairs.id(address)
+        ? "deferred"
+        : "rejected";
     }
     let recorded = false;
     let failed = false;
-    const opened = await this.#pairs.transact(peer, async (state) => {
+    const opened = await this.#pairs.transact(address, async (state) => {
       const result = await ratchetDecrypt(state, data, this.#generate);
       const body = result && unframe(result.plaintext, id);
       if (!result || body === null) {
@@ -285,17 +339,35 @@ export class Pairing implements Channel {
     return recorded || failed ? "failed" : "rejected";
   }
 
-  async #initiate(peer: string, replace: boolean): Promise<InitiateResult> {
-    const current = this.#pairs.state(peer);
-    if (current === "established" || (current === "pending" && !replace)) {
-      return current;
-    }
+  async #initiate(
+    peer: string,
+    device: string | null,
+    replace: boolean,
+  ): Promise<InitiateResult> {
     if (
       !this.#source?.state.active ||
       !isIdentity(peer) ||
-      peer === this.#identity.identity
+      peer === this.#keys.identity
     ) {
       return "failed";
+    }
+    const roster = await this.#rosters.fetch(peer);
+    if (!roster) {
+      return "unavailable";
+    }
+    const wanted = roster.devices.filter((d) => {
+      const state = this.#pairs.state(pairAddress(peer, d.id));
+      return (
+        (device === null || d.id === device) &&
+        (state === "none" ||
+          (state === "pending" &&
+            replace &&
+            device === null &&
+            this.established(peer).length === 0))
+      );
+    });
+    if (wanted.length === 0) {
+      return this.established(peer).length > 0 ? "established" : "pending";
     }
     const reply = await this.#client.request({
       type: "bundle",
@@ -309,46 +381,49 @@ export class Pairing implements Channel {
     if (reply?.type !== "bundle" || reply.payload.identity !== peer) {
       return "failed";
     }
-    const staticBundle: KeyBundle = {
-      identity: peer,
-      key: reply.payload.key,
-      signature: reply.payload.signature,
-    };
-    const staticKey = await verifyBundle(staticBundle);
-    if (!staticKey) {
+    let outcome: InitiateResult = "unavailable";
+    for (const entry of wanted) {
+      const bundle = reply.payload.bundles.find((b) => b.device === entry.id);
+      if (!bundle) {
+        continue;
+      }
+      const result = await this.#start(peer, entry, bundle);
+      if (
+        result === "established" ||
+        (result === "pending" && outcome !== "established")
+      ) {
+        outcome = result;
+      } else if (outcome === "unavailable") {
+        outcome = result;
+      }
+    }
+    if (outcome === "unavailable" && reply.payload.bundles.length > 0) {
       return "invalid_bundle";
     }
-    this.#bundles.emit(staticBundle);
-    const device = reply.payload.bundles[0];
-    const signed = await verifyPrekey(
-      "signed",
-      peer,
-      staticKey,
-      device.device,
-      device.signed,
-    );
-    const onetime = device.onetime
-      ? await verifyPrekey(
-          "onetime",
-          peer,
-          staticKey,
-          device.device,
-          device.onetime,
-        )
+    return this.established(peer).length > 0 ? "established" : outcome;
+  }
+
+  async #start(
+    peer: string,
+    entry: DeviceEntry,
+    bundle: WireDeviceBundle,
+  ): Promise<InitiateResult> {
+    const signed = await verifyPrekey("signed", peer, entry, bundle.signed);
+    const onetime = bundle.onetime
+      ? await verifyPrekey("onetime", peer, entry, bundle.onetime)
       : null;
-    if (!signed || (device.onetime && !onetime)) {
+    if (!signed || (bundle.onetime && !onetime)) {
       return "invalid_bundle";
     }
     const result = await initiate(
-      { identity: this.#identity, exchange: this.#exchange },
+      this.#keys,
       {
         identity: peer,
-        staticKey,
-        device: device.device,
-        signed: { id: device.signed.id, key: signed },
+        device: entry,
+        signed: { id: bundle.signed.id, key: signed },
         onetime:
-          device.onetime && onetime
-            ? { id: device.onetime.id, key: onetime }
+          bundle.onetime && onetime
+            ? { id: bundle.onetime.id, key: onetime }
             : null,
       },
       this.#generate,
@@ -360,16 +435,17 @@ export class Pairing implements Channel {
       result.pending.secret,
       signed,
       {
-        initiator: this.#identity.identity,
+        initiator: this.#keys.identity,
         responder: peer,
         session: result.pending.id,
         role: "initiator",
       },
       result.pending.ratchet,
     );
+    const address = pairAddress(peer, entry.id);
     if (
       !(await this.#pairs.savePending(
-        peer,
+        address,
         result.initiation.ephemeral,
         result.pending,
         ratchet,
@@ -382,13 +458,13 @@ export class Pairing implements Channel {
       payload: { version: handshakeVersion, to: peer, ...result.initiation },
     });
     if (sent?.type !== "initiated") {
-      await this.#pairs.discard(peer, result.pending.id);
+      await this.#pairs.discard(address, result.pending.id);
       return sent?.type === "error" &&
         sent.payload.code === "recipient_unavailable"
         ? "unavailable"
         : "failed";
     }
-    return this.#pairs.state(peer) === "established"
+    return this.#pairs.state(address) === "established"
       ? "established"
       : "pending";
   }
@@ -398,44 +474,32 @@ export class Pairing implements Channel {
   }
 
   async #respond(initiation: Initiation): Promise<void> {
-    if (initiation.device !== this.#prekeys.device) {
-      return;
-    }
+    const peer = initiation.from;
+    const address = pairAddress(peer, initiation.device);
     if (
-      this.#pairs.state(initiation.from) === "pending" &&
-      this.#identity.identity < initiation.from
+      this.#pairs.state(address) === "pending" &&
+      pairAddress(this.#keys.identity, this.#keys.deviceId) < address
     ) {
       return;
     }
-    const sender: KeyBundle = {
-      identity: initiation.from,
-      key: initiation.key,
-      signature: initiation.signature,
-    };
-    const fromStatic = await verifyBundle(sender);
+    const fromDevice = await this.#rosters.resolve(peer, initiation.device);
     const peerRatchet = decodeBase64Url(initiation.ratchet, exchangeKeySize);
-    if (!fromStatic || !peerRatchet) {
+    if (!fromDevice || !peerRatchet || peer === this.#keys.identity) {
       return;
     }
-    this.#bundles.emit(sender);
     const signedBefore = this.#prekeys.inventory.signed;
     const outcome = await this.#prekeys.consume(
       initiation.signed,
       initiation.onetime,
-      async (keys) => {
-        const established = await respond(
-          { identity: this.#identity, exchange: this.#exchange },
-          keys,
-          {
-            from: initiation.from,
-            fromStatic,
-            device: initiation.device,
-            ephemeral: initiation.ephemeral,
-            ratchet: initiation.ratchet,
-            proof: initiation.proof,
-            confirm: initiation.confirm,
-          },
-        );
+      async (keys: ResponderKeys) => {
+        const established = await respond(this.#keys, keys, {
+          from: peer,
+          fromDevice,
+          ephemeral: initiation.ephemeral,
+          ratchet: initiation.ratchet,
+          proof: initiation.proof,
+          confirm: initiation.confirm,
+        });
         if (!established) {
           return null;
         }
@@ -444,8 +508,8 @@ export class Pairing implements Channel {
           { publicKey: keys.signed.key, privateKey: keys.signed.privateKey },
           peerRatchet,
           {
-            initiator: initiation.from,
-            responder: this.#identity.identity,
+            initiator: peer,
+            responder: this.#keys.identity,
             session: established.id,
             role: "responder",
           },
@@ -459,7 +523,7 @@ export class Pairing implements Channel {
     }
     if (
       !(await this.#pairs.saveResponder(
-        initiation.from,
+        address,
         initiation.ephemeral,
         outcome.value.ratchet,
       ))
@@ -469,7 +533,8 @@ export class Pairing implements Channel {
     await this.#client.request({
       type: "accept",
       payload: {
-        to: initiation.from,
+        to: peer,
+        device: initiation.device,
         ephemeral: initiation.ephemeral,
         confirm: outcome.value.accept,
       },
@@ -484,7 +549,7 @@ export class Pairing implements Channel {
 
   async #accept(acceptance: Acceptance): Promise<void> {
     await this.#pairs.accept(
-      acceptance.from,
+      pairAddress(acceptance.from, acceptance.device),
       acceptance.ephemeral,
       acceptance.confirm,
     );

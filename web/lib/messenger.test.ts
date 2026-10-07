@@ -1,19 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decodeBase64Url, encodeBase64Url } from "./base64.ts";
-import { ExchangeKey, type KeyBundle } from "./encryption.ts";
-import { IdentityKey } from "./identity.ts";
+import { pairAddress } from "./pairs.ts";
 import { createMessageId, maxBodySize } from "./protocol.ts";
 import {
-  type MemoryStore,
   type SecureDevice,
   freePort,
+  linkedDevice,
   memoryStore,
   secureDevice,
   startServer,
   useServer,
 } from "./testing.ts";
-import { loadVault } from "./vault.ts";
+import { type Unlocked, createVault } from "./vault.ts";
 
 useServer();
 
@@ -31,25 +30,12 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
   }
 }
 
-async function stranger(): Promise<string> {
-  return (await IdentityKey.generate()).identity;
+async function stranger(): Promise<Unlocked["keys"]> {
+  return ((await createVault(memoryStore())) as Unlocked).keys;
 }
 
-async function identityStore(): Promise<MemoryStore> {
-  const store = memoryStore();
-  assert.equal((await loadVault(store)).status, "ready");
-  return store;
-}
-
-async function conflictingDevice(source: MemoryStore): Promise<MemoryStore> {
-  const store = memoryStore();
-  const fresh = await ExchangeKey.create();
-  store.data.set("vault:keys", {
-    ...(source.data.get("vault:keys") as Json),
-    exchangeKey: fresh.key.publicKey,
-    exchange: fresh.privateKey,
-  });
-  return store;
+function session(p: Peer, from: Peer): string {
+  return pairAddress(from.id, from.deviceId);
 }
 
 function peer(port: number, store = memoryStore()): Promise<Peer> {
@@ -112,17 +98,18 @@ function acks(p: Peer): Json[] {
 async function paired(port: number): Promise<[Peer, Peer]> {
   const a = await peer(port);
   const b = await peer(port);
-  assert.equal(await a.pairing.establish(b.id), "established");
+  assert.equal((await a.pairing.establish(b.id)).result, "established");
   return [a, b];
 }
 
-test("activates after publishing the static key and subscribes to its queue", async () => {
+test("activates after registering the device roster and subscribes to its device queue", async () => {
   const port = await freePort();
   await startServer(port);
   const a = await peer(port);
   assert.equal(a.messenger.state.active, true);
   const types = a.sent.map((raw) => JSON.parse(raw).type);
-  assert.ok(types.indexOf("publish") < types.indexOf("fetch"));
+  assert.ok(types.indexOf("register") < types.indexOf("authenticate"));
+  assert.ok(types.indexOf("authenticate") < types.indexOf("fetch"));
   assert.equal(frames(a.sent, "session").length, 0);
   assert.equal(frames(a.received, "fetched").length, 1);
 });
@@ -133,14 +120,20 @@ test("sends only ratchet ciphertext with a fresh message identifier", async () =
   const [a, b] = await paired(port);
   const secret = "the server must never read this 🔒";
 
-  assert.deepEqual(await a.messenger.send(b.id, secret), { ok: true });
+  assert.equal((await a.messenger.send(b.id, secret)).ok, true);
   await until(() => b.inbox.length === 1, "delivery");
   const send = frames(a.sent, "send")[0].payload as Json;
-  assert.deepEqual(Object.keys(send).sort(), ["ciphertext", "id", "to"]);
+  assert.deepEqual(Object.keys(send).sort(), ["envelopes", "id", "to"]);
+  const envelopes = send.envelopes as Json[];
+  assert.deepEqual(
+    envelopes.map((e) => e.device),
+    [b.deviceId],
+  );
   assert.match(send.id as string, /^[A-Za-z0-9_-]{22}$/);
+  const sealed = envelopes[0].ciphertext as string;
   const ciphertext = decodeBase64Url(
-    send.ciphertext,
-    Math.floor(((send.ciphertext as string).length * 3) / 4),
+    sealed,
+    Math.floor((sealed.length * 3) / 4),
   );
   assert.ok(ciphertext);
   assert.equal(ciphertext[0], 1);
@@ -148,15 +141,19 @@ test("sends only ratchet ciphertext with a fresh message identifier", async () =
   assert.deepEqual(lastDelivery(b), {
     id: send.id,
     from: a.id,
-    key: a.keys.exchange.publicKey,
-    signature: deliveries(b)[0].signature,
-    ciphertext: send.ciphertext,
+    device: a.deviceId,
+    ciphertext: sealed,
   });
   await until(() => acks(b).length === 1, "acknowledged");
-  assert.deepEqual(acks(b)[0], { from: a.id, id: send.id });
+  assert.deepEqual(acks(b)[0], {
+    from: a.id,
+    device: a.deviceId,
+    id: send.id,
+  });
   await until(() => a.receipts.length === 1, "receipt");
   assert.deepEqual(a.receipts[0], {
     to: b.id,
+    device: b.deviceId,
     id: send.id,
     status: "delivered",
   });
@@ -169,10 +166,10 @@ test("sends only ratchet ciphertext with a fresh message identifier", async () =
     assert.ok(!/private|pkcs8|"root"|"chain"/i.test(frame));
   }
   const second = await a.messenger.send(b.id, "again");
-  assert.deepEqual(second, { ok: true });
+  assert.equal(second.ok, true);
   const ids = frames(a.sent, "send").map((f) => (f.payload as Json).id);
   const texts = frames(a.sent, "send").map(
-    (f) => (f.payload as Json).ciphertext,
+    (f) => ((f.payload as Json).envelopes as Json[])[0].ciphertext,
   );
   assert.notEqual(ids[0], ids[1]);
   assert.notEqual(texts[0], texts[1]);
@@ -183,7 +180,7 @@ test("acknowledges only after the receiver durably accepted the message", async 
   await startServer(port);
   const [a, b] = await paired(port);
   b.failStorage(true);
-  assert.deepEqual(await a.messenger.send(b.id, "must survive"), { ok: true });
+  assert.equal((await a.messenger.send(b.id, "must survive")).ok, true);
   await until(() => deliveries(b).length === 1, "delivered to b");
   await settle(a, b);
   assert.equal(acks(b).length, 0);
@@ -203,7 +200,7 @@ test("tampered, misdirected, or rebound deliveries never decrypt or advance the 
   await startServer(port);
   const [a, b] = await paired(port);
   const c = await peer(port);
-  assert.equal(await c.pairing.establish(b.id), "established");
+  assert.equal((await c.pairing.establish(b.id)).result, "established");
 
   b.hold(true);
   await a.messenger.send(b.id, "original");
@@ -214,7 +211,7 @@ test("tampered, misdirected, or rebound deliveries never decrypt or advance the 
   await until(() => b.inbox.length === 1, "c to b");
   const fromC = lastDelivery(b);
   const state = async () =>
-    b.pairs.transact(a.id, async (s) => ({
+    b.pairs.transact(session(b, a), async (s) => ({
       state: s,
       value: JSON.stringify([s.receiving?.n ?? null, s.skipped.length]),
     }));
@@ -233,14 +230,10 @@ test("tampered, misdirected, or rebound deliveries never decrypt or advance the 
       ciphertext: flip(text, -1 + Math.floor((text.length * 3) / 4)),
     },
     "message id": { ...good, id: createMessageId() },
-    "sender identity": {
-      ...good,
-      from: c.id,
-      key: fromC.key,
-      signature: fromC.signature,
-    },
+    "sender identity": { ...good, from: c.id, device: fromC.device },
+    "sender device": { ...good, device: c.deviceId },
     "another session's ciphertext": { ...good, ciphertext: fromC.ciphertext },
-    "static binding": { ...good, signature: fromC.signature },
+    "unknown sender device": { ...good, device: (await stranger()).deviceId },
     truncated: { ...good, ciphertext: text.slice(0, text.length - 8) },
   };
   for (const [name, payload] of Object.entries(mutations)) {
@@ -287,7 +280,7 @@ test("reports unavailable recipients, pending sessions, and invalid input withou
   const port = await freePort();
   await startServer(port);
   const a = await peer(port);
-  const absent = await stranger();
+  const absent = (await stranger()).identity;
   assert.deepEqual(await a.messenger.send(absent, "x"), {
     ok: false,
     reason: "recipient_unavailable",
@@ -311,49 +304,48 @@ test("reports unavailable recipients, pending sessions, and invalid input withou
     });
   }
   assert.equal(frames(a.sent, "send").length, 0);
-  assert.equal(frames(a.sent, "bundle").length, 1);
+  assert.equal(frames(a.sent, "devices").length, 1);
+  assert.equal(frames(a.sent, "bundle").length, 0);
 });
 
-test("a second session cannot bind a different static key", async () => {
+test("a linked device that was never authorized cannot activate or send", async () => {
   const port = await freePort();
   await startServer(port);
-  const first = await identityStore();
-  await peer(port, first);
-  const conflicting = await secureDevice(port, {
-    store: await conflictingDevice(first),
-    wait: false,
+  const [a, b] = await paired(port);
+  const unauthorized = await secureDevice(port, { link: a.id, wait: false });
+  await until(() => unauthorized.auth.state === "pending", "pending");
+  await settle(unauthorized);
+  assert.equal(unauthorized.messenger.state.active, false);
+  assert.equal(frames(unauthorized.sent, "fetch").length, 0);
+  assert.deepEqual(await unauthorized.messenger.send(b.id, "x"), {
+    ok: false,
+    reason: "authentication_required",
   });
-  await until(
-    () => frames(conflicting.received, "error").length > 0,
-    "conflict rejected",
-  );
-  assert.equal(conflicting.messenger.state.active, false);
+  assert.equal(frames(unauthorized.sent, "authenticate").length, 0);
+  const result = await a.messenger.send(b.id, "still works");
+  assert.equal(result.ok && result.devices, 1);
 });
 
-test("reports only verified static key bundles from lookups and deliveries", async () => {
+test("lookups and deliveries accept only devices in a verified roster", async () => {
   const port = await freePort();
   await startServer(port);
   const [a, b] = await paired(port);
   const c = await peer(port);
-  const seen: string[] = [];
-  a.messenger.onKey((bundle: KeyBundle) =>
-    seen.push(
-      `${bundle.key === b.keys.exchange.publicKey ? "b" : bundle.key === c.keys.exchange.publicKey ? "c" : "?"}:${bundle.identity === (bundle.key === b.keys.exchange.publicKey ? b.id : c.id)}`,
-    ),
-  );
   assert.equal(await a.messenger.lookup(b.id), true);
+  assert.deepEqual(
+    a.rosters.cached(b.id)?.devices.map((d) => d.id),
+    [b.deviceId],
+  );
   assert.equal(await a.messenger.lookup("not-an-identity"), false);
-  assert.equal(await a.messenger.lookup(await stranger()), false);
+  assert.equal(await a.messenger.lookup((await stranger()).identity), false);
   await b.messenger.send(a.id, "y");
   await until(() => a.inbox.length === 1, "delivery");
-  inject(a, {
-    ...lastDelivery(a),
-    id: createMessageId(),
-    key: c.keys.exchange.publicKey,
-  });
-  await until(() => a.inbox.length === 2, "forged processed");
-  assert.equal(a.inbox[1].body, null);
-  assert.deepEqual(seen, ["b:true", "b:true"]);
+  for (const device of [c.deviceId, (await stranger()).deviceId, "short"]) {
+    inject(a, { ...lastDelivery(a), id: createMessageId(), device });
+  }
+  await settle(a);
+  assert.deepEqual(bodies(a), ["y", null, null]);
+  assert.equal(a.rosters.cached(c.id), null);
   a.messenger.stop();
   assert.equal(await a.messenger.lookup(b.id), false);
 });
@@ -374,7 +366,7 @@ test("processes nothing while inactive or stopped and starts only once", async (
     ok: false,
     reason: "authentication_required",
   });
-  assert.equal(frames(b.sent, "publish").length, 1);
+  assert.equal(frames(b.sent, "authenticate").length, 1);
 });
 
 test("surfaces queue limits without retrying", async () => {
@@ -407,7 +399,7 @@ test("fuzzed queued deliveries never yield foreign plaintext or move the ratchet
   b.hold(false);
   const pool = deliveries(b);
   const state = async () =>
-    b.pairs.transact(a.id, async (s) => ({
+    b.pairs.transact(session(b, a), async (s) => ({
       state: s,
       value: JSON.stringify([s.receiving?.n ?? null, s.skipped.length]),
     }));
@@ -456,7 +448,7 @@ test("fuzzed queued deliveries never yield foreign plaintext or move the ratchet
         mutated = { ...base, ciphertext: encodeBase64Url(bytes) };
         break;
       case 6:
-        mutated = { ...base, key: c.keys.exchange.publicKey };
+        mutated = { ...base, device: c.deviceId };
         break;
       default:
         mutated = {

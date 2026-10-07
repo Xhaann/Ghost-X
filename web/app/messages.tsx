@@ -46,12 +46,12 @@ function status(message: ConversationMessage): string {
 
 const trustLabels: Record<TrustState, string> = {
   unavailable:
-    "Verification cannot be checked: this identity's current key is not available",
+    "Verification cannot be checked: this identity's current devices are not available",
   unverified:
     "Not verified: the server authenticated this identity, but you have not compared fingerprints",
   verified: "Verified: you confirmed this exact fingerprint",
   changed:
-    "Identity key changed since you verified it. Compare the new fingerprint before relying on this conversation.",
+    "This identity's devices or keys changed since you verified it. Compare the new fingerprint before relying on this conversation.",
 };
 
 function Verification({

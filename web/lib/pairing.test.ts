@@ -6,11 +6,13 @@ import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
 import { Messenger } from "./messenger.ts";
 import { Pairing } from "./pairing.ts";
-import { Pairs } from "./pairs.ts";
+import { Pairs, pairAddress } from "./pairs.ts";
 import { PrekeyStore, poolSize } from "./prekeys.ts";
 import { WebSocketTransport } from "./socket.ts";
 import {
+  type SecureDevice,
   freePort,
+  linkedDevice,
   memoryStore,
   secureDevice,
   startServer,
@@ -39,6 +41,10 @@ async function device(port: number, store: Store = memoryStore()) {
   return secureDevice(port, { store });
 }
 
+function address(d: SecureDevice): string {
+  return pairAddress(d.id, d.deviceId);
+}
+
 function frames(list: string[], type: string): Json[] {
   return list.map((f) => JSON.parse(f) as Json).filter((f) => f.type === type);
 }
@@ -57,7 +63,7 @@ test("establishes a session with an offline recipient that completes on reconnec
 
   const a = await device(port);
   assert.equal(await a.pairing.initiate(idB), "pending");
-  assert.equal(a.pairs.state(idB), "pending");
+  assert.equal(a.pairs.state(address(b)), "pending");
   const sent = frames(a.frames, "initiate").at(-1)?.payload as Json;
   assert.deepEqual(Object.keys(sent).sort(), [
     "confirm",
@@ -79,14 +85,14 @@ test("establishes a session with an offline recipient that completes on reconnec
   b = await device(port, storeB);
   assert.equal(b.id, idB);
   await until(
-    () => b.pairs.state(a.id) === "established",
+    () => b.pairs.state(address(a)) === "established",
     "responder established",
   );
   await until(
-    () => a.pairs.state(idB) === "established",
+    () => a.pairs.state(address(b)) === "established",
     "initiator established",
   );
-  assert.equal(a.pairs.id(idB), b.pairs.id(a.id));
+  assert.equal(a.pairs.id(address(b)), b.pairs.id(address(a)));
   assert.ok(!b.prekeys.inventory.onetime.includes(reserved as number));
   assert.equal(
     frames(b.frames, "initiation").length,
@@ -95,6 +101,7 @@ test("establishes a session with an offline recipient that completes on reconnec
   );
   assert.deepEqual(await a.messenger.send(idB, "after async setup"), {
     ok: true,
+    devices: 1,
   });
 
   for (const frame of [...a.frames, ...b.frames]) {
@@ -111,15 +118,15 @@ test("establishes immediately when the recipient is online and survives reloads"
   let a = await device(port, storeA);
   let b = await device(port, storeB);
   assert.equal(await a.pairing.initiate(b.id), "pending");
-  await until(() => a.pairs.state(b.id) === "established", "established");
-  const id = a.pairs.id(b.id);
+  await until(() => a.pairs.state(address(b)) === "established", "established");
+  const id = a.pairs.id(address(b));
   await a.shutdown();
   await b.shutdown();
   a = await device(port, storeA);
   b = await device(port, storeB);
-  assert.equal(a.pairs.state(b.id), "established");
-  assert.equal(b.pairs.state(a.id), "established");
-  assert.equal(a.pairs.id(b.id), id);
+  assert.equal(a.pairs.state(address(b)), "established");
+  assert.equal(b.pairs.state(address(a)), "established");
+  assert.equal(a.pairs.id(address(b)), id);
   assert.equal(await a.pairing.initiate(b.id), "established");
 });
 
@@ -129,9 +136,9 @@ test("a replayed initiation never creates a second session", async () => {
   const a = await device(port);
   const b = await device(port);
   assert.equal(await a.pairing.initiate(b.id), "pending");
-  await until(() => a.pairs.state(b.id) === "established", "established");
+  await until(() => a.pairs.state(address(b)) === "established", "established");
   const initiation = frames(b.frames, "initiation")[0];
-  const first = b.pairs.id(a.id);
+  const first = b.pairs.id(address(a));
   const accepts = frames(b.frames, "accept").length;
   const inventory = b.prekeys.inventory.onetime.length;
 
@@ -145,7 +152,7 @@ test("a replayed initiation never creates a second session", async () => {
   b.deliver(JSON.stringify(noOnetime));
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.equal(frames(b.frames, "accept").length, accepts);
-  assert.equal(b.pairs.id(a.id), first);
+  assert.equal(b.pairs.id(address(a)), first);
   assert.equal(b.prekeys.inventory.onetime.length, inventory);
 
   const replay = await a.client.request({
@@ -170,7 +177,7 @@ test("a replay without a one-time prekey is caught by the consumed-initiation re
   assert.equal(await a.pairing.initiate(b.id), "pending");
   const sent = frames(a.frames, "initiate").at(-1)?.payload as Json;
   assert.equal(sent.onetime === null || typeof sent.onetime === "number", true);
-  await until(() => a.pairs.state(b.id) === "established", "established");
+  await until(() => a.pairs.state(address(b)) === "established", "established");
   const initiation = frames(b.frames, "initiation")[0];
   const accepts = frames(b.frames, "accept").length;
   b.deliver(JSON.stringify(initiation));
@@ -200,7 +207,8 @@ test("malicious bundle substitutions are rejected before any initiation", async 
   const gOnetime = gb.onetime;
   assert.ok(gOnetime && ob.onetime);
   const substitutions = [
-    { ...g, key: o.key, signature: o.signature },
+    { ...g, bundles: [ob] },
+    { ...g, bundles: [{ ...ob, device: gb.device }] },
     { ...g, bundles: [{ ...gb, signed: ob.signed }] },
     {
       ...g,
@@ -242,7 +250,7 @@ test("malicious bundle substitutions are rejected before any initiation", async 
     const before = frames(a.frames, "initiate").length;
     assert.equal(await a.pairing.initiate(b.id), "invalid_bundle");
     assert.equal(frames(a.frames, "initiate").length, before);
-    assert.equal(a.pairs.state(b.id), "none");
+    assert.equal(a.pairs.state(address(b)), "none");
   }
   a.client.request = (async (...args: Parameters<Client["request"]>) =>
     args[0].type === "bundle"
@@ -255,7 +263,7 @@ test("malicious bundle substitutions are rejected before any initiation", async 
   assert.equal(await a.pairing.initiate(b.id), "failed");
   a.client.request = original;
   assert.equal(await a.pairing.initiate(b.id), "pending");
-  await until(() => a.pairs.state(b.id) === "established", "genuine");
+  await until(() => a.pairs.state(address(b)) === "established", "genuine");
 });
 
 test("one-time prekeys are reserved atomically, consumed once, and replenished", async () => {
@@ -274,7 +282,7 @@ test("one-time prekeys are reserved atomically, consumed once, and replenished",
   );
   assert.equal(new Set(used).size, used.length);
   await until(
-    () => initiators.every((i) => i.pairs.state(b.id) === "established"),
+    () => initiators.every((i) => i.pairs.state(address(b)) === "established"),
     "all established",
   );
   for (const id of used) {
@@ -313,12 +321,18 @@ test("signed prekey rotation keeps one previous key for delayed initiations", as
   const d = await device(port);
 
   b = await device(port, storeB);
-  await until(() => a.pairs.state(b.id) === "established", "a established");
+  await until(
+    () => a.pairs.state(address(b)) === "established",
+    "a established",
+  );
   assert.equal(await b.prekeys.rotate(), true);
   assert.equal(await b.pairing.publish(), true);
   assert.equal(b.prekeys.inventory.previous, first);
   assert.equal(await d.pairing.initiate(b.id), "pending");
-  await until(() => d.pairs.state(b.id) === "established", "d established");
+  await until(
+    () => d.pairs.state(address(b)) === "established",
+    "d established",
+  );
   const used = (frames(d.frames, "initiate").at(-1)?.payload as Json).signed;
   assert.equal(used, first + 1);
 
@@ -340,14 +354,14 @@ test("signed prekey rotation keeps one previous key for delayed initiations", as
   assert.equal(frames(b.frames, "accept").length, accepts);
 });
 
-test("verification survives prekey rotation and asynchronous sessions but not a key change", async () => {
+test("verification survives prekey rotation and asynchronous sessions but not a device change", async () => {
   const port = await freePort();
   await startServer(port);
-  const storeB = memoryStore();
   const a = await device(port);
-  let b = await device(port, storeB);
-  const { fingerprint } = await import("./fingerprint.ts");
-  const own = await fingerprint(b.id, b.keys.exchange.publicKey);
+  const b = await device(port);
+  const { rosterFingerprint } = await import("./device.ts");
+  assert.ok(b.devices.roster);
+  const own = await rosterFingerprint(b.devices.roster);
   assert.ok(own);
   await a.messenger.lookup(b.id);
   await until(() => a.trust.view(b.id).state === "unverified", "observed");
@@ -356,30 +370,20 @@ test("verification survives prekey rotation and asynchronous sessions but not a 
   assert.equal(await b.prekeys.rotate(), true);
   assert.equal(await b.pairing.publish(), true);
   assert.equal(await a.pairing.initiate(b.id), "pending");
-  await until(() => a.pairs.state(b.id) === "established", "established");
+  await until(() => a.pairs.state(address(b)) === "established", "established");
   assert.equal(a.trust.view(b.id).state, "verified");
 
-  await b.shutdown();
-  const changed = memoryStore();
-  for (const [key, value] of storeB.data) {
-    if (key === "vault:keys") {
-      const { ExchangeKey } = await import("./encryption.ts");
-      const fresh = await ExchangeKey.create();
-      changed.data.set(key, {
-        ...(value as Json),
-        exchangeKey: fresh.key.publicKey,
-        exchange: fresh.privateKey,
-      });
-    }
-  }
-  const idB = b.id;
-  b = await device(port, changed);
-  assert.equal(b.id, idB);
+  const b2 = await linkedDevice(port, b);
+  assert.equal(b2.id, b.id);
   await a.messenger.lookup(b.id);
   await until(() => a.trust.view(b.id).state === "changed", "changed");
-  const renewed = await fingerprint(b.id, b.keys.exchange.publicKey);
+  assert.equal(await a.trust.verify(b.id, own.value), false);
+  assert.ok(b.devices.roster);
+  const renewed = await rosterFingerprint(b.devices.roster);
   assert.ok(renewed);
+  assert.notEqual(renewed.value, own.value);
   assert.equal(await a.trust.verify(b.id, renewed.value), true);
+  assert.equal(a.trust.view(b.id).state, "verified");
 });
 
 test("the server never receives private prekey material and cannot complete a handshake", async () => {
@@ -388,7 +392,7 @@ test("the server never receives private prekey material and cannot complete a ha
   const a = await device(port);
   const b = await device(port);
   assert.equal(await a.pairing.initiate(b.id), "pending");
-  await until(() => a.pairs.state(b.id) === "established", "established");
+  await until(() => a.pairs.state(address(b)) === "established", "established");
   const outbound = [...a.frames, ...b.frames]
     .map((f) => JSON.parse(f) as Json)
     .filter(
@@ -442,7 +446,10 @@ test("a stripped one-time prekey or a stale replayed bundle is handled safely", 
     (frames(a.frames, "initiate").at(-1)?.payload as Json).onetime,
     null,
   );
-  await until(() => a.pairs.state(b.id) === "established", "three-key path");
+  await until(
+    () => a.pairs.state(address(b)) === "established",
+    "three-key path",
+  );
 
   for (let i = 0; i < 2; i++) {
     assert.equal(await b.prekeys.rotate(), true);
@@ -455,7 +462,7 @@ test("a stripped one-time prekey or a stale replayed bundle is handled safely", 
       ? { type: "bundle", id: "q", payload: stale }
       : real(...args)) as Client["request"];
   assert.equal(await c.pairing.initiate(b.id), "failed");
-  assert.equal(c.pairs.state(b.id), "none");
+  assert.equal(c.pairs.state(address(b)), "none");
   const error = frames(c.frames, "error").at(-1)?.payload as Json;
   assert.equal(error.code, "stale_session");
 });
@@ -489,38 +496,59 @@ test("open classifies input by session state and never re-keys on its own", asyn
   const a = await device(port);
   assert.equal(await a.pairing.initiate(idB), "pending");
   const pendingCount = initiations(a);
-  assert.equal(await a.pairing.open(idB, id, await probe(), never), "rejected");
   assert.equal(
-    await a.pairing.open(idB, id, await probe(a.pairs.id(idB)), never),
+    await a.pairing.open(idB, b.deviceId, id, await probe(), never),
+    "rejected",
+  );
+  assert.equal(
+    await a.pairing.open(
+      idB,
+      b.deviceId,
+      id,
+      await probe(a.pairs.id(address(b))),
+      never,
+    ),
     "deferred",
   );
   assert.equal(
-    await a.pairing.open(idB, id, new Uint8Array(80), never),
+    await a.pairing.open(idB, b.deviceId, id, new Uint8Array(80), never),
     "rejected",
   );
   assert.equal(
-    await a.pairing.open(idB, "bad", await probe(a.pairs.id(idB)), never),
+    await a.pairing.open(
+      idB,
+      b.deviceId,
+      "bad",
+      await probe(a.pairs.id(address(b))),
+      never,
+    ),
     "rejected",
   );
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(initiations(a), pendingCount);
-  assert.equal(a.pairs.state(idB), "pending");
+  assert.equal(a.pairs.state(address(b)), "pending");
 
   b = await device(port, storeB);
-  await until(() => a.pairs.state(idB) === "established", "established");
-  const session = a.pairs.id(idB);
-  assert.equal(await a.pairing.open(idB, id, await probe(), never), "rejected");
+  await until(() => a.pairs.state(address(b)) === "established", "established");
+  const session = a.pairs.id(address(b));
   assert.equal(
-    await a.pairing.open(idB, id, await probe(session), never),
+    await a.pairing.open(idB, b.deviceId, id, await probe(), never),
+    "rejected",
+  );
+  assert.equal(
+    await a.pairing.open(idB, b.deviceId, id, await probe(session), never),
     "rejected",
   );
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(initiations(a), pendingCount);
-  assert.equal(a.pairs.id(idB), session);
+  assert.equal(a.pairs.id(address(b)), session);
 
   const c = await device(port);
-  assert.equal(await c.pairing.open(idB, id, await probe(), never), "missing");
+  assert.equal(
+    await c.pairing.open(idB, b.deviceId, id, await probe(), never),
+    "missing",
+  );
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(initiations(c), 0);
-  assert.equal(c.pairs.state(idB), "none");
+  assert.equal(c.pairs.state(address(b)), "none");
 });

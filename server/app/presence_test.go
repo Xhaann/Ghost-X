@@ -148,6 +148,9 @@ func TestPresenceConcurrentSessionsOverWebSocket(t *testing.T) {
 	_, url := startServer(t)
 	f, _ := watch(t, url)
 	k := newKey(t)
+	setup := dialApp(t, url)
+	register(t, setup, k.roster)
+	setup.Close()
 
 	conns := make([]*websocket.Conn, 20)
 	var wg sync.WaitGroup

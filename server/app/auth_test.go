@@ -2,8 +2,6 @@ package app
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,21 +13,50 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/Xhaann/ghost-x/server/auth"
+	"github.com/Xhaann/ghost-x/server/device"
+	"github.com/Xhaann/ghost-x/server/device/devicetest"
+	"github.com/Xhaann/ghost-x/server/protocol"
 )
 
 type key struct {
-	private  ed25519.PrivateKey
+	owner    *devicetest.Identity
+	device   *devicetest.Device
 	identity string
+	roster   device.Roster
 }
 
 func newKey(t *testing.T) key {
 	t.Helper()
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	owner := devicetest.NewIdentity()
+	d := owner.NewDevice()
+	return key{owner: owner, device: d, identity: owner.Identity, roster: owner.Add(d)}
+}
+
+func siblingKeys(t *testing.T, n int) []key {
+	t.Helper()
+	owner := devicetest.NewIdentity()
+	var list []*devicetest.Device
+	for range n {
+		list = append(list, owner.NewDevice())
 	}
-	return key{private: private, identity: base64.RawURLEncoding.EncodeToString(public)}
+	roster := owner.Add(list...)
+	out := make([]key, n)
+	for i, d := range list {
+		out[i] = key{owner: owner, device: d, identity: owner.Identity, roster: roster}
+	}
+	return out
+}
+
+func rosterFrame(r device.Roster) string {
+	payload, _ := json.Marshal(protocol.EncodeRoster(r))
+	return fmt.Sprintf(`{"type":"register","id":"r1","payload":%s}`, payload)
+}
+
+func register(t *testing.T, conn *websocket.Conn, r device.Roster) {
+	t.Helper()
+	if msg := roundTrip(t, conn, rosterFrame(r)); msg.Type != "registered" {
+		t.Fatalf("register = %+v %s", msg, msg.Payload)
+	}
 }
 
 func challenge(t *testing.T, conn *websocket.Conn) []byte {
@@ -52,14 +79,16 @@ func challenge(t *testing.T, conn *websocket.Conn) []byte {
 }
 
 func authenticateRequest(k key, nonce []byte) string {
-	signature := base64.RawURLEncoding.EncodeToString(ed25519.Sign(k.private, auth.Message(nonce)))
-	return fmt.Sprintf(`{"type":"authenticate","id":"a1","payload":{"identity":%q,"signature":%q}}`, k.identity, signature)
+	return fmt.Sprintf(`{"type":"authenticate","id":"a1","payload":{"identity":%q,"device":%q,"signature":%q}}`, k.identity, k.device.ID, k.device.AuthSignature(k.owner, nonce))
 }
 
 func authenticateConn(t *testing.T, conn *websocket.Conn, k key) {
 	t.Helper()
+	if msg := roundTrip(t, conn, rosterFrame(k.roster)); msg.Type != "registered" && string(msg.Payload) != `{"code":"stale_roster"}` {
+		t.Fatalf("register = %+v %s", msg, msg.Payload)
+	}
 	msg := roundTrip(t, conn, authenticateRequest(k, challenge(t, conn)))
-	if msg.Type != "authenticated" || string(msg.Payload) != `{"identity":"`+k.identity+`"}` {
+	if msg.Type != "authenticated" || string(msg.Payload) != `{"identity":"`+k.identity+`","device":"`+k.device.ID+`"}` {
 		t.Fatalf("authenticate response = %+v %s", msg, msg.Payload)
 	}
 }
@@ -103,6 +132,7 @@ func TestProofCannotMoveBetweenConnections(t *testing.T) {
 	srv, url := startServer(t)
 	first, second := dialApp(t, url), dialApp(t, url)
 	k := newKey(t)
+	register(t, first, k.roster)
 
 	nonce := challenge(t, first)
 	challenge(t, second)
@@ -141,6 +171,7 @@ func TestReconnectRequiresFreshAuthentication(t *testing.T) {
 	srv, url := startServer(t)
 	k := newKey(t)
 	first := dialApp(t, url)
+	register(t, first, k.roster)
 	nonce := challenge(t, first)
 	request := authenticateRequest(k, nonce)
 	if msg := roundTrip(t, first, request); msg.Type != "authenticated" {
@@ -189,7 +220,7 @@ func serveDirect(t *testing.T) (*Server, string, context.CancelFunc, chan error)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(testConfig())
+	srv := newServer(t, testConfig())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ctx, ln) }()
@@ -257,6 +288,9 @@ func TestForcedShutdownDestroysSessions(t *testing.T) {
 func TestConcurrentAuthenticationAndDisconnect(t *testing.T) {
 	srv, url := startServer(t)
 	k := newKey(t)
+	setup := dialApp(t, url)
+	register(t, setup, k.roster)
+	setup.Close()
 
 	var wg sync.WaitGroup
 	for i := range 30 {
@@ -329,10 +363,10 @@ func TestProtectedOperationBoundToConnection(t *testing.T) {
 	authenticateConn(t, first, k)
 	authenticateConn(t, second, other)
 
-	for conn, want := range map[*websocket.Conn]string{first: k.identity, second: other.identity} {
+	for conn, want := range map[*websocket.Conn]key{first: k, second: other} {
 		msg := roundTrip(t, conn, `{"type":"whoami","id":"w1","payload":{}}`)
-		if msg.Type != "whoami" || string(msg.Payload) != `{"identity":"`+want+`"}` {
-			t.Fatalf("whoami = %+v %s, want %s", msg, msg.Payload, want)
+		if msg.Type != "whoami" || string(msg.Payload) != `{"identity":"`+want.identity+`","device":"`+want.device.ID+`"}` {
+			t.Fatalf("whoami = %+v %s, want %s", msg, msg.Payload, want.identity)
 		}
 	}
 	expectError(t, roundTrip(t, third, `{"type":"whoami","id":"w1","payload":{}}`), "authentication_required")

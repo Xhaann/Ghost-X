@@ -2,7 +2,19 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { type AuthState, Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
-import { IdentityKey } from "./identity.ts";
+import { Devices } from "./devices.ts";
+import { memoryStore } from "./testing.ts";
+import { type Keys, type Unlocked, createVault } from "./vault.ts";
+
+type Local = { identity: string; keys: Keys; devices: Devices };
+
+async function local(): Promise<Local> {
+  const store = memoryStore();
+  const vault = (await createVault(store)) as Unlocked;
+  const devices = await Devices.open(store, vault.keys);
+  assert.ok(devices);
+  return { identity: vault.keys.identity, keys: vault.keys, devices };
+}
 import { Presence, type PresenceState } from "./presence.ts";
 import { WebSocketTransport } from "./socket.ts";
 import {
@@ -19,7 +31,7 @@ useServer();
 
 type Peer = {
   client: Client;
-  key: IdentityKey;
+  key: Local;
   auth: Authenticator;
   presence: Presence;
   log: PresenceState[];
@@ -47,7 +59,7 @@ async function authenticated(
 
 async function peer(
   port: number,
-  key?: IdentityKey,
+  key?: Local,
   withPresence = true,
 ): Promise<Peer> {
   const client = track(
@@ -57,8 +69,8 @@ async function peer(
       ),
     ),
   );
-  const identity = key ?? (await IdentityKey.generate());
-  const auth = new Authenticator(client, identity);
+  const identity = key ?? (await local());
+  const auth = new Authenticator(client, identity.keys, identity.devices);
   const presence = new Presence(client, auth);
   track({ close: () => presence.stop() });
   track({ close: () => auth.stop() });
@@ -91,7 +103,8 @@ test("stays inactive until authenticated", async () => {
   const client = track(
     new Client(track(new WebSocketTransport(`ws://127.0.0.1:${port}/ws`))),
   );
-  const auth = new Authenticator(client, await IdentityKey.generate());
+  const owner = await local();
+  const auth = new Authenticator(client, owner.keys, owner.devices);
   const presence = new Presence(client, auth);
   track({ close: () => presence.stop() });
   const log: PresenceState[] = [];
@@ -143,7 +156,7 @@ test("keeps an identity present while any session remains", async () => {
   await startServer(port);
   const a = await peer(port);
   await until(activeWith(a, a.key.identity), "own presence");
-  const shared = await IdentityKey.generate();
+  const shared = await local();
 
   const first = await peer(port, shared, false);
   await until(activeWith(a, a.key.identity, shared.identity), "shared present");
@@ -226,7 +239,7 @@ test("ignores malformed, stale, and duplicate presence frames", async () => {
   const a = await peer(port);
   await until(activeWith(a, a.key.identity), "own presence");
   const [socket] = openSockets();
-  const other = await IdentityKey.generate();
+  const other = await local();
   const inject = (data: unknown) =>
     socket.dispatchEvent(
       new MessageEvent("message", {
@@ -253,7 +266,7 @@ test("ignores presence frames while inactive", async () => {
   const a = await peer(port);
   await until(activeWith(a, a.key.identity), "own presence");
   const [socket] = openSockets();
-  const other = await IdentityKey.generate();
+  const other = await local();
 
   a.auth.stop();
   await until(() => a.presence.state.status === "inactive", "reset");
@@ -275,8 +288,8 @@ test("discards a subscription reply from a superseded attempt", async () => {
   const client = track(
     new Client(track(new WebSocketTransport(`ws://127.0.0.1:${port}/ws`))),
   );
-  const key = await IdentityKey.generate();
-  const auth = new Authenticator(client, key);
+  const key = await local();
+  const auth = new Authenticator(client, key.keys, key.devices);
   track({ close: () => auth.stop() });
   let state: AuthState = "unauthenticated";
   const listeners = new Set<(s: AuthState) => void>();

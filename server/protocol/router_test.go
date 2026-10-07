@@ -11,7 +11,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/Xhaann/ghost-x/server/auth"
-	"github.com/Xhaann/ghost-x/server/direct"
 	"github.com/Xhaann/ghost-x/server/prekey"
 	"github.com/Xhaann/ghost-x/server/presence"
 	"github.com/Xhaann/ghost-x/server/queue"
@@ -49,29 +48,28 @@ func errorCode(t *testing.T, resp response) Code {
 func discard([]byte) {}
 
 func testSession() *auth.Session {
-	return auth.NewRegistry(time.Now, nil).Open()
+	return auth.NewRegistry(time.Now, nil, testDevices).Open()
 }
 
 func newTestRouter() *Router {
-	messages := direct.NewRegistry()
-	prekeys := prekey.NewRegistry()
-	queued := queue.NewRegistry(time.Now)
+	prekeys := prekey.NewRegistry(testDevices.Authorized)
+	queued := queue.NewRegistry(time.Now, testDevices.Authorized)
 	return NewRouter(map[string]Handler{
 		"ping":         Ping(time.Now),
 		"challenge":    Challenge(),
 		"authenticate": Authenticate(),
+		"register":     Register(testDevices),
+		"devices":      Devices(testDevices),
 	}, map[string]ProtectedHandler{
 		"whoami":   WhoAmI(),
 		"presence": Presence(presence.NewRegistry()),
-		"send":     Send(messages, prekeys, queued),
+		"send":     Send(queued),
 		"fetch":    Fetch(queued),
 		"ack":      Ack(queued),
 		"clear":    Clear(queued),
-		"publish":  Publish(messages),
-		"key":      Key(messages),
-		"prekeys":  Prekeys(messages, prekeys),
+		"prekeys":  Prekeys(testDevices, prekeys),
 		"bundle":   FetchBundle(prekeys),
-		"initiate": Initiate(messages, prekeys),
+		"initiate": Initiate(testDevices, prekeys),
 		"accept":   Accept(prekeys),
 	})
 }
@@ -212,18 +210,18 @@ func FuzzRouterHandle(f *testing.F) {
 		`{"type":"challenge","id":"a","payload":{}}`,
 		`{"type":"whoami","id":"a","payload":{}}`,
 		`{"type":"presence","id":"a","payload":{}}`,
-		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA","ciphertext":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"send","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA","envelopes":[{"device":"AAAAAAAAAAAAAAAAAAAAAA","ciphertext":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]}}`,
+		`{"type":"register","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","version":1,"devices":[{"id":"AAAAAAAAAAAAAAAAAAAAAA","signing":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","exchange":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}],"signature":"x"}}`,
+		`{"type":"devices","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"fetch","id":"a","payload":{}}`,
-		`{"type":"ack","id":"a","payload":{"from":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA"}}`,
-		`{"type":"clear","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA"}}`,
-		`{"type":"publish","id":"a","payload":{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
-		`{"type":"key","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"ack","id":"a","payload":{"from":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","device":"AAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"clear","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","device":"AAAAAAAAAAAAAAAAAAAAAA","id":"AAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"prekeys","id":"a","payload":{"device":"AAAAAAAAAAAAAAAAAAAAAA","signed":{"id":1,"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"},"onetime":[]}}`,
 		`{"type":"bundle","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
-		`{"type":"initiate","id":"a","payload":{"version":2,"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","device":"AAAAAAAAAAAAAAAAAAAAAA","signed":1,"onetime":null,"ephemeral":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ratchet":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","proof":"x","confirm":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
-		`{"type":"accept","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ephemeral":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","confirm":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"initiate","id":"a","payload":{"version":3,"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","device":"AAAAAAAAAAAAAAAAAAAAAA","signed":1,"onetime":null,"ephemeral":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ratchet":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","proof":"x","confirm":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
+		`{"type":"accept","id":"a","payload":{"to":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","device":"AAAAAAAAAAAAAAAAAAAAAA","ephemeral":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","confirm":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
 		`{"type":"present","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}`,
-		`{"type":"authenticate","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
+		`{"type":"authenticate","id":"a","payload":{"identity":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","device":"AAAAAAAAAAAAAAAAAAAAAA","signature":"x"}}`,
 	} {
 		f.Add([]byte(seed))
 	}

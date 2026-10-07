@@ -69,8 +69,8 @@ const ranks: Record<DeliveryState, number> = {
   failed: 1,
   unavailable: 1,
   queued: 2,
-  delivered: 3,
   expired: 3,
+  delivered: 4,
 };
 
 export function advances(from: DeliveryState, to: DeliveryState): boolean {

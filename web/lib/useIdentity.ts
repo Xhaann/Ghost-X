@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Devices } from "./devices.ts";
 import { History } from "./history.ts";
 import { Pairs } from "./pairs.ts";
 import { PrekeyStore } from "./prekeys.ts";
 import { openIndexedStore } from "./storage.ts";
 import { Trust } from "./trust.ts";
-import { type Keys, loadVault } from "./vault.ts";
+import {
+  type Keys,
+  type VaultState,
+  createVault,
+  linkVault,
+  loadVault,
+} from "./vault.ts";
 
 export type LocalSession = {
   keys: Keys;
+  devices: Devices;
   history: History;
   trust: Trust;
   prekeys: PrekeyStore | null;
@@ -19,12 +27,21 @@ export type LocalState =
   | { status: "loading" }
   | { status: "unavailable" }
   | { status: "corrupted" }
+  | { status: "empty" }
   | ({ status: "ready" } & LocalSession);
 
-export function useIdentity(): { local: LocalState; reset: () => void } {
+type Setup = { kind: "create" } | { kind: "link"; identity: string } | null;
+
+export function useIdentity(): {
+  local: LocalState;
+  reset: () => void;
+  create: () => void;
+  link: (identity: string) => void;
+} {
   const [local, setLocal] = useState<LocalState>({ status: "loading" });
   const [epoch, setEpoch] = useState(0);
   const resetting = useRef(false);
+  const setup = useRef<Setup>(null);
   const settled = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
@@ -48,26 +65,37 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
         close();
         return;
       }
-      const vault = await loadVault(store);
-      if (vault.status === "corrupted") {
+      let vault: VaultState = await loadVault(store);
+      const requested = setup.current;
+      setup.current = null;
+      if (vault.status === "empty" && requested) {
+        vault =
+          requested.kind === "create"
+            ? await createVault(store)
+            : await linkVault(store, requested.identity);
+      }
+      if (vault.status !== "ready") {
         if (active) {
           setLocal(vault);
         }
         return;
       }
-      const [history, trust, prekeys, pairs] = await Promise.all([
+      const [history, trust, prekeys, pairs, devices] = await Promise.all([
         History.open(store, vault.keys, vault.integrity, vault.storage),
         Trust.open(store, vault.integrity),
         PrekeyStore.open(store, vault.keys, vault.integrity),
-        Pairs.open(
-          store,
-          vault.integrity,
-          vault.storage,
-          vault.keys.identity.identity,
-        ),
+        Pairs.open(store, vault.integrity, vault.storage, vault.keys.identity),
+        Devices.open(store, vault.keys),
       ]);
+      if (!devices) {
+        if (active) {
+          setLocal({ status: "corrupted" });
+        }
+        return;
+      }
       const session = {
         keys: vault.keys,
+        devices,
         history,
         trust,
         prekeys,
@@ -80,7 +108,8 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
         return;
       }
       await Promise.all([history.close(), trust.close(), pairs.close()]);
-      vault.keys.identity.release();
+      vault.keys.root?.release();
+      vault.keys.device.release();
       vault.keys.exchange.release();
       close();
     })().catch(() => {
@@ -100,7 +129,8 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
             session.trust.close(),
             session.pairs.close(),
           ]);
-          session.keys.identity.release();
+          session.keys.root?.release();
+          session.keys.device.release();
           session.keys.exchange.release();
         }
         close();
@@ -114,5 +144,15 @@ export function useIdentity(): { local: LocalState; reset: () => void } {
     setEpoch((value) => value + 1);
   }, []);
 
-  return { local, reset };
+  const create = useCallback(() => {
+    setup.current = { kind: "create" };
+    setEpoch((value) => value + 1);
+  }, []);
+
+  const link = useCallback((identity: string) => {
+    setup.current = { kind: "link", identity };
+    setEpoch((value) => value + 1);
+  }, []);
+
+  return { local, reset, create, link };
 }

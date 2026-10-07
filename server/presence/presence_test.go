@@ -1,9 +1,6 @@
 package presence
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"slices"
 	"sync"
@@ -11,20 +8,26 @@ import (
 	"time"
 
 	"github.com/Xhaann/ghost-x/server/auth"
+	"github.com/Xhaann/ghost-x/server/device"
+	"github.com/Xhaann/ghost-x/server/device/devicetest"
 )
 
+var devices, _ = device.Open("")
+
 type key struct {
-	private  ed25519.PrivateKey
+	owner    *devicetest.Identity
+	device   *devicetest.Device
 	identity string
 }
 
 func newKey(t testing.TB) key {
 	t.Helper()
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
+	owner := devicetest.NewIdentity()
+	d := owner.NewDevice()
+	if err := devices.Publish(owner.Add(d)); err != nil {
 		t.Fatal(err)
 	}
-	return key{private: private, identity: base64.RawURLEncoding.EncodeToString(public)}
+	return key{owner: owner, device: d, identity: owner.Identity}
 }
 
 func (k key) authenticate(t testing.TB, s *auth.Session) error {
@@ -33,8 +36,7 @@ func (k key) authenticate(t testing.TB, s *auth.Session) error {
 	if err != nil {
 		return err
 	}
-	signature := base64.RawURLEncoding.EncodeToString(ed25519.Sign(k.private, auth.Message(nonce)))
-	_, err = s.Authenticate(k.identity, signature)
+	_, err = s.Authenticate(k.identity, k.device.ID, k.device.AuthSignature(k.owner, nonce))
 	return err
 }
 
@@ -62,7 +64,7 @@ type fixture struct {
 
 func newFixture() fixture {
 	p := NewRegistry()
-	return fixture{presence: p, sessions: auth.NewRegistry(time.Now, p)}
+	return fixture{presence: p, sessions: auth.NewRegistry(time.Now, p, devices)}
 }
 
 func (f fixture) authenticated(t *testing.T, k key) *auth.Session {
@@ -116,7 +118,7 @@ func TestFailedAuthenticationIsNotPresent(t *testing.T) {
 
 	for range auth.MaxFailures {
 		nonce, _ := s.Challenge()
-		s.Authenticate(k.identity, base64.RawURLEncoding.EncodeToString(ed25519.Sign(other.private, auth.Message(nonce))))
+		s.Authenticate(k.identity, k.device.ID, other.device.AuthSignature(k.owner, nonce))
 	}
 	s.Close()
 
@@ -183,7 +185,7 @@ func TestRepeatedLifecycleEventsAreHarmless(t *testing.T) {
 
 	s := f.authenticated(t, k)
 	id, _ := s.Identity()
-	f.presence.Authenticated(s, id)
+	f.presence.Authenticated(s, id, "")
 	s.Close()
 	s.Close()
 	f.presence.Closed(s, id)
@@ -317,9 +319,9 @@ func TestAuthenticationRacingClose(t *testing.T) {
 	for range 200 {
 		s := f.sessions.Open()
 		nonce, _ := s.Challenge()
-		signature := base64.RawURLEncoding.EncodeToString(ed25519.Sign(k.private, auth.Message(nonce)))
+		signature := k.device.AuthSignature(k.owner, nonce)
 		var wg sync.WaitGroup
-		wg.Go(func() { s.Authenticate(k.identity, signature) })
+		wg.Go(func() { s.Authenticate(k.identity, k.device.ID, signature) })
 		wg.Go(s.Close)
 		wg.Wait()
 	}

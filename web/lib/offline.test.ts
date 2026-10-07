@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { pairAddress } from "./pairs.ts";
 import { encodeBase64Url } from "./base64.ts";
 import { Conversations, type DeliveryState } from "./conversations.ts";
 import { maxSkip, maxSkipped } from "./ratchet.ts";
@@ -118,12 +119,16 @@ async function stored(
     .map((m) => m.body);
 }
 
+function address(device: Device): string {
+  return pairAddress(device.id, device.deviceId);
+}
+
 async function pair(port: number) {
   const storeA = memoryStore();
   const storeB = memoryStore();
   const a = await boot(port, storeA);
   const b = await boot(port, storeB);
-  assert.equal(await a.pairing.establish(b.id), "established");
+  assert.equal((await a.pairing.establish(b.id)).result, "established");
   return { a, b, storeA, storeB };
 }
 
@@ -156,7 +161,11 @@ test("messages sent to an offline recipient are queued as ciphertext and deliver
   );
   for (const frame of frames(a.sent, "send")) {
     const payload = frame.payload as Json;
-    assert.deepEqual(Object.keys(payload).sort(), ["ciphertext", "id", "to"]);
+    assert.deepEqual(Object.keys(payload).sort(), ["envelopes", "id", "to"]);
+    assert.deepEqual(
+      (payload.envelopes as Json[]).map((e) => e.device),
+      [b.deviceId],
+    );
     assert.ok(!secrets.some((s) => JSON.stringify(payload).includes(s)));
   }
 
@@ -204,7 +213,7 @@ test("the sender ratchet advances while the recipient is offline and the recipie
 
   const count = maxSkip + 20;
   const chain = async () =>
-    a.pairs.transact(idB, async (s) => ({
+    a.pairs.transact(address(b), async (s) => ({
       state: s,
       value: s.sending?.n ?? 0,
     }));
@@ -224,7 +233,7 @@ test("the sender ratchet advances while the recipient is offline and the recipie
   assert.equal(bodies.length, 128 > count ? count : 128);
   assert.equal(((await chain()) ?? 0) - (start ?? 0), count);
   const texts = frames(a.sent, "send").map(
-    (f) => (f.payload as Json).ciphertext,
+    (f) => ((f.payload as Json).envelopes as Json[])[0].ciphertext,
   );
   assert.equal(new Set(texts).size, texts.length);
 
@@ -235,7 +244,7 @@ test("the sender ratchet advances while the recipient is offline and the recipie
     15000,
   );
   assert.deepEqual(received(again, a.id), bodies);
-  const skipped = await again.pairs.transact(a.id, async (s) => ({
+  const skipped = await again.pairs.transact(address(a), async (s) => ({
     state: s,
     value: s.skipped.length,
   }));
@@ -255,9 +264,11 @@ test("a gap beyond the skip bound fails closed without moving the ratchet", asyn
   await startServer(port);
   const { a, b } = await pair(port);
   for (let i = 0; i <= maxSkip; i++) {
-    assert.ok(await a.pairing.seal(b.id, createMessageId(), `lost ${i}`));
+    assert.ok(
+      await a.pairing.seal(b.id, b.deviceId, createMessageId(), `lost ${i}`),
+    );
   }
-  const before = await b.pairs.transact(a.id, async (s) => ({
+  const before = await b.pairs.transact(address(a), async (s) => ({
     state: s,
     value: JSON.stringify([s.receiving?.n ?? null, s.skipped.length]),
   }));
@@ -265,7 +276,7 @@ test("a gap beyond the skip bound fails closed without moving the ratchet", asyn
   assert.equal((await send(a, "too far ahead")).result, "queued");
   await until(() => received(b, a.id).length === 1, "processed");
   assert.deepEqual(received(b, a.id), [null]);
-  const after = await b.pairs.transact(a.id, async (s) => ({
+  const after = await b.pairs.transact(address(a), async (s) => ({
     state: s,
     value: JSON.stringify([s.receiving?.n ?? null, s.skipped.length]),
   }));
@@ -304,7 +315,7 @@ test("crash after decryption but before recording keeps the message and the ratc
     return realPut(name, key, value);
   };
   const ratchet = async (d: Device) =>
-    d.pairs.transact(a.id, async (s) => ({
+    d.pairs.transact(address(a), async (s) => ({
       state: s,
       value: s.receiving?.n ?? -1,
     }));
@@ -348,7 +359,7 @@ test("crash after recording but before the ratchet commit heals on redelivery", 
   await until(() => frames(again.sent, "ack").length >= 1, "acknowledged");
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual(received(again, a.id), ["recorded first"]);
-  const skipped = await again.pairs.transact(a.id, async (s) => ({
+  const skipped = await again.pairs.transact(address(a), async (s) => ({
     state: s,
     value: s.skipped.length,
   }));
@@ -475,20 +486,20 @@ test("queued ciphertext from a replaced session is rejected, never decrypted wit
   const { a, b, storeA, storeB } = await pair(port);
   const idA = a.id;
   const idB = b.id;
-  const oldSession = b.pairs.id(idA);
+  const oldSession = b.pairs.id(address(a));
   await b.shutdown();
   a.conversations.open(idB);
   assert.equal((await send(a, "old session message")).result, "queued");
   await a.shutdown();
-  storeA.data.delete(`pairs:${idB}`);
+  storeA.data.delete(`pairs:${address(b)}`);
   const fresh = await boot(port, storeA);
   assert.equal(await fresh.pairing.initiate(idB), "pending");
 
   const held = await boot(port, storeB, { drop: ["message"] });
   await until(
     () =>
-      held.pairs.id(idA) !== oldSession &&
-      held.pairs.state(idA) === "established",
+      held.pairs.id(address(a)) !== oldSession &&
+      held.pairs.state(address(a)) === "established",
     "new session",
   );
   await held.shutdown();
@@ -499,7 +510,7 @@ test("queued ciphertext from a replaced session is rejected, never decrypted wit
   );
   assert.deepEqual(received(again, idA), [null]);
   await until(
-    () => fresh.pairs.state(idB) === "established",
+    () => fresh.pairs.state(address(b)) === "established",
     "initiator established",
   );
   fresh.conversations.open(idB);
@@ -519,7 +530,7 @@ test("a message arriving before its session is confirmed waits instead of failin
   a.delay(["acceptance"]);
   assert.equal(await a.pairing.initiate(idB), "pending");
   b = await boot(port, storeB);
-  await until(() => b.pairs.state(a.id) === "established", "responder");
+  await until(() => b.pairs.state(address(a)) === "established", "responder");
   b.conversations.open(a.id);
   assert.equal((await send(b, "early reply")).result, "queued");
   await until(
@@ -527,11 +538,11 @@ test("a message arriving before its session is confirmed waits instead of failin
     "arrived early",
   );
   await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(a.pairs.state(idB), "pending");
+  assert.equal(a.pairs.state(address(b)), "pending");
   assert.deepEqual(received(a, idB), []);
   assert.equal(frames(a.sent, "ack").length, 0);
   a.release();
-  await until(() => a.pairs.state(idB) === "established", "confirmed");
+  await until(() => a.pairs.state(address(b)) === "established", "confirmed");
   await until(() => received(a, idB).length === 1, "deferred delivery");
   assert.deepEqual(received(a, idB), ["early reply"]);
   await until(() => frames(a.sent, "ack").length === 1, "acknowledged");
@@ -549,7 +560,7 @@ test("forged and replayed acknowledgments never remove another recipient's messa
     for (const from of [a.id, b.id, mallory.id]) {
       await actor.client.request({
         type: "ack",
-        payload: { from, id: message.id },
+        payload: { from, device: a.deviceId, id: message.id },
       });
     }
   }
@@ -563,7 +574,7 @@ test("forged and replayed acknowledgments never remove another recipient's messa
   for (let i = 0; i < 3; i++) {
     await again.client.request({
       type: "ack",
-      payload: { from: a.id, id: message.id },
+      payload: { from: a.id, device: a.deviceId, id: message.id },
     });
   }
   await new Promise((resolve) => setTimeout(resolve, 100));

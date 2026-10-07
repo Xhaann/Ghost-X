@@ -7,8 +7,9 @@ import { useAuth } from "@/lib/useAuth.ts";
 import { type LocalState, useIdentity } from "@/lib/useIdentity.ts";
 import { usePresence } from "@/lib/usePresence.ts";
 import { useWhoami } from "@/lib/useWhoami.ts";
-import { useEffect, useState } from "react";
-import { type Fingerprint, fingerprint } from "@/lib/fingerprint.ts";
+import { type FormEvent, useState } from "react";
+import { isIdentity } from "@/lib/identity.ts";
+import DevicePanel from "./devices";
 import Messages from "./messages";
 
 const labels: Record<AuthState, string> = {
@@ -16,6 +17,8 @@ const labels: Record<AuthState, string> = {
   authenticating: "Authenticating",
   authenticated: "Authenticated",
   failed: "Authentication failed",
+  pending: "Waiting for this device to be authorized",
+  revoked: "This device is no longer authorized",
 };
 
 function presenceLabel(presence: PresenceState, self: string | undefined) {
@@ -36,7 +39,47 @@ const localLabels: Record<Exclude<LocalState["status"], "ready">, string> = {
   loading: "Loading",
   unavailable: "Local storage unavailable",
   corrupted: "Stored identity could not be restored",
+  empty: "No identity on this device",
 };
+
+function Setup({
+  onCreate,
+  onLink,
+}: {
+  onCreate: () => void;
+  onLink: (identity: string) => void;
+}) {
+  const [identity, setIdentity] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    const value = identity.trim();
+    if (!isIdentity(value)) {
+      setNotice("Invalid identity");
+      return;
+    }
+    onLink(value);
+  };
+  return (
+    <div data-setup>
+      <button type="button" onClick={onCreate}>
+        Create a new identity
+      </button>
+      <form onSubmit={submit}>
+        <label>
+          Link this device to an existing identity{" "}
+          <input
+            aria-label="Identity to link"
+            value={identity}
+            onChange={(event) => setIdentity(event.target.value)}
+          />
+        </label>{" "}
+        <button type="submit">Link device</button>
+      </form>
+      {notice && <output>{notice}</output>}
+    </div>
+  );
+}
 
 function Reset({ onReset }: { onReset: () => void }) {
   const [confirming, setConfirming] = useState(false);
@@ -66,62 +109,41 @@ function Reset({ onReset }: { onReset: () => void }) {
   );
 }
 
-function OwnFingerprint({
-  identity,
-  exchangeKey,
-}: {
-  identity: string;
-  exchangeKey: string;
-}) {
-  const [print, setPrint] = useState<Fingerprint | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    fingerprint(identity, exchangeKey).then((value) => {
-      if (active) {
-        setPrint(value);
-      }
-    });
-    return () => {
-      active = false;
-      setPrint(null);
-    };
-  }, [identity, exchangeKey]);
-
-  return print ? (
-    <p>
-      Your fingerprint <code data-own-fingerprint>{print.digits}</code>
-    </p>
-  ) : null;
-}
-
 export default function Identity({ client }: { client: Client | null }) {
-  const { local, reset } = useIdentity();
+  const { local, reset, create, link } = useIdentity();
   const session = local.status === "ready" ? local : null;
-  const key = session?.keys.identity ?? null;
-  const { state, authenticator } = useAuth(client, key);
+  const self = session?.keys.identity;
+  const { state, authenticator } = useAuth(client, session);
   const presence = usePresence(client, authenticator);
   const { query, result } = useWhoami(client, state);
-  const others = presence.identities.filter((id) => id !== key?.identity);
+  const others = presence.identities.filter((id) => id !== self);
 
   return (
     <section>
       {session ? (
         <p>
-          Identity <code>{session.keys.identity.identity}</code>{" "}
+          Identity <code data-identity>{session.keys.identity}</code>{" "}
           <span data-origin={session.created ? "created" : "restored"}>
-            {session.created ? "New identity" : "Restored identity"}
-          </span>
+            {session.created
+              ? session.keys.root
+                ? "New identity"
+                : "New linked device"
+              : "Restored identity"}
+          </span>{" "}
+          Device <code data-device-id>{session.keys.deviceId}</code>
         </p>
       ) : (
         <p data-local={local.status}>
           {localLabels[local.status as keyof typeof localLabels]}
         </p>
       )}
+      {local.status === "empty" && <Setup onCreate={create} onLink={link} />}
       {session && (
-        <OwnFingerprint
-          identity={session.keys.identity.identity}
-          exchangeKey={session.keys.exchange.publicKey}
+        <DevicePanel
+          client={client}
+          devices={session.devices}
+          identity={session.keys.identity}
+          deviceId={session.keys.deviceId}
         />
       )}
       {(session || local.status === "corrupted") && <Reset onReset={reset} />}
@@ -144,9 +166,7 @@ export default function Identity({ client }: { client: Client | null }) {
       )}
       {state === "authenticated" && (
         <>
-          <p data-presence={presence.status}>
-            {presenceLabel(presence, key?.identity)}
-          </p>
+          <p data-presence={presence.status}>{presenceLabel(presence, self)}</p>
           {presence.status === "active" &&
             (others.length === 0 ? (
               <p data-others="0">No other identities present</p>

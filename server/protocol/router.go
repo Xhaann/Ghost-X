@@ -18,10 +18,12 @@ type Router struct {
 }
 
 type Conn struct {
-	router  *Router
-	session *auth.Session
-	push    func([]byte)
-	request string
+	router        *Router
+	session       *auth.Session
+	push          func([]byte)
+	request       string
+	registrations int
+	lookups       int
 }
 
 func NewRouter(public map[string]Handler, protected map[string]ProtectedHandler) *Router {

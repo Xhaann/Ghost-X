@@ -13,29 +13,36 @@ export type ErrorCode =
   | "authentication_failed"
   | "recipient_unavailable"
   | "message_too_large"
-  | "key_required"
   | "duplicate_message"
   | "stale_session"
   | "session_limit"
   | "pending_limit"
   | "queue_full"
+  | "stale_roster"
+  | "stale_devices"
+  | "registry_full"
+  | "rate_limited"
+  | "device_revoked"
   | "internal_error";
 
 export type ClientMessage =
   | { type: "ping"; payload: { sentAt: number } }
   | { type: "challenge"; payload: Record<string, never> }
-  | { type: "authenticate"; payload: { identity: string; signature: string } }
+  | {
+      type: "authenticate";
+      payload: { identity: string; device: string; signature: string };
+    }
   | { type: "whoami"; payload: Record<string, never> }
   | { type: "presence"; payload: Record<string, never> }
-  | { type: "publish"; payload: { key: string; signature: string } }
-  | { type: "key"; payload: { identity: string } }
+  | { type: "register"; payload: WireRoster }
+  | { type: "devices"; payload: { identity: string } }
   | {
       type: "send";
-      payload: { to: string; id: string; ciphertext: string };
+      payload: { to: string; id: string; envelopes: WireEnvelope[] };
     }
   | { type: "fetch"; payload: Record<string, never> }
-  | { type: "ack"; payload: { from: string; id: string } }
-  | { type: "clear"; payload: { to: string; id: string } }
+  | { type: "ack"; payload: { from: string; device: string; id: string } }
+  | { type: "clear"; payload: { to: string; device: string; id: string } }
   | {
       type: "prekeys";
       payload: { device: string; signed: WirePrekey; onetime: WirePrekey[] };
@@ -57,8 +64,24 @@ export type ClientMessage =
     }
   | {
       type: "accept";
-      payload: { to: string; ephemeral: string; confirm: string };
+      payload: {
+        to: string;
+        device: string;
+        ephemeral: string;
+        confirm: string;
+      };
     };
+
+export type WireDevice = { id: string; signing: string; exchange: string };
+
+export type WireRoster = {
+  identity: string;
+  version: number;
+  devices: WireDevice[];
+  signature: string;
+};
+
+export type WireEnvelope = { device: string; ciphertext: string };
 
 export type WirePrekey = { id: number; key: string; signature: string };
 
@@ -77,11 +100,16 @@ export type ServerMessage =
       payload: { sentAt: number; receivedAt: number };
     }
   | { type: "challenge"; id: string; payload: { nonce: string } }
-  | { type: "authenticated"; id: string; payload: { identity: string } }
-  | { type: "whoami"; id: string; payload: { identity: string } }
+  | {
+      type: "authenticated" | "whoami";
+      id: string;
+      payload: { identity: string; device: string };
+    }
+  | { type: "registered"; id: string; payload: { version: number } }
+  | { type: "devices"; id: string; payload: WireRoster }
   | { type: "presence"; id: string; payload: Record<string, never> }
   | {
-      type: "queued" | "fetched" | "acked" | "cleared" | "published";
+      type: "queued" | "fetched" | "acked" | "cleared";
       id: string;
       payload: Record<string, never>;
     }
@@ -94,8 +122,6 @@ export type ServerMessage =
       payload: {
         version: number;
         identity: string;
-        key: string;
-        signature: string;
         bundles: WireDeviceBundle[];
       };
     }
@@ -105,8 +131,6 @@ export type ServerMessage =
       payload: {
         version: number;
         from: string;
-        key: string;
-        signature: string;
         device: string;
         signed: number;
         onetime: number | null;
@@ -119,28 +143,27 @@ export type ServerMessage =
   | {
       type: "acceptance";
       id?: undefined;
-      payload: { from: string; ephemeral: string; confirm: string };
-    }
-  | {
-      type: "key";
-      id: string;
-      payload: { identity: string; key: string; signature: string };
+      payload: {
+        from: string;
+        device: string;
+        ephemeral: string;
+        confirm: string;
+      };
     }
   | {
       type: "message";
       id?: undefined;
-      payload: {
-        id: string;
-        from: string;
-        key: string;
-        signature: string;
-        ciphertext: string;
-      };
+      payload: { id: string; from: string; device: string; ciphertext: string };
     }
   | {
       type: "receipt";
       id?: undefined;
-      payload: { to: string; id: string; status: ReceiptStatus };
+      payload: {
+        to: string;
+        device: string;
+        id: string;
+        status: ReceiptStatus;
+      };
     }
   | {
       type: "present" | "absent";
@@ -164,6 +187,7 @@ export const maxDevices = 4;
 export const deviceIdSize = 16;
 export const confirmSize = 32;
 export const maxOnetimePublish = 100;
+export const maxRosterVersion = 2 ** 31 - 1;
 export const ratchetHeaderSize = 1 + 16 + 32 + 4 + 4;
 export const messageIdSize = 16;
 export const messageIdLength = 22;
@@ -194,12 +218,16 @@ const errorCodes: readonly string[] = [
   "authentication_failed",
   "recipient_unavailable",
   "message_too_large",
-  "key_required",
   "duplicate_message",
   "stale_session",
   "session_limit",
   "pending_limit",
   "queue_full",
+  "stale_roster",
+  "stale_devices",
+  "registry_full",
+  "rate_limited",
+  "device_revoked",
   "internal_error",
 ];
 
@@ -258,6 +286,57 @@ function parseDeviceBundle(value: unknown): WireDeviceBundle | null {
     return null;
   }
   return { device: value.device, signed, onetime };
+}
+
+export const handshakeWireVersion = 3;
+
+export function isRosterVersion(value: unknown): value is number {
+  return (
+    Number.isSafeInteger(value) &&
+    (value as number) >= 1 &&
+    (value as number) <= maxRosterVersion
+  );
+}
+
+export function parseWireRoster(value: unknown): WireRoster | null {
+  if (
+    !isObject(value) ||
+    !hasOnly(value, ["identity", "version", "devices", "signature"]) ||
+    !isIdentity(value.identity) ||
+    !isRosterVersion(value.version) ||
+    !isFixed(value.signature, signatureSize) ||
+    !Array.isArray(value.devices) ||
+    value.devices.length < 1 ||
+    value.devices.length > maxDevices
+  ) {
+    return null;
+  }
+  const devices: WireDevice[] = [];
+  for (const entry of value.devices) {
+    if (
+      !isObject(entry) ||
+      !hasOnly(entry, ["id", "signing", "exchange"]) ||
+      !isFixed(entry.id, deviceIdSize) ||
+      !isIdentity(entry.signing) ||
+      !isFixed(entry.exchange, exchangeKeySize)
+    ) {
+      return null;
+    }
+    devices.push({
+      id: entry.id,
+      signing: entry.signing,
+      exchange: entry.exchange,
+    });
+  }
+  if (new Set(devices.map((d) => d.id)).size !== devices.length) {
+    return null;
+  }
+  return {
+    identity: value.identity,
+    version: value.version,
+    devices,
+    signature: value.signature,
+  };
 }
 
 export function isFixed(value: unknown, size: number): value is string {
@@ -341,10 +420,35 @@ export function parse(data: unknown): ServerMessage | null {
     if (
       hasOnly(value, ["type", "id", "payload"]) &&
       isValidId(id) &&
-      hasOnly(payload, ["identity"]) &&
-      isIdentity(payload.identity)
+      hasOnly(payload, ["identity", "device"]) &&
+      isIdentity(payload.identity) &&
+      isFixed(payload.device, deviceIdSize)
     ) {
-      return { type, id, payload: { identity: payload.identity } };
+      return {
+        type,
+        id,
+        payload: { identity: payload.identity, device: payload.device },
+      };
+    }
+    return null;
+  }
+
+  if (type === "registered") {
+    if (
+      hasOnly(value, ["type", "id", "payload"]) &&
+      isValidId(id) &&
+      hasOnly(payload, ["version"]) &&
+      isRosterVersion(payload.version)
+    ) {
+      return { type, id, payload: { version: payload.version } };
+    }
+    return null;
+  }
+
+  if (type === "devices") {
+    const roster = parseWireRoster(payload);
+    if (hasOnly(value, ["type", "id", "payload"]) && isValidId(id) && roster) {
+      return { type, id, payload: roster };
     }
     return null;
   }
@@ -364,8 +468,7 @@ export function parse(data: unknown): ServerMessage | null {
     type === "queued" ||
     type === "fetched" ||
     type === "acked" ||
-    type === "cleared" ||
-    type === "published"
+    type === "cleared"
   ) {
     if (
       hasOnly(value, ["type", "id", "payload"]) &&
@@ -377,36 +480,13 @@ export function parse(data: unknown): ServerMessage | null {
     return null;
   }
 
-  if (type === "key") {
-    if (
-      hasOnly(value, ["type", "id", "payload"]) &&
-      isValidId(id) &&
-      hasOnly(payload, ["identity", "key", "signature"]) &&
-      isIdentity(payload.identity) &&
-      isFixed(payload.key, exchangeKeySize) &&
-      isFixed(payload.signature, signatureSize)
-    ) {
-      return {
-        type,
-        id,
-        payload: {
-          identity: payload.identity,
-          key: payload.key,
-          signature: payload.signature,
-        },
-      };
-    }
-    return null;
-  }
-
   if (type === "message") {
     if (
       hasOnly(value, ["type", "payload"]) &&
-      hasOnly(payload, ["id", "from", "key", "signature", "ciphertext"]) &&
+      hasOnly(payload, ["id", "from", "device", "ciphertext"]) &&
       isMessageId(payload.id) &&
       isIdentity(payload.from) &&
-      isFixed(payload.key, exchangeKeySize) &&
-      isFixed(payload.signature, signatureSize) &&
+      isFixed(payload.device, deviceIdSize) &&
       isMessage(payload.ciphertext)
     ) {
       return {
@@ -414,8 +494,7 @@ export function parse(data: unknown): ServerMessage | null {
         payload: {
           id: payload.id,
           from: payload.from,
-          key: payload.key,
-          signature: payload.signature,
+          device: payload.device,
           ciphertext: payload.ciphertext,
         },
       };
@@ -426,14 +505,20 @@ export function parse(data: unknown): ServerMessage | null {
   if (type === "receipt") {
     if (
       hasOnly(value, ["type", "payload"]) &&
-      hasOnly(payload, ["to", "id", "status"]) &&
+      hasOnly(payload, ["to", "device", "id", "status"]) &&
       isIdentity(payload.to) &&
+      isFixed(payload.device, deviceIdSize) &&
       isMessageId(payload.id) &&
       (payload.status === "delivered" || payload.status === "expired")
     ) {
       return {
         type,
-        payload: { to: payload.to, id: payload.id, status: payload.status },
+        payload: {
+          to: payload.to,
+          device: payload.device,
+          id: payload.id,
+          status: payload.status,
+        },
       };
     }
     return null;
@@ -468,17 +553,9 @@ export function parse(data: unknown): ServerMessage | null {
     if (
       hasOnly(value, ["type", "id", "payload"]) &&
       isValidId(id) &&
-      hasOnly(payload, [
-        "version",
-        "identity",
-        "key",
-        "signature",
-        "bundles",
-      ]) &&
-      payload.version === 2 &&
+      hasOnly(payload, ["version", "identity", "bundles"]) &&
+      payload.version === handshakeWireVersion &&
       isIdentity(payload.identity) &&
-      isFixed(payload.key, exchangeKeySize) &&
-      isFixed(payload.signature, signatureSize) &&
       Array.isArray(payload.bundles) &&
       payload.bundles.length >= 1 &&
       payload.bundles.length <= maxDevices
@@ -494,10 +571,8 @@ export function parse(data: unknown): ServerMessage | null {
         type,
         id,
         payload: {
-          version: 2,
+          version: handshakeWireVersion,
           identity: payload.identity,
-          key: payload.key,
-          signature: payload.signature,
           bundles: bundles as WireDeviceBundle[],
         },
       };
@@ -511,8 +586,6 @@ export function parse(data: unknown): ServerMessage | null {
       hasOnly(payload, [
         "version",
         "from",
-        "key",
-        "signature",
         "device",
         "signed",
         "onetime",
@@ -521,10 +594,8 @@ export function parse(data: unknown): ServerMessage | null {
         "proof",
         "confirm",
       ]) &&
-      payload.version === 2 &&
+      payload.version === handshakeWireVersion &&
       isIdentity(payload.from) &&
-      isFixed(payload.key, exchangeKeySize) &&
-      isFixed(payload.signature, signatureSize) &&
       isFixed(payload.device, deviceIdSize) &&
       isEpoch(payload.signed) &&
       (payload.onetime === null || isEpoch(payload.onetime)) &&
@@ -536,10 +607,8 @@ export function parse(data: unknown): ServerMessage | null {
       return {
         type,
         payload: {
-          version: 2,
+          version: handshakeWireVersion,
           from: payload.from,
-          key: payload.key,
-          signature: payload.signature,
           device: payload.device,
           signed: payload.signed,
           onetime: payload.onetime as number | null,
@@ -556,8 +625,9 @@ export function parse(data: unknown): ServerMessage | null {
   if (type === "acceptance") {
     if (
       hasOnly(value, ["type", "payload"]) &&
-      hasOnly(payload, ["from", "ephemeral", "confirm"]) &&
+      hasOnly(payload, ["from", "device", "ephemeral", "confirm"]) &&
       isIdentity(payload.from) &&
+      isFixed(payload.device, deviceIdSize) &&
       isFixed(payload.ephemeral, exchangeKeySize) &&
       isFixed(payload.confirm, confirmSize)
     ) {
@@ -565,6 +635,7 @@ export function parse(data: unknown): ServerMessage | null {
         type,
         payload: {
           from: payload.from,
+          device: payload.device,
           ephemeral: payload.ephemeral,
           confirm: payload.confirm,
         },

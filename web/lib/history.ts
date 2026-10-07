@@ -279,7 +279,7 @@ export class History implements HistoryPort {
   }
 
   async restore(): Promise<RestoreResult> {
-    const self = this.#keys.identity.identity;
+    const self = this.#keys.identity;
     const entries = [...this.#records.entries()];
     const opened = await Promise.all(
       entries.map(async ([, record]): Promise<Restored | null> => {
@@ -428,7 +428,7 @@ export class History implements HistoryPort {
       if (!peerKey) {
         return null;
       }
-      const self = this.#keys.identity.identity;
+      const self = this.#keys.identity;
       const own = this.#keys.exchange.publicRaw;
       const sent = legacy.direction === "sent";
       const parties: Parties = {

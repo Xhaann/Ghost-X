@@ -12,10 +12,6 @@ type challengePayload struct {
 	Nonce string `json:"nonce"`
 }
 
-type identityPayload struct {
-	Identity string `json:"identity"`
-}
-
 func Challenge() Handler {
 	return func(c *Conn, payload []byte) (Reply, error) {
 		if _, err := decodeObject(payload); err != nil {
@@ -34,26 +30,29 @@ func Challenge() Handler {
 
 func Authenticate() Handler {
 	return func(c *Conn, payload []byte) (Reply, error) {
-		var encoded, signature string
-		fields, err := decodeObject(payload, "identity", "signature")
+		var encoded, deviceID, signature string
+		fields, err := decodeObject(payload, "identity", "device", "signature")
 		if err == nil {
 			encoded, err = decodeString(fields["identity"])
+		}
+		if err == nil {
+			deviceID, err = decodeString(fields["device"])
 		}
 		if err == nil {
 			signature, err = decodeString(fields["signature"])
 		}
 		if err != nil {
-			encoded, signature = "", ""
+			encoded, deviceID, signature = "", "", ""
 		}
 
-		id, authErr := c.session.Authenticate(encoded, signature)
+		id, authErr := c.session.Authenticate(encoded, deviceID, signature)
 		if err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
 		if authErr != nil {
 			return Reply{}, authError(authErr)
 		}
-		return Reply{Type: "authenticated", Payload: identityPayload{Identity: id.String()}}, nil
+		return Reply{Type: "authenticated", Payload: authenticatedPayload{Identity: id.String(), Device: deviceID}}, nil
 	}
 }
 
@@ -62,7 +61,8 @@ func WhoAmI() ProtectedHandler {
 		if _, err := decodeObject(payload); err != nil {
 			return Reply{}, &Error{Code: CodeInvalidPayload}
 		}
-		return Reply{Type: "whoami", Payload: identityPayload{Identity: id.String()}}, nil
+		deviceID, _ := c.session.Device()
+		return Reply{Type: "whoami", Payload: authenticatedPayload{Identity: id.String(), Device: deviceID}}, nil
 	}
 }
 

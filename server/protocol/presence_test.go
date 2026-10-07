@@ -43,7 +43,7 @@ func newPresenceFixture() presenceFixture {
 		}, map[string]ProtectedHandler{
 			"presence": Presence(p),
 		}),
-		sessions: auth.NewRegistry(time.Now, p),
+		sessions: auth.NewRegistry(time.Now, p, testDevices),
 		presence: p,
 	}
 }
@@ -203,7 +203,7 @@ func FuzzPresenceRequest(f *testing.F) {
 		conn, session, out := fx.conn()
 		defer session.Close()
 		nonce := requestChallenge(t, conn)
-		if resp := decodeResponse(t, authenticate(conn, s.identity, s.sign(auth.Message(nonce)))); resp.Type != "authenticated" {
+		if resp := decodeResponse(t, authenticate(conn, s.identity, s.device.ID, s.proof(nonce))); resp.Type != "authenticated" {
 			t.Fatalf("authentication = %+v", resp)
 		}
 		reply := conn.Handle([]byte(`{"type":"presence","id":"s1","payload":` + payload + `}`))

@@ -11,7 +11,7 @@ import { exchangeKeySize, isEpoch, isFixed, maxEpoch } from "./protocol.ts";
 import type { KeyValueStore } from "./storage.ts";
 import type { Keys } from "./vault.ts";
 
-export const prekeysVersion = 1;
+export const prekeysVersion = 2;
 export const poolSize = 20;
 export const lowWater = 5;
 export const maxLocalOnetime = 40;
@@ -21,7 +21,7 @@ export const consumedLimit = 256;
 const recordKey = "prekeys";
 const macSize = 32;
 const encoder = new TextEncoder();
-const context = encoder.encode("ghostx/prekeys/v1\0");
+const context = encoder.encode("ghostx/prekeys/v2\0");
 const fields = [
   "v",
   "device",
@@ -195,9 +195,15 @@ export class PrekeyStore {
     integrity: CryptoKey,
   ): Promise<PrekeyStore | null> {
     const existing = await store.get("vault", recordKey);
-    if (existing !== undefined) {
+    const stale =
+      typeof existing === "object" &&
+      existing !== null &&
+      (existing as { v?: unknown }).v === 1;
+    if (existing !== undefined && !stale) {
       const state = await PrekeyStore.#verify(existing, integrity);
-      return state ? new PrekeyStore(store, keys, integrity, state) : null;
+      return state && state.device === keys.deviceId
+        ? new PrekeyStore(store, keys, integrity, state)
+        : null;
     }
     const slots = await Promise.all(
       Array.from({ length: poolSize }, (_, i) => generate(i + 1)),
@@ -205,9 +211,7 @@ export class PrekeyStore {
     const fresh = await PrekeyStore.#seal(
       {
         v: prekeysVersion,
-        device: encodeBase64Url(
-          crypto.getRandomValues(new Uint8Array(deviceIdSize)),
-        ),
+        device: keys.deviceId,
         nextSigned: 2,
         nextOnetime: poolSize + 1,
         uses: 0,
@@ -218,7 +222,17 @@ export class PrekeyStore {
       },
       integrity,
     );
-    if (await store.add("vault", recordKey, fresh)) {
+    if (
+      stale
+        ? await store.swap(
+            "vault",
+            recordKey,
+            (current) =>
+              current !== undefined && (current as { v?: unknown }).v === 1,
+            fresh,
+          )
+        : await store.add("vault", recordKey, fresh)
+    ) {
       return new PrekeyStore(store, keys, integrity, fresh);
     }
     const winner = await PrekeyStore.#verify(
@@ -275,13 +289,10 @@ export class PrekeyStore {
   async publication(): Promise<Publication | null> {
     await this.#refresh();
     const state = this.#state;
-    const staticKey = this.#keys.exchange.publicRaw;
     const sign = (kind: "signed" | "onetime", slot: Slot) =>
       signPrekey(
         kind,
-        this.#keys.identity,
-        staticKey,
-        state.device,
+        this.#keys,
         slot.id,
         decodeBase64Url(slot.key, exchangeKeySize) ?? new Uint8Array(),
       );

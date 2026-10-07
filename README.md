@@ -16,6 +16,7 @@ WebSocket endpoint: `/ws`
 | `SERVER_ADDR` | `:8080` |
 | `SHUTDOWN_TIMEOUT` | `10s` |
 | `ALLOWED_ORIGINS` | same host only |
+| `DEVICE_STORE` | `ghostx/devices.json` in the user config directory |
 
 ## Web
 

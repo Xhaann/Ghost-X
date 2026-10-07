@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -18,6 +19,7 @@ type Config struct {
 	Addr            string
 	ShutdownTimeout time.Duration
 	AllowedOrigins  []string
+	DeviceStore     string
 }
 
 func Load() (Config, error) {
@@ -42,6 +44,19 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid SHUTDOWN_TIMEOUT %q: must be positive", v)
 		}
 		cfg.ShutdownTimeout = d
+	}
+
+	if v, ok := os.LookupEnv("DEVICE_STORE"); ok && v != "" {
+		if !filepath.IsAbs(v) {
+			return Config{}, fmt.Errorf("invalid DEVICE_STORE %q: must be an absolute path", v)
+		}
+		cfg.DeviceStore = v
+	} else {
+		dir, err := os.UserConfigDir()
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve device store: %w", err)
+		}
+		cfg.DeviceStore = filepath.Join(dir, "ghostx", "devices.json")
 	}
 
 	if v, ok := os.LookupEnv("ALLOWED_ORIGINS"); ok && v != "" {

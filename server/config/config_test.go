@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -87,5 +89,26 @@ func TestLoadInvalidOrigins(t *testing.T) {
 				t.Fatal("Load() error = nil, want error")
 			}
 		})
+	}
+}
+
+func TestLoadDeviceStore(t *testing.T) {
+	t.Setenv("DEVICE_STORE", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	dir, _ := os.UserConfigDir()
+	if cfg.DeviceStore != filepath.Join(dir, "ghostx", "devices.json") {
+		t.Errorf("DeviceStore = %q", cfg.DeviceStore)
+	}
+	path := filepath.Join(t.TempDir(), "devices.json")
+	t.Setenv("DEVICE_STORE", path)
+	if cfg, err := Load(); err != nil || cfg.DeviceStore != path {
+		t.Fatalf("DeviceStore = %q, %v", cfg.DeviceStore, err)
+	}
+	t.Setenv("DEVICE_STORE", "relative/devices.json")
+	if _, err := Load(); err == nil {
+		t.Fatal("relative device store accepted")
 	}
 }

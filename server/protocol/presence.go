@@ -33,3 +33,7 @@ func encodePresence(e presence.Event) []byte {
 	}
 	return encode(typ, "", identityPayload{Identity: e.Identity})
 }
+
+type identityPayload struct {
+	Identity string `json:"identity"`
+}

@@ -1,35 +1,14 @@
 package protocol
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Xhaann/ghost-x/server/auth"
 )
-
-type signer struct {
-	private  ed25519.PrivateKey
-	identity string
-}
-
-func newSigner(t testing.TB) signer {
-	t.Helper()
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return signer{private: private, identity: base64.RawURLEncoding.EncodeToString(public)}
-}
-
-func (s signer) sign(message []byte) string {
-	return base64.RawURLEncoding.EncodeToString(ed25519.Sign(s.private, message))
-}
 
 func authRouter() *Router {
 	return NewRouter(map[string]Handler{
@@ -57,10 +36,6 @@ func requestChallenge(t *testing.T, conn *Conn) []byte {
 	return nonce
 }
 
-func authenticate(conn *Conn, identity, signature string) []byte {
-	return conn.Handle(fmt.Appendf(nil, `{"type":"authenticate","id":"a1","payload":{"identity":%q,"signature":%q}}`, identity, signature))
-}
-
 func expectCode(t *testing.T, data []byte, code Code) {
 	t.Helper()
 	if got := errorCode(t, decodeResponse(t, data)); got != code {
@@ -69,15 +44,15 @@ func expectCode(t *testing.T, data []byte, code Code) {
 }
 
 func TestAuthenticateBindsSession(t *testing.T) {
-	registry := auth.NewRegistry(time.Now, nil)
+	registry := auth.NewRegistry(time.Now, nil, testDevices)
 	session := registry.Open()
 	conn := authRouter().Conn(session, discard)
 	s := newSigner(t)
 
 	nonce := requestChallenge(t, conn)
-	resp := decodeResponse(t, authenticate(conn, s.identity, s.sign(auth.Message(nonce))))
+	resp := decodeResponse(t, authenticate(conn, s.identity, s.device.ID, s.proof(nonce)))
 
-	if resp.Type != "authenticated" || resp.ID != "a1" || string(resp.Payload) != `{"identity":"`+s.identity+`"}` {
+	if resp.Type != "authenticated" || resp.ID != "a1" || string(resp.Payload) != `{"identity":"`+s.identity+`","device":"`+s.device.ID+`"}` {
 		t.Fatalf("response = %+v %s", resp, resp.Payload)
 	}
 	if id, ok := session.Identity(); !ok || id.String() != s.identity {
@@ -86,7 +61,7 @@ func TestAuthenticateBindsSession(t *testing.T) {
 }
 
 func TestAuthenticateRejectsCrossConnectionProof(t *testing.T) {
-	registry := auth.NewRegistry(time.Now, nil)
+	registry := auth.NewRegistry(time.Now, nil, testDevices)
 	router := authRouter()
 	firstSession, secondSession := registry.Open(), registry.Open()
 	first, second := router.Conn(firstSession, discard), router.Conn(secondSession, discard)
@@ -94,7 +69,7 @@ func TestAuthenticateRejectsCrossConnectionProof(t *testing.T) {
 
 	nonce := requestChallenge(t, first)
 	requestChallenge(t, second)
-	expectCode(t, authenticate(second, s.identity, s.sign(auth.Message(nonce))), CodeAuthFailed)
+	expectCode(t, authenticate(second, s.identity, s.device.ID, s.proof(nonce)), CodeAuthFailed)
 
 	if _, ok := secondSession.Identity(); ok {
 		t.Fatal("second connection authenticated with first connection's proof")
@@ -113,35 +88,35 @@ func TestAuthenticateFailures(t *testing.T) {
 		code Code
 	}{
 		"no challenge": {func(t *testing.T, conn *Conn) []byte {
-			return authenticate(conn, s.identity, s.sign(auth.Message(make([]byte, auth.ChallengeSize))))
+			return authenticate(conn, s.identity, s.device.ID, s.proof(make([]byte, auth.ChallengeSize)))
 		}, CodeAuthFailed},
 		"replayed proof": {func(t *testing.T, conn *Conn) []byte {
-			sig := s.sign(auth.Message(requestChallenge(t, conn)))
-			expectCode(t, authenticate(conn, s.identity, other.sign([]byte("x"))), CodeAuthFailed)
-			return authenticate(conn, s.identity, sig)
+			sig := s.proof(requestChallenge(t, conn))
+			expectCode(t, authenticate(conn, s.identity, s.device.ID, other.sign([]byte("x"))), CodeAuthFailed)
+			return authenticate(conn, s.identity, s.device.ID, sig)
 		}, CodeAuthFailed},
 		"other identity": {func(t *testing.T, conn *Conn) []byte {
-			return authenticate(conn, other.identity, s.sign(auth.Message(requestChallenge(t, conn))))
+			return authenticate(conn, other.identity, other.device.ID, s.proof(requestChallenge(t, conn)))
 		}, CodeAuthFailed},
 		"previous proof context": {func(t *testing.T, conn *Conn) []byte {
 			nonce := requestChallenge(t, conn)
-			return authenticate(conn, s.identity, s.sign(append([]byte("ghostx/identity/proof/v1\x00"), nonce...)))
+			return authenticate(conn, s.identity, s.device.ID, s.sign(append([]byte("ghostx/identity/proof/v1\x00"), nonce...)))
 		}, CodeAuthFailed},
 		"duplicate authentication": {func(t *testing.T, conn *Conn) []byte {
-			sig := s.sign(auth.Message(requestChallenge(t, conn)))
-			if resp := decodeResponse(t, authenticate(conn, s.identity, sig)); resp.Type != "authenticated" {
+			sig := s.proof(requestChallenge(t, conn))
+			if resp := decodeResponse(t, authenticate(conn, s.identity, s.device.ID, sig)); resp.Type != "authenticated" {
 				t.Fatalf("first authentication = %+v", resp)
 			}
-			return authenticate(conn, s.identity, sig)
+			return authenticate(conn, s.identity, s.device.ID, sig)
 		}, CodeAuthFailed},
 		"challenge after authentication": {func(t *testing.T, conn *Conn) []byte {
-			if resp := decodeResponse(t, authenticate(conn, s.identity, s.sign(auth.Message(requestChallenge(t, conn))))); resp.Type != "authenticated" {
+			if resp := decodeResponse(t, authenticate(conn, s.identity, s.device.ID, s.proof(requestChallenge(t, conn)))); resp.Type != "authenticated" {
 				t.Fatalf("authentication = %+v", resp)
 			}
 			return conn.Handle([]byte(`{"type":"challenge","id":"c2","payload":{}}`))
 		}, CodeAuthFailed},
 		"malformed identity": {func(t *testing.T, conn *Conn) []byte {
-			return authenticate(conn, s.identity+"=", s.sign(auth.Message(requestChallenge(t, conn))))
+			return authenticate(conn, s.identity+"=", s.device.ID, s.proof(requestChallenge(t, conn)))
 		}, CodeInvalidPayload},
 		"malformed payload": {func(t *testing.T, conn *Conn) []byte {
 			requestChallenge(t, conn)
@@ -165,7 +140,7 @@ func TestMalformedAuthenticateConsumesChallenge(t *testing.T) {
 
 	nonce := requestChallenge(t, conn)
 	expectCode(t, conn.Handle([]byte(`{"type":"authenticate","id":"a1","payload":{}}`)), CodeInvalidPayload)
-	expectCode(t, authenticate(conn, s.identity, s.sign(auth.Message(nonce))), CodeAuthFailed)
+	expectCode(t, authenticate(conn, s.identity, s.device.ID, s.proof(nonce)), CodeAuthFailed)
 }
 
 func TestAuthenticationLocksAfterFailures(t *testing.T) {
@@ -176,7 +151,7 @@ func TestAuthenticationLocksAfterFailures(t *testing.T) {
 
 	for range auth.MaxFailures {
 		nonce := requestChallenge(t, conn)
-		expectCode(t, authenticate(conn, s.identity, other.sign(auth.Message(nonce))), CodeAuthFailed)
+		expectCode(t, authenticate(conn, s.identity, s.device.ID, other.proof(nonce)), CodeAuthFailed)
 	}
 	expectCode(t, conn.Handle([]byte(`{"type":"challenge","id":"c1","payload":{}}`)), CodeAuthFailed)
 	if session.State() != auth.Failed {
@@ -192,7 +167,7 @@ func TestClosedSessionRejectsAuthentication(t *testing.T) {
 	nonce := requestChallenge(t, conn)
 	session.Close()
 
-	expectCode(t, authenticate(conn, s.identity, s.sign(auth.Message(nonce))), CodeAuthFailed)
+	expectCode(t, authenticate(conn, s.identity, s.device.ID, s.proof(nonce)), CodeAuthFailed)
 	expectCode(t, conn.Handle([]byte(`{"type":"challenge","id":"c1","payload":{}}`)), CodeAuthFailed)
 	if _, ok := session.Identity(); ok {
 		t.Fatal("closed session authenticated")
@@ -204,9 +179,10 @@ func TestAuthErrorsDoNotLeakDetails(t *testing.T) {
 	s := newSigner(t)
 
 	for _, out := range [][]byte{
-		authenticate(conn, s.identity, "x"),
-		authenticate(conn, "x", "x"),
-		authenticate(conn, s.identity, strings.Repeat("A", 86)),
+		authenticate(conn, s.identity, s.device.ID, "x"),
+		authenticate(conn, "x", "x", "x"),
+		authenticate(conn, s.identity, unregistered().device.ID, s.proof(make([]byte, 32))),
+		authenticate(conn, s.identity, s.device.ID, strings.Repeat("A", 86)),
 	} {
 		for _, leak := range []string{"auth:", "identity:", "edwards25519", "session", "nonce"} {
 			if strings.Contains(string(out), leak) {
@@ -218,14 +194,15 @@ func TestAuthErrorsDoNotLeakDetails(t *testing.T) {
 
 func FuzzAuthenticateMessage(f *testing.F) {
 	s := newSigner(f)
-	f.Add(`{"identity":"` + s.identity + `","signature":"` + strings.Repeat("A", 86) + `"}`)
+	f.Add(`{"identity":"` + s.identity + `","device":"` + s.device.ID + `","signature":"` + strings.Repeat("A", 86) + `"}`)
 	f.Add(`{}`)
 	f.Add(`null`)
 	f.Add(`{"identity":1,"signature":[]}`)
-	f.Add(`{"identity":"` + strings.Repeat("A", 43) + `","signature":"` + strings.Repeat("_", 86) + `","x":1}`)
+	f.Add(`{"identity":"` + strings.Repeat("A", 43) + `","device":"` + strings.Repeat("A", 22) + `","signature":"` + strings.Repeat("_", 86) + `","x":1}`)
+	f.Add(`{"identity":"` + s.identity + `","signature":"` + strings.Repeat("A", 86) + `"}`)
 
 	router := authRouter()
-	registry := auth.NewRegistry(time.Now, nil)
+	registry := auth.NewRegistry(time.Now, nil, testDevices)
 	f.Fuzz(func(t *testing.T, payload string) {
 		session := registry.Open()
 		defer session.Close()
@@ -243,4 +220,49 @@ func FuzzAuthenticateMessage(f *testing.F) {
 			t.Fatal("session authenticated by fuzz input")
 		}
 	})
+}
+
+func TestAuthenticateRequiresAnAuthorizedDeviceKey(t *testing.T) {
+	pair := newSiblings(t, 2)
+	outsider := unregistered()
+	tests := map[string]func(conn *Conn) []byte{
+		"unregistered identity": func(conn *Conn) []byte {
+			return authenticate(conn, outsider.identity, outsider.device.ID, outsider.proof(requestChallenge(t, conn)))
+		},
+		"sibling proof for this device": func(conn *Conn) []byte {
+			return authenticate(conn, pair[0].identity, pair[0].device.ID, pair[1].proof(requestChallenge(t, conn)))
+		},
+		"identity root key": func(conn *Conn) []byte {
+			nonce := requestChallenge(t, conn)
+			sig := base64.RawURLEncoding.EncodeToString(ed25519Sign(pair[0], auth.Message(nonce, decoded(pair[0].identity), pair[0].device.IDRaw)))
+			return authenticate(conn, pair[0].identity, pair[0].device.ID, sig)
+		},
+		"device of another identity": func(conn *Conn) []byte {
+			other := newSigner(t)
+			return authenticate(conn, pair[0].identity, other.device.ID, other.proof(requestChallenge(t, conn)))
+		},
+		"missing device": func(conn *Conn) []byte {
+			requestChallenge(t, conn)
+			return conn.Handle([]byte(`{"type":"authenticate","id":"a1","payload":{"identity":"` + pair[0].identity + `","signature":"x"}}`))
+		},
+	}
+	for name, run := range tests {
+		t.Run(name, func(t *testing.T) {
+			session := testSession()
+			out := run(authRouter().Conn(session, discard))
+			if resp := decodeResponse(t, out); resp.Type != "error" {
+				t.Fatalf("accepted: %s", out)
+			}
+			if _, ok := session.Identity(); ok {
+				t.Fatal("session authenticated")
+			}
+		})
+	}
+	revoked := newSiblings(t, 2)
+	conn := authRouter().Conn(testSession(), discard)
+	nonce := requestChallenge(t, conn)
+	if err := testDevices.Publish(revoked[0].owner.Remove(revoked[1].device)); err != nil {
+		t.Fatal(err)
+	}
+	expectCode(t, authenticate(conn, revoked[1].identity, revoked[1].device.ID, revoked[1].proof(nonce)), CodeAuthFailed)
 }

@@ -1,14 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decodeBase64Url, encodeBase64Url } from "./base64.ts";
-import { ExchangeKey } from "./encryption.ts";
 import {
   type ResponderKeys,
   initiate,
   respond,
   verifyPrekey,
 } from "./handshake.ts";
-import { IdentityKey } from "./identity.ts";
 import {
   PrekeyStore,
   consumedLimit,
@@ -19,12 +17,15 @@ import {
   signedLifetime,
 } from "./prekeys.ts";
 import { memoryStore } from "./testing.ts";
-import { type Unlocked, loadVault } from "./vault.ts";
+import { type Unlocked, createVault, loadVault } from "./vault.ts";
+import type { DeviceEntry } from "./device.ts";
 
 type Store = ReturnType<typeof memoryStore>;
 
 async function owner(store: Store = memoryStore()) {
-  const state = await loadVault(store);
+  const existing = await loadVault(store);
+  const state =
+    existing.status === "empty" ? await createVault(store) : existing;
   assert.equal(state.status, "ready");
   const unlocked = state as Unlocked;
   const prekeys = await PrekeyStore.open(
@@ -44,43 +45,42 @@ async function initiation(
   target: Awaited<ReturnType<typeof owner>>,
   useOnetime = true,
 ) {
-  const a = {
-    identity: await IdentityKey.generate(),
-    exchange: await ExchangeKey.generate(),
-  };
+  const initiator = (await createVault(memoryStore())) as Unlocked;
+  const a = initiator.keys;
   const publication = await target.prekeys.publication();
   assert.ok(publication);
-  const staticKey = target.keys.exchange.publicRaw;
+  const device: DeviceEntry = {
+    id: target.keys.deviceId,
+    signing: target.keys.device.identity,
+    exchange: target.keys.exchange.publicKey,
+  };
+  assert.equal(publication.device, device.id);
   const signed = await verifyPrekey(
     "signed",
-    target.keys.identity.identity,
-    staticKey,
-    publication.device,
+    target.keys.identity,
+    device,
     publication.signed,
   );
   const first = publication.onetime[0];
   const onetime = useOnetime
-    ? await verifyPrekey(
-        "onetime",
-        target.keys.identity.identity,
-        staticKey,
-        publication.device,
-        first,
-      )
+    ? await verifyPrekey("onetime", target.keys.identity, device, first)
     : null;
   assert.ok(signed);
   const started = await initiate(a, {
-    identity: target.keys.identity.identity,
-    staticKey,
-    device: publication.device,
+    identity: target.keys.identity,
+    device,
     signed: { id: publication.signed.id, key: signed },
     onetime: onetime ? { id: first.id, key: onetime } : null,
   });
   assert.ok(started);
   const run = (keys: ResponderKeys) =>
     respond(target.keys, keys, {
-      from: a.identity.identity,
-      fromStatic: a.exchange.publicRaw,
+      from: a.identity,
+      fromDevice: {
+        id: a.deviceId,
+        signing: a.device.identity,
+        exchange: a.exchange.publicKey,
+      },
       ...started.initiation,
     });
   return { a, started, run };
@@ -112,8 +112,7 @@ test("creates a bounded, signed, non-extractable prekey inventory once", async (
   assert.deepEqual(again.inventory, b.prekeys.inventory);
 
   const concurrent = memoryStore();
-  const vault = await loadVault(concurrent);
-  const u = vault as Unlocked;
+  const u = (await createVault(concurrent)) as Unlocked;
   const stores = await Promise.all(
     Array.from({ length: 5 }, () =>
       PrekeyStore.open(concurrent, u.keys, u.integrity),
@@ -238,7 +237,7 @@ test("corrupted prekey state fails closed without touching the identity", async 
       ...original,
       signed: { ...(original.signed as object), id: 9 },
     },
-    "future version": { ...original, v: 2 },
+    "future version": { ...original, v: 3 },
     "extra field": { ...original, extra: 1 },
     "duplicate onetime": {
       ...original,
@@ -269,11 +268,7 @@ test("corrupted prekey state fails closed without touching the identity", async 
     );
     const vault = await loadVault(b.store);
     assert.equal(vault.status, "ready", name);
-    assert.equal(
-      (vault as Unlocked).keys.identity.identity,
-      b.keys.identity.identity,
-      name,
-    );
+    assert.equal((vault as Unlocked).keys.identity, b.keys.identity, name);
     assert.equal(b.store.data.get("vault:prekeys"), value, name);
   }
 });
@@ -284,3 +279,44 @@ function flipped(text: string): string {
   bytes[0] ^= 1;
   return encodeBase64Url(bytes);
 }
+
+test("a previous single-device prekey state is replaced by one bound to this device", async () => {
+  const b = await owner();
+  const original = record(b.store);
+  b.store.data.set("vault:prekeys", {
+    ...original,
+    v: 1,
+    device: encodeBase64Url(new Uint8Array(16)),
+  });
+  const fresh = await PrekeyStore.open(b.store, b.keys, b.integrity);
+  assert.ok(fresh);
+  assert.equal(fresh.device, b.keys.deviceId);
+  assert.equal(record(b.store).v, 2);
+  const publication = await fresh.publication();
+  assert.ok(publication);
+  assert.ok(
+    await verifyPrekey(
+      "signed",
+      b.keys.identity,
+      {
+        id: b.keys.deviceId,
+        signing: b.keys.device.identity,
+        exchange: b.keys.exchange.publicKey,
+      },
+      publication.signed,
+    ),
+  );
+  assert.equal(
+    await verifyPrekey(
+      "signed",
+      b.keys.identity,
+      {
+        id: b.keys.deviceId,
+        signing: b.keys.identity,
+        exchange: b.keys.exchange.publicKey,
+      },
+      publication.signed,
+    ),
+    null,
+  );
+});

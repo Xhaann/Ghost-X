@@ -14,12 +14,16 @@ const (
 	CodeAuthFailed      Code = "authentication_failed"
 	CodeUnavailable     Code = "recipient_unavailable"
 	CodeTooLarge        Code = "message_too_large"
-	CodeKeyRequired     Code = "key_required"
 	CodeDuplicate       Code = "duplicate_message"
 	CodeStaleSession    Code = "stale_session"
 	CodeSessionLimit    Code = "session_limit"
 	CodePendingLimit    Code = "pending_limit"
 	CodeQueueFull       Code = "queue_full"
+	CodeStaleRoster     Code = "stale_roster"
+	CodeStaleDevices    Code = "stale_devices"
+	CodeRegistryFull    Code = "registry_full"
+	CodeRateLimited     Code = "rate_limited"
+	CodeRevoked         Code = "device_revoked"
 	CodeInternalError   Code = "internal_error"
 )
 

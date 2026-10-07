@@ -31,14 +31,14 @@ import {
   legacySeal,
   memoryStore,
 } from "./testing.ts";
-import { type Unlocked, loadVault } from "./vault.ts";
+import { type Unlocked, createVault, loadVault } from "./vault.ts";
 
 type Store = ReturnType<typeof memoryStore>;
 type Party = Unlocked & { store: Store };
 
 async function party(): Promise<Party> {
   const store = memoryStore();
-  const state = await loadVault(store);
+  const state = await createVault(store);
   assert.equal(state.status, "ready");
   return { ...(state as Unlocked), store };
 }
@@ -118,7 +118,7 @@ async function history(a: string, b: Party) {
 }
 
 async function identity(): Promise<string> {
-  return (await party()).keys.identity.identity;
+  return (await party()).keys.identity;
 }
 
 type Incoming = { id: string; from: string; body: string | null };
@@ -185,7 +185,7 @@ async function legacyRecord(
     body: string;
   },
 ): Promise<[string, Record<string, unknown>]> {
-  const self = owner.keys.identity.identity;
+  const self = owner.keys.identity;
   const sent = fields.direction === "sent";
   const parties = {
     id: fields.id,
@@ -278,7 +278,7 @@ test("persists only locally encrypted bodies and restores them after a reload", 
       {
         id: "m1",
         from: a,
-        to: b.keys.identity.identity,
+        to: b.keys.identity,
         sequence: 2,
         direction: "received",
         body: secrets[0],
@@ -286,7 +286,7 @@ test("persists only locally encrypted bodies and restores them after a reload", 
       },
       {
         id: "r1",
-        from: b.keys.identity.identity,
+        from: b.keys.identity,
         to: a,
         sequence: 3,
         direction: "sent",
@@ -296,7 +296,7 @@ test("persists only locally encrypted bodies and restores them after a reload", 
       {
         id: "m2",
         from: a,
-        to: b.keys.identity.identity,
+        to: b.keys.identity,
         sequence: 4,
         direction: "received",
         body: secrets[1],
@@ -402,7 +402,7 @@ test("a corrupted record is reported but never displayed as valid", async () => 
   const record = b.store.data.get(key) as Record<string, unknown>;
   b.store.data.set(key, { ...record, sequence: 1 });
   const result = await (await open(await reload(b))).restore();
-  const store = new Conversations(new Source(), b.keys.identity.identity, {
+  const store = new Conversations(new Source(), b.keys.identity, {
     restored: result.restored,
   });
   store.start();
@@ -419,7 +419,7 @@ test("restores conversations, ordering, unread, and settled delivery state", asy
   const b = await party();
   const first = await open(b);
   const source = new Source();
-  const store = new Conversations(source, b.keys.identity.identity, {
+  const store = new Conversations(source, b.keys.identity, {
     history: first,
   });
   store.start();
@@ -431,7 +431,7 @@ test("restores conversations, ordering, unread, and settled delivery state", asy
   store.open(peerA);
   await deliver(peerA, "a2", "from a two while active");
   for (const [body, result] of [
-    ["to a queued", { ok: true }],
+    ["to a queued", { ok: true, devices: 1 }],
     ["to a unavailable", { ok: false, reason: "recipient_unavailable" }],
     ["to a failed", { ok: false, reason: "internal_error" }],
   ] as [string, SendResult][]) {
@@ -461,7 +461,7 @@ test("restores conversations, ordering, unread, and settled delivery state", asy
   const second = await open(await reload(b));
   const { restored, rejected } = await second.restore();
   assert.equal(rejected, 0);
-  const after = new Conversations(new Source(), b.keys.identity.identity, {
+  const after = new Conversations(new Source(), b.keys.identity, {
     history: second,
     restored,
   });
@@ -491,7 +491,7 @@ test("restores conversations, ordering, unread, and settled delivery state", asy
   await second.flush();
   after.stop();
   const third = await (await open(await reload(b))).restore();
-  const reopened = new Conversations(new Source(), b.keys.identity.identity, {
+  const reopened = new Conversations(new Source(), b.keys.identity, {
     restored: third.restored,
   });
   reopened.start();
@@ -511,7 +511,7 @@ test("live duplicates of restored messages are ignored", async () => {
   const { restored } = await (await open(await reload(b))).restore();
   const source = new Source();
   const h = await open(b);
-  const store = new Conversations(source, b.keys.identity.identity, {
+  const store = new Conversations(source, b.keys.identity, {
     history: h,
     restored: [...restored, ...restored],
   });
@@ -544,7 +544,7 @@ test("undecryptable live messages are never persisted", async () => {
   const b = await party();
   const source = new Source();
   const h = await open(b);
-  const store = new Conversations(source, b.keys.identity.identity, {
+  const store = new Conversations(source, b.keys.identity, {
     history: h,
   });
   store.start();
@@ -716,7 +716,7 @@ test("results that settle after the store stops are not persisted", async () => 
   const b = await party();
   const h = await open(b);
   const source = new Source();
-  const store = new Conversations(source, b.keys.identity.identity, {
+  const store = new Conversations(source, b.keys.identity, {
     history: h,
   });
   store.start();
@@ -724,7 +724,7 @@ test("results that settle after the store stops are not persisted", async () => 
   const attempt = store.send("settles late");
   assert.equal(attempt.accepted, true);
   store.stop();
-  source.pending[0].resolve({ ok: true });
+  source.pending[0].resolve({ ok: true, devices: 1 });
   if (attempt.accepted) {
     await attempt.delivery;
   }
@@ -736,14 +736,14 @@ test("reset removes identity, keys, and history", async () => {
   const a = await identity();
   const b = await party();
   await history(a, b);
-  const old = b.keys.identity.identity;
+  const old = b.keys.identity;
   await b.store.clear();
   assert.equal(b.store.data.size, 0);
-  const state = await loadVault(b.store);
+  const state = await createVault(b.store);
   assert.equal(state.status, "ready");
   const fresh = state as Unlocked;
   assert.equal(fresh.created, true);
-  assert.notEqual(fresh.keys.identity.identity, old);
+  assert.notEqual(fresh.keys.identity, old);
   const h = await History.open(
     b.store,
     fresh.keys,

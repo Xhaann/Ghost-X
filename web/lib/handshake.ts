@@ -16,32 +16,42 @@ import {
 
 export { confirmSize, deviceIdSize };
 
-export const handshakeVersion = 2;
+export const handshakeVersion = 3;
 export const initiationIdSize = 16;
 
 const exchange = { name: "X25519" };
 const encoder = new TextEncoder();
-const signedContext = encoder.encode("ghostx/prekey/signed/v1\0");
-const onetimeContext = encoder.encode("ghostx/prekey/onetime/v1\0");
-const transcriptContext = encoder.encode("ghostx/x3dh/v2\0");
-const proofContext = encoder.encode("ghostx/x3dh/initiate/v2\0");
+const signedContext = encoder.encode("ghostx/prekey/signed/v2\0");
+const onetimeContext = encoder.encode("ghostx/prekey/onetime/v2\0");
+const transcriptContext = encoder.encode("ghostx/x3dh/v3\0");
+const proofContext = encoder.encode("ghostx/x3dh/initiate/v3\0");
 const curvePrefix = new Uint8Array(32).fill(0xff);
 const labels = {
-  root: encoder.encode("ghostx/x3dh/v2/root\0"),
-  initiator: encoder.encode("ghostx/x3dh/v2/confirm/initiator\0"),
-  responder: encoder.encode("ghostx/x3dh/v2/confirm/responder\0"),
+  root: encoder.encode("ghostx/x3dh/v3/root\0"),
+  initiator: encoder.encode("ghostx/x3dh/v3/confirm/initiator\0"),
+  responder: encoder.encode("ghostx/x3dh/v3/confirm/responder\0"),
 };
 
 export type Prekey = { id: number; key: string; signature: string };
 
 export type PrekeyKind = "signed" | "onetime";
 
+export type DeviceRef = { id: string; signing: string; exchange: string };
+
+export type OwnDevice = {
+  identity: string;
+  device: IdentityKey;
+  deviceId: string;
+  exchange: ExchangeKey;
+};
+
 export type Transcript = {
   initiator: string;
+  initiatorDevice: string;
   responder: string;
+  responderDevice: string;
   initiatorStatic: Uint8Array<ArrayBuffer>;
   responderStatic: Uint8Array<ArrayBuffer>;
-  device: string;
   signed: { id: number; key: Uint8Array<ArrayBuffer> };
   onetime: { id: number; key: Uint8Array<ArrayBuffer> } | null;
   ephemeral: Uint8Array<ArrayBuffer>;
@@ -91,8 +101,8 @@ function u32(value: number): Uint8Array<ArrayBuffer> {
 function prekeyMessage(
   context: Uint8Array,
   identity: string,
-  staticKey: Uint8Array,
   device: string,
+  exchange: Uint8Array,
   id: number,
   key: Uint8Array,
 ): Uint8Array<ArrayBuffer> | null {
@@ -102,27 +112,27 @@ function prekeyMessage(
     !owner ||
     !deviceRaw ||
     !isEpoch(id) ||
-    staticKey.length !== exchangeKeySize ||
+    exchange.length !== exchangeKeySize ||
     key.length !== exchangeKeySize
   ) {
     return null;
   }
-  return concat(context, owner, staticKey, deviceRaw, u32(id), key);
+  return concat(context, owner, deviceRaw, exchange, u32(id), key);
 }
 
 export function prekeyBindingMessage(
   kind: PrekeyKind,
   identity: string,
-  staticKey: Uint8Array,
   device: string,
+  exchange: Uint8Array,
   id: number,
   key: Uint8Array,
 ): Uint8Array<ArrayBuffer> | null {
   return prekeyMessage(
     kind === "signed" ? signedContext : onetimeContext,
     identity,
-    staticKey,
     device,
+    exchange,
     id,
     key,
   );
@@ -130,53 +140,52 @@ export function prekeyBindingMessage(
 
 export async function signPrekey(
   kind: PrekeyKind,
-  identity: IdentityKey,
-  staticKey: Uint8Array,
-  device: string,
+  own: OwnDevice,
   id: number,
   key: Uint8Array,
 ): Promise<Prekey | null> {
   const message = prekeyBindingMessage(
     kind,
-    identity.identity,
-    staticKey,
-    device,
+    own.identity,
+    own.deviceId,
+    own.exchange.publicRaw,
     id,
     key,
   );
-  const signature = message ? await identity.sign(message) : null;
+  const signature = message ? await own.device.sign(message) : null;
   return signature ? { id, key: encodeBase64Url(key), signature } : null;
 }
 
 export async function verifyPrekey(
   kind: PrekeyKind,
   identity: string,
-  staticKey: Uint8Array,
-  device: string,
+  device: DeviceRef,
   prekey: Prekey,
 ): Promise<Uint8Array<ArrayBuffer> | null> {
   const key = decodeBase64Url(prekey.key, exchangeKeySize);
-  if (!key || !isCanonicalExchangeKey(key)) {
+  const exchange = decodeBase64Url(device.exchange, exchangeKeySize);
+  if (!key || !exchange || !isCanonicalExchangeKey(key)) {
     return null;
   }
   const message = prekeyBindingMessage(
     kind,
     identity,
-    staticKey,
-    device,
+    device.id,
+    exchange,
     prekey.id,
     key,
   );
   if (!message) {
     return null;
   }
-  return (await verify(identity, message, prekey.signature)) ? key : null;
+  return (await verify(device.signing, message, prekey.signature)) ? key : null;
 }
 
 export function transcriptBytes(t: Transcript): Uint8Array<ArrayBuffer> | null {
   const initiator = parseIdentity(t.initiator);
   const responder = parseIdentity(t.responder);
-  const device = decodeBase64Url(t.device, deviceIdSize);
+  const initiatorDevice = decodeBase64Url(t.initiatorDevice, deviceIdSize);
+  const responderDevice = decodeBase64Url(t.responderDevice, deviceIdSize);
   const keys = [
     t.initiatorStatic,
     t.responderStatic,
@@ -188,7 +197,8 @@ export function transcriptBytes(t: Transcript): Uint8Array<ArrayBuffer> | null {
   if (
     !initiator ||
     !responder ||
-    !device ||
+    !initiatorDevice ||
+    !responderDevice ||
     !isEpoch(t.signed.id) ||
     (t.onetime !== null && !isEpoch(t.onetime.id)) ||
     keys.some((key) => key.length !== exchangeKeySize)
@@ -198,10 +208,11 @@ export function transcriptBytes(t: Transcript): Uint8Array<ArrayBuffer> | null {
   return concat(
     transcriptContext,
     initiator,
+    initiatorDevice,
     responder,
+    responderDevice,
     t.initiatorStatic,
     t.responderStatic,
-    device,
     u32(t.signed.id),
     t.signed.key,
     ...(t.onetime
@@ -284,14 +295,13 @@ export async function derive(
 
 export type VerifiedBundle = {
   identity: string;
-  staticKey: Uint8Array<ArrayBuffer>;
-  device: string;
+  device: DeviceRef;
   signed: { id: number; key: Uint8Array<ArrayBuffer> };
   onetime: { id: number; key: Uint8Array<ArrayBuffer> } | null;
 };
 
 export async function initiate(
-  own: { identity: IdentityKey; exchange: ExchangeKey },
+  own: OwnDevice,
   peer: VerifiedBundle,
   generate: Generate = generateRatchetKey,
 ): Promise<{ initiation: Initiation; pending: Pending } | null> {
@@ -303,12 +313,17 @@ export async function initiate(
     const ephemeral = new Uint8Array(
       await crypto.subtle.exportKey("raw", pair.publicKey),
     );
+    const peerStatic = decodeBase64Url(peer.device.exchange, exchangeKeySize);
+    if (!peerStatic) {
+      return null;
+    }
     const t: Transcript = {
-      initiator: own.identity.identity,
+      initiator: own.identity,
+      initiatorDevice: own.deviceId,
       responder: peer.identity,
+      responderDevice: peer.device.id,
       initiatorStatic: own.exchange.publicRaw,
-      responderStatic: peer.staticKey,
-      device: peer.device,
+      responderStatic: peerStatic,
       signed: peer.signed,
       onetime: peer.onetime,
       ephemeral,
@@ -322,21 +337,21 @@ export async function initiate(
     }
     const secrets = [
       dh1,
-      await agree(pair.privateKey, peer.staticKey),
+      await agree(pair.privateKey, peerStatic),
       await agree(pair.privateKey, peer.signed.key),
       ...(peer.onetime ? [await agree(pair.privateKey, peer.onetime.key)] : []),
     ];
     const derived = await derive(secrets, transcript);
     const [confirm, proof] = await Promise.all([
       crypto.subtle.sign("HMAC", derived.initiator, transcript),
-      own.identity.sign(proofInput),
+      own.device.sign(proofInput),
     ]);
     if (!proof) {
       return null;
     }
     return {
       initiation: {
-        device: peer.device,
+        device: peer.device.id,
         signed: peer.signed.id,
         onetime: peer.onetime?.id ?? null,
         ephemeral: encodeBase64Url(ephemeral),
@@ -367,12 +382,11 @@ export type ResponderKeys = {
 };
 
 export async function respond(
-  own: { identity: IdentityKey; exchange: ExchangeKey },
+  own: OwnDevice,
   keys: ResponderKeys,
   initiation: {
     from: string;
-    fromStatic: Uint8Array<ArrayBuffer>;
-    device: string;
+    fromDevice: DeviceRef;
     ephemeral: string;
     ratchet: string;
     proof: string;
@@ -380,10 +394,15 @@ export async function respond(
   },
 ): Promise<Established | null> {
   try {
+    const fromStatic = decodeBase64Url(
+      initiation.fromDevice.exchange,
+      exchangeKeySize,
+    );
     const ephemeral = decodeBase64Url(initiation.ephemeral, exchangeKeySize);
     const ratchet = decodeBase64Url(initiation.ratchet, exchangeKeySize);
     const confirm = decodeBase64Url(initiation.confirm, confirmSize);
     if (
+      !fromStatic ||
       !ephemeral ||
       !ratchet ||
       !confirm ||
@@ -394,10 +413,11 @@ export async function respond(
     }
     const t: Transcript = {
       initiator: initiation.from,
-      responder: own.identity.identity,
-      initiatorStatic: initiation.fromStatic,
+      initiatorDevice: initiation.fromDevice.id,
+      responder: own.identity,
+      responderDevice: own.deviceId,
+      initiatorStatic: fromStatic,
       responderStatic: own.exchange.publicRaw,
-      device: initiation.device,
       signed: { id: keys.signed.id, key: keys.signed.key },
       onetime: keys.onetime
         ? { id: keys.onetime.id, key: keys.onetime.key }
@@ -410,7 +430,11 @@ export async function respond(
     if (
       !transcript ||
       !proofInput ||
-      !(await verify(initiation.from, proofInput, initiation.proof))
+      !(await verify(
+        initiation.fromDevice.signing,
+        proofInput,
+        initiation.proof,
+      ))
     ) {
       return null;
     }
@@ -419,7 +443,7 @@ export async function respond(
       return null;
     }
     const secrets = [
-      await agree(keys.signed.privateKey, initiation.fromStatic),
+      await agree(keys.signed.privateKey, fromStatic),
       dh2,
       await agree(keys.signed.privateKey, ephemeral),
       ...(keys.onetime

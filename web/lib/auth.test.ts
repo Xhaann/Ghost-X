@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { type AuthState, Authenticator, authMessage } from "./auth.ts";
 import { Client } from "./client.ts";
-import { IdentityKey } from "./identity.ts";
+import { Devices } from "./devices.ts";
 import type { ServerMessage } from "./protocol.ts";
 import { WebSocketTransport } from "./socket.ts";
 import {
@@ -14,7 +14,21 @@ import {
   track,
   useServer,
   waitFor,
+  memoryStore,
 } from "./testing.ts";
+import { type Keys, type Unlocked, createVault, linkVault } from "./vault.ts";
+
+type Local = { keys: Keys; devices: Devices };
+
+async function local(link?: string): Promise<Local> {
+  const store = memoryStore();
+  const vault = (
+    link ? await linkVault(store, link) : await createVault(store)
+  ) as Unlocked;
+  const devices = await Devices.open(store, vault.keys);
+  assert.ok(devices);
+  return { keys: vault.keys, devices };
+}
 
 useServer();
 
@@ -35,8 +49,8 @@ async function connected(port: number): Promise<Client> {
   return c;
 }
 
-function authenticator(c: Client, key: IdentityKey) {
-  const auth = new Authenticator(c, key);
+function authenticator(c: Client, key: Local) {
+  const auth = new Authenticator(c, key.keys, key.devices);
   track({ close: () => auth.stop() });
   const states: AuthState[] = [];
   auth.onState((state) => states.push(state));
@@ -67,22 +81,34 @@ function replies(c: Client, type: ServerMessage["type"]): ServerMessage[] {
   return seen;
 }
 
-test("builds a domain-separated authentication message", () => {
+test("builds a domain-separated authentication message bound to identity and device", async () => {
   const nonce = Uint8Array.from({ length: 32 }, (_, i) => i);
-  const message = authMessage(nonce);
-  const context = "ghostx/session/authenticate/v1\0";
-
+  const { keys } = await local();
+  const message = authMessage(nonce, keys.identity, keys.deviceId);
+  assert.ok(message);
+  const context = "ghostx/session/authenticate/v2\0";
   assert.equal(
     new TextDecoder().decode(message.slice(0, context.length)),
     context,
   );
-  assert.deepEqual(message.slice(context.length), nonce);
-  assert.deepEqual(authMessage(nonce), message);
+  assert.deepEqual(message.slice(context.length, context.length + 32), nonce);
+  assert.equal(message.length, context.length + 32 + 32 + 16);
+  const other = await local();
+  assert.notDeepEqual(
+    authMessage(nonce, other.keys.identity, keys.deviceId),
+    message,
+  );
+  assert.notDeepEqual(
+    authMessage(nonce, keys.identity, other.keys.deviceId),
+    message,
+  );
+  assert.equal(authMessage(nonce, "bad", keys.deviceId), null);
+  assert.equal(authMessage(nonce, keys.identity, "bad"), null);
 });
 
 test("starts unauthenticated", async () => {
   const c = client(await freePort());
-  const { auth, states } = authenticator(c, await IdentityKey.generate());
+  const { auth, states } = authenticator(c, await local());
 
   auth.start();
 
@@ -94,7 +120,7 @@ test("authenticates a connected client", async () => {
   const port = await freePort();
   await startServer(port);
   const c = await connected(port);
-  const { auth, states } = authenticator(c, await IdentityKey.generate());
+  const { auth, states } = authenticator(c, await local());
 
   auth.start();
   await settle(auth, "authenticated");
@@ -106,7 +132,7 @@ test("authenticates once the client connects", async () => {
   const port = await freePort();
   await startServer(port);
   const c = client(port);
-  const { auth, states } = authenticator(c, await IdentityKey.generate());
+  const { auth, states } = authenticator(c, await local());
 
   auth.start();
   c.open();
@@ -119,8 +145,8 @@ test("fails with a released key and retries on request", async () => {
   const port = await freePort();
   await startServer(port);
   const c = await connected(port);
-  const key = await IdentityKey.generate();
-  key.release();
+  const key = await local();
+  key.keys.device.release();
   const { auth, states } = authenticator(c, key);
 
   auth.start();
@@ -142,7 +168,7 @@ test("ignores retry unless authentication failed", async () => {
   await startServer(port);
   const c = await connected(port);
   const challenges = replies(c, "challenge");
-  const { auth } = authenticator(c, await IdentityKey.generate());
+  const { auth } = authenticator(c, await local());
 
   auth.retry();
   auth.start();
@@ -160,7 +186,7 @@ test("re-authenticates with a fresh challenge after reconnect", async () => {
   const c = await connected(port);
   const challenges = replies(c, "challenge");
   const authenticated = replies(c, "authenticated");
-  const { auth, states } = authenticator(c, await IdentityKey.generate());
+  const { auth, states } = authenticator(c, await local());
 
   auth.start();
   await settle(auth, "authenticated");
@@ -191,7 +217,7 @@ test("starts once even when called repeatedly", async () => {
   await startServer(port);
   const c = await connected(port);
   const challenges = replies(c, "challenge");
-  const { auth } = authenticator(c, await IdentityKey.generate());
+  const { auth } = authenticator(c, await local());
 
   auth.start();
   auth.start();
@@ -207,7 +233,7 @@ test("abandons a superseded attempt without a second proof", async () => {
   const c = await connected(port);
   const authenticated = replies(c, "authenticated");
   const errors = replies(c, "error");
-  const key = await IdentityKey.generate();
+  const key = await local();
   const first = authenticator(c, key);
   const second = authenticator(c, key);
 
@@ -227,7 +253,7 @@ test("stop resets state and ignores later connections", async () => {
   const server = await startServer(port);
   const c = await connected(port);
   const challenges = replies(c, "challenge");
-  const { auth } = authenticator(c, await IdentityKey.generate());
+  const { auth } = authenticator(c, await local());
 
   auth.start();
   await settle(auth, "authenticated");
@@ -248,7 +274,7 @@ test("resets when the client closes", async () => {
   const port = await freePort();
   await startServer(port);
   const c = await connected(port);
-  const { auth } = authenticator(c, await IdentityKey.generate());
+  const { auth } = authenticator(c, await local());
 
   auth.start();
   await settle(auth, "authenticated");
@@ -260,7 +286,7 @@ test("resets when the client closes", async () => {
 test("authenticates independent connections with one identity", async () => {
   const port = await freePort();
   await startServer(port);
-  const key = await IdentityKey.generate();
+  const key = await local();
   const [a, b] = await Promise.all([connected(port), connected(port)]);
   const first = authenticator(a, key);
   const second = authenticator(b, key);
@@ -281,10 +307,7 @@ test("rejects an authenticated reply for another identity", async () => {
   await startServer(port);
   const c = await connected(port);
   const [socket] = openSockets();
-  const [key, other] = await Promise.all([
-    IdentityKey.generate(),
-    IdentityKey.generate(),
-  ]);
+  const [key, other] = await Promise.all([local(), local()]);
   const send = socket.send.bind(socket);
   socket.send = (data: string) => {
     const message = JSON.parse(data);
@@ -296,7 +319,10 @@ test("rejects an authenticated reply for another identity", async () => {
             data: JSON.stringify({
               type: "authenticated",
               id: message.id,
-              payload: { identity: other.identity },
+              payload: {
+                identity: other.keys.identity,
+                device: key.keys.deviceId,
+              },
             }),
           }),
         );
@@ -321,30 +347,39 @@ test("never places private key material in sent frames", async () => {
     sent.push(data);
     send(data);
   };
-  const key = await IdentityKey.generate();
+  const key = await local();
   const { auth } = authenticator(c, key);
 
   auth.start();
   await settle(auth, "authenticated");
 
-  assert.equal(sent.length, 2);
-  const [challenge, authenticate] = sent.map((frame) => JSON.parse(frame));
+  assert.equal(sent.length, 3);
+  const [register, challenge, authenticate] = sent.map((frame) =>
+    JSON.parse(frame),
+  );
+  assert.equal(register.type, "register");
+  assert.deepEqual(register.payload, key.devices.roster);
   assert.deepEqual(Object.keys(challenge).sort(), ["id", "payload", "type"]);
   assert.deepEqual(challenge.payload, {});
   assert.deepEqual(Object.keys(authenticate).sort(), ["id", "payload", "type"]);
   assert.deepEqual(Object.keys(authenticate.payload).sort(), [
+    "device",
     "identity",
     "signature",
   ]);
-  assert.equal(authenticate.payload.identity, key.identity);
+  assert.equal(authenticate.payload.identity, key.keys.identity);
+  assert.equal(authenticate.payload.device, key.keys.deviceId);
   assert.match(authenticate.payload.signature, /^[A-Za-z0-9_-]{86}$/);
+  for (const frame of sent) {
+    assert.ok(!/private|pkcs8|"root"|"d":/i.test(frame));
+  }
 });
 
 test("protected requests require authentication", async () => {
   const port = await freePort();
   await startServer(port);
   const c = await connected(port);
-  const key = await IdentityKey.generate();
+  const key = await local();
 
   const before = await c.request({ type: "whoami", payload: {} });
   assert.deepEqual(before?.type === "error" && before.payload, {
@@ -357,14 +392,15 @@ test("protected requests require authentication", async () => {
 
   const after = await c.request({ type: "whoami", payload: {} });
   assert.ok(after?.type === "whoami");
-  assert.equal(after.payload.identity, key.identity);
+  assert.equal(after.payload.identity, key.keys.identity);
+  assert.equal(after.payload.device, key.keys.deviceId);
 });
 
 test("protected requests need fresh authentication after reconnect", async () => {
   const port = await freePort();
   const server = await startServer(port);
   const c = await connected(port);
-  const key = await IdentityKey.generate();
+  const key = await local();
   const { auth } = authenticator(c, key);
 
   auth.start();
@@ -385,5 +421,67 @@ test("protected requests need fresh authentication after reconnect", async () =>
   await settle(auth, "authenticated");
   const reply = await c.request({ type: "whoami", payload: {} });
   assert.ok(reply?.type === "whoami");
-  assert.equal(reply.payload.identity, key.identity);
+  assert.equal(reply.payload.identity, key.keys.identity);
+});
+
+test("a linked device waits for authorization, then authenticates with its own key", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const owner = await local();
+  const rootClient = await connected(port);
+  const rootAuth = authenticator(rootClient, owner);
+  rootAuth.auth.start();
+  await settle(rootAuth.auth, "authenticated");
+
+  const second = await local(owner.keys.identity);
+  const c = await connected(port);
+  const sent: string[] = [];
+  const [, socket] = openSockets();
+  const send = socket.send.bind(socket);
+  socket.send = (data: string) => {
+    sent.push(data);
+    send(data);
+  };
+  const { auth, states } = authenticator(c, second);
+  auth.start();
+  await settle(auth, "pending");
+  assert.equal(
+    sent.filter((f) => JSON.parse(f).type === "authenticate").length,
+    0,
+  );
+
+  const request = await second.devices.linkRequest();
+  assert.ok(request);
+  assert.ok((await owner.devices.authorize(rootClient, request)).ok);
+  await settle(auth, "authenticated", 8000);
+  assert.ok(states.includes("pending"));
+  const authenticate = JSON.parse(
+    sent.find((f) => JSON.parse(f).type === "authenticate") as string,
+  );
+  assert.equal(authenticate.payload.device, second.keys.deviceId);
+});
+
+test("a revoked device is disconnected and cannot authenticate again", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const owner = await local();
+  const rootClient = await connected(port);
+  const rootAuth = authenticator(rootClient, owner);
+  rootAuth.auth.start();
+  await settle(rootAuth.auth, "authenticated");
+  const second = await local(owner.keys.identity);
+  const request = await second.devices.linkRequest();
+  assert.ok(request);
+  assert.ok((await owner.devices.authorize(rootClient, request)).ok);
+  const c = await connected(port);
+  const { auth } = authenticator(c, second);
+  auth.start();
+  await settle(auth, "authenticated");
+
+  assert.ok((await owner.devices.revoke(rootClient, second.keys.deviceId)).ok);
+  await settle(auth, "revoked", 8000);
+  assert.equal(second.devices.status, "revoked");
+  const whoami = await c.request({ type: "whoami", payload: {} });
+  assert.ok(whoami?.type === "error");
+  assert.equal(rootAuth.auth.state, "authenticated");
 });

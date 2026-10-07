@@ -1,11 +1,6 @@
 import { decodeBase64UrlRange, encodeBase64Url } from "./base64.ts";
 import type { Client } from "./client.ts";
-import {
-  type ExchangeKey,
-  type KeyBundle,
-  verifyBundle,
-} from "./encryption.ts";
-import { type IdentityKey, isIdentity } from "./identity.ts";
+import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
 import type { Channel } from "./pairing.ts";
 import type { AuthSource } from "./presence.ts";
@@ -13,6 +8,7 @@ import {
   type ErrorCode,
   type ReceiptStatus,
   type ServerMessage,
+  type WireEnvelope,
   bodySize,
   createMessageId,
   isMessageId,
@@ -21,9 +17,10 @@ import {
   maxMessageSize,
   minMessageSize,
 } from "./protocol.ts";
+import type { Rosters } from "./rosters.ts";
 
 export type SendResult =
-  | { ok: true }
+  | { ok: true; devices: number }
   | {
       ok: false;
       reason: ErrorCode | "not_sent" | "encryption_failed" | "session_pending";
@@ -31,7 +28,12 @@ export type SendResult =
 
 export type MessengerState = { active: boolean };
 
-export type Receipt = { to: string; id: string; status: ReceiptStatus };
+export type Receipt = {
+  to: string;
+  device: string;
+  id: string;
+  status: ReceiptStatus;
+};
 
 export interface Receiver {
   has(from: string, id: string): boolean;
@@ -47,11 +49,10 @@ type Delivery = Extract<ServerMessage, { type: "message" }>["payload"];
 export class Messenger {
   readonly #client: Client;
   readonly #auth: AuthSource;
-  readonly #identity: IdentityKey;
-  readonly #exchange: ExchangeKey;
+  readonly #self: string;
   readonly #channel: Channel;
+  readonly #rosters: Rosters;
   readonly #states = new Listeners<MessengerState>();
-  readonly #bundles = new Listeners<KeyBundle>();
   readonly #deferred = new Map<string, Delivery[]>();
   #receiver: Receiver | null = null;
   #state: MessengerState = { active: false };
@@ -62,15 +63,15 @@ export class Messenger {
   constructor(
     client: Client,
     auth: AuthSource,
-    identity: IdentityKey,
-    exchange: ExchangeKey,
+    self: string,
     channel: Channel,
+    rosters: Rosters,
   ) {
     this.#client = client;
     this.#auth = auth;
-    this.#identity = identity;
-    this.#exchange = exchange;
+    this.#self = self;
     this.#channel = channel;
+    this.#rosters = rosters;
   }
 
   get state(): MessengerState {
@@ -79,10 +80,6 @@ export class Messenger {
 
   onState(listener: (state: MessengerState) => void): () => void {
     return this.#states.add(listener);
-  }
-
-  onKey(listener: (bundle: KeyBundle) => void): () => void {
-    return this.#bundles.add(listener);
   }
 
   receive(receiver: Receiver): () => void {
@@ -112,16 +109,16 @@ export class Messenger {
       }),
       this.#auth.onState((state) => {
         if (state === "authenticated") {
-          this.#establish();
+          this.#activate();
         } else {
           this.#deactivate();
         }
       }),
-      this.#channel.onChange((peer) => this.#resume(peer)),
+      this.#channel.onChange((address) => this.#resume(address)),
     ];
     this.#detach = () => detach.forEach((release) => release());
     if (this.#auth.state === "authenticated") {
-      this.#establish();
+      this.#activate();
     }
   }
 
@@ -135,24 +132,7 @@ export class Messenger {
     if (!this.#state.active || !isIdentity(identity)) {
       return false;
     }
-    const generation = this.#generation;
-    const reply = await this.#client.request({
-      type: "key",
-      payload: { identity },
-    });
-    if (reply?.type !== "key" || reply.payload.identity !== identity) {
-      return false;
-    }
-    const bundle: KeyBundle = {
-      identity,
-      key: reply.payload.key,
-      signature: reply.payload.signature,
-    };
-    if (!(await verifyBundle(bundle)) || generation !== this.#generation) {
-      return false;
-    }
-    this.#bundles.emit(bundle);
-    return true;
+    return (await this.#rosters.fetch(identity)) !== null;
   }
 
   async send(
@@ -163,7 +143,7 @@ export class Messenger {
     if (!this.#state.active) {
       return { ok: false, reason: "authentication_required" };
     }
-    if (!isIdentity(to) || !isMessageId(id) || to === this.#identity.identity) {
+    if (!isIdentity(to) || !isMessageId(id) || to === this.#self) {
       return { ok: false, reason: "invalid_payload" };
     }
     if (bodySize(body) > maxBodySize) {
@@ -174,28 +154,48 @@ export class Messenger {
     }
     const generation = this.#generation;
     const session = await this.#channel.establish(to);
-    if (session === "unavailable") {
+    if (session.result === "unavailable") {
       return { ok: false, reason: "recipient_unavailable" };
     }
-    if (session !== "established") {
+    if (session.devices.length === 0) {
       return { ok: false, reason: "session_pending" };
     }
     if (generation !== this.#generation) {
       return { ok: false, reason: "not_sent" };
     }
-    const sealed = await this.#channel.seal(to, id, body);
-    if (!sealed) {
+    const envelopes: WireEnvelope[] = [];
+    for (const device of session.devices) {
+      const sealed = await this.#channel.seal(to, device, id, body);
+      if (sealed) {
+        envelopes.push({ device, ciphertext: encodeBase64Url(sealed) });
+      }
+    }
+    if (envelopes.length === 0) {
       return { ok: false, reason: "encryption_failed" };
     }
     if (generation !== this.#generation) {
       return { ok: false, reason: "not_sent" };
     }
-    const reply = await this.#client.request({
+    let delivered = envelopes;
+    let reply = await this.#client.request({
       type: "send",
-      payload: { to, id, ciphertext: encodeBase64Url(sealed) },
+      payload: { to, id, envelopes },
     });
+    if (reply?.type === "error" && reply.payload.code === "stale_devices") {
+      const roster = await this.#rosters.fetch(to);
+      delivered = envelopes.filter((e) =>
+        roster?.devices.some((d) => d.id === e.device),
+      );
+      if (delivered.length === 0 || delivered.length === envelopes.length) {
+        return { ok: false, reason: "stale_devices" };
+      }
+      reply = await this.#client.request({
+        type: "send",
+        payload: { to, id, envelopes: delivered },
+      });
+    }
     if (reply?.type === "queued") {
-      return { ok: true };
+      return { ok: true, devices: delivered.length };
     }
     if (reply?.type === "error") {
       return { ok: false, reason: reply.payload.code };
@@ -203,26 +203,13 @@ export class Messenger {
     return { ok: false, reason: "not_sent" };
   }
 
-  #establish(): void {
+  #activate(): void {
     const generation = ++this.#generation;
-    this.#setActive(false);
     this.#deferred.clear();
-    (async () => {
-      const bundle = await this.#exchange.bind(this.#identity);
-      if (!bundle || generation !== this.#generation) {
-        return;
-      }
-      const published = await this.#client.request({
-        type: "publish",
-        payload: { key: bundle.key, signature: bundle.signature },
-      });
-      if (generation === this.#generation && published?.type === "published") {
-        this.#setActive(true);
-        if (this.#receiver) {
-          await this.#fetch(generation);
-        }
-      }
-    })().catch(() => {});
+    this.#setActive(true);
+    if (this.#receiver) {
+      void this.#fetch(generation);
+    }
   }
 
   async #fetch(generation: number): Promise<void> {
@@ -246,27 +233,15 @@ export class Messenger {
     if (!receiver || generation !== this.#generation) {
       return;
     }
-    const { from, id } = delivery;
-    const peer: KeyBundle = {
-      identity: from,
-      key: delivery.key,
-      signature: delivery.signature,
-    };
+    const { from, device, id } = delivery;
     const data = decodeBase64UrlRange(
       delivery.ciphertext,
       minMessageSize,
       maxMessageSize,
     );
-    const valid = data !== null && (await verifyBundle(peer)) !== null;
-    if (generation !== this.#generation) {
-      return;
-    }
-    if (valid) {
-      this.#bundles.emit(peer);
-    }
     const known = receiver.has(from, id);
-    const result = valid
-      ? await this.#channel.open(from, id, data, (body) =>
+    const result = data
+      ? await this.#channel.open(from, device, id, data, (body) =>
           known ? Promise.resolve(true) : receiver.accept({ from, id, body }),
         )
       : "rejected";
@@ -274,14 +249,14 @@ export class Messenger {
       return;
     }
     if (result === "accepted") {
-      this.#acknowledge(from, id);
+      this.#acknowledge(delivery);
       return;
     }
     if (result === "failed") {
       return;
     }
     if (known) {
-      this.#acknowledge(from, id);
+      this.#acknowledge(delivery);
       return;
     }
     if (result === "deferred") {
@@ -289,14 +264,21 @@ export class Messenger {
       return;
     }
     if (result === "missing") {
-      void this.#channel.initiate(from);
+      void this.#channel.initiate(from, device);
     }
     receiver.reject({ from, id });
-    this.#acknowledge(from, id);
+    this.#acknowledge(delivery);
   }
 
-  #acknowledge(from: string, id: string): void {
-    this.#client.send({ type: "ack", payload: { from, id } });
+  #acknowledge(delivery: Delivery): void {
+    this.#client.send({
+      type: "ack",
+      payload: {
+        from: delivery.from,
+        device: delivery.device,
+        id: delivery.id,
+      },
+    });
   }
 
   #defer(delivery: Delivery): void {
@@ -307,19 +289,20 @@ export class Messenger {
     if (total >= maxDeferred) {
       return;
     }
-    const list = this.#deferred.get(delivery.from) ?? [];
+    const address = `${delivery.from}/${delivery.device}`;
+    const list = this.#deferred.get(address) ?? [];
     if (!list.some((d) => d.id === delivery.id)) {
       list.push(delivery);
     }
-    this.#deferred.set(delivery.from, list);
+    this.#deferred.set(address, list);
   }
 
-  #resume(peer: string): void {
-    const list = this.#deferred.get(peer);
+  #resume(address: string): void {
+    const list = this.#deferred.get(address);
     if (!list) {
       return;
     }
-    this.#deferred.delete(peer);
+    this.#deferred.delete(address);
     const generation = this.#generation;
     for (const delivery of list) {
       this.#enqueue(() => this.#deliver(delivery, generation));
@@ -334,7 +317,7 @@ export class Messenger {
     if (await receiver.settle(receipt)) {
       this.#client.send({
         type: "clear",
-        payload: { to: receipt.to, id: receipt.id },
+        payload: { to: receipt.to, device: receipt.device, id: receipt.id },
       });
     }
   }

@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/Xhaann/ghost-x/server/auth"
 	"github.com/Xhaann/ghost-x/server/config"
-	"github.com/Xhaann/ghost-x/server/direct"
+	"github.com/Xhaann/ghost-x/server/device"
 	"github.com/Xhaann/ghost-x/server/identity"
 	"github.com/Xhaann/ghost-x/server/prekey"
 	"github.com/Xhaann/ghost-x/server/presence"
@@ -23,16 +25,16 @@ type Server struct {
 	hub      *socket.Hub
 	sessions *auth.Registry
 	presence *presence.Registry
-	direct   *direct.Registry
+	devices  *device.Registry
 	queue    *queue.Registry
 	http     *http.Server
 }
 
 type observers []auth.Observer
 
-func (o observers) Authenticated(s *auth.Session, id identity.Identity) {
+func (o observers) Authenticated(s *auth.Session, id identity.Identity, device string) {
 	for _, observer := range o {
-		observer.Authenticated(s, id)
+		observer.Authenticated(s, id, device)
 	}
 }
 
@@ -46,7 +48,7 @@ type endpoint struct {
 	client  *socket.Client
 	conn    *protocol.Conn
 	session *auth.Session
-	direct  *direct.Registry
+	devices *device.Registry
 	prekeys *prekey.Registry
 	queue   *queue.Registry
 }
@@ -57,33 +59,40 @@ func (e *endpoint) Receive(data []byte) {
 
 func (e *endpoint) Close() {
 	e.session.Close()
-	e.direct.Detach(e.session)
+	e.devices.Detach(e.session)
 	e.prekeys.Detach(e.session)
 	e.queue.Detach(e.session)
 }
 
-func New(cfg config.Config) *Server {
+func New(cfg config.Config) (*Server, error) {
+	devices, err := device.Open(cfg.DeviceStore)
+	if err != nil {
+		return nil, err
+	}
 	present := presence.NewRegistry()
-	messages := direct.NewRegistry()
-	prekeys := prekey.NewRegistry()
-	queued := queue.NewRegistry(time.Now)
-	sessions := auth.NewRegistry(time.Now, observers{present, messages, prekeys, queued})
+	prekeys := prekey.NewRegistry(devices.Authorized)
+	queued := queue.NewRegistry(time.Now, devices.Authorized)
+	devices.OnRevoke(func(owner, id string) {
+		prekeys.RemoveDevice(owner, id)
+		queued.RemoveDevice(owner, id)
+	})
+	sessions := auth.NewRegistry(time.Now, observers{present, prekeys, queued}, devices)
 	router := protocol.NewRouter(map[string]protocol.Handler{
 		"ping":         protocol.Ping(time.Now),
 		"challenge":    protocol.Challenge(),
 		"authenticate": protocol.Authenticate(),
+		"register":     protocol.Register(devices),
+		"devices":      protocol.Devices(devices),
 	}, map[string]protocol.ProtectedHandler{
 		"whoami":   protocol.WhoAmI(),
 		"presence": protocol.Presence(present),
-		"send":     protocol.Send(messages, prekeys, queued),
+		"send":     protocol.Send(queued),
 		"fetch":    protocol.Fetch(queued),
 		"ack":      protocol.Ack(queued),
 		"clear":    protocol.Clear(queued),
-		"publish":  protocol.Publish(messages),
-		"key":      protocol.Key(messages),
-		"prekeys":  protocol.Prekeys(messages, prekeys),
+		"prekeys":  protocol.Prekeys(devices, prekeys),
 		"bundle":   protocol.FetchBundle(prekeys),
-		"initiate": protocol.Initiate(messages, prekeys),
+		"initiate": protocol.Initiate(devices, prekeys),
 		"accept":   protocol.Accept(prekeys),
 	})
 
@@ -91,13 +100,17 @@ func New(cfg config.Config) *Server {
 	opts.Accept = func(c *socket.Client) socket.Receiver {
 		session := sessions.Open()
 		push := func(data []byte) { _ = c.Send(data) }
+		devices.Attach(session, func() {
+			session.Close()
+			c.Close(websocket.ClosePolicyViolation, "device revoked")
+		})
 		queued.Attach(session, func(p queue.Push) bool {
 			return c.Send(protocol.EncodePush(p)) == nil
 		})
 		prekeys.Attach(session, func(e prekey.Event) bool {
 			return c.Send(protocol.EncodeEvent(e)) == nil
 		})
-		return &endpoint{client: c, conn: router.Conn(session, push), session: session, direct: messages, prekeys: prekeys, queue: queued}
+		return &endpoint{client: c, conn: router.Conn(session, push), session: session, devices: devices, prekeys: prekeys, queue: queued}
 	}
 	hub := socket.NewHub(opts)
 
@@ -110,7 +123,7 @@ func New(cfg config.Config) *Server {
 		hub:      hub,
 		sessions: sessions,
 		presence: present,
-		direct:   messages,
+		devices:  devices,
 		queue:    queued,
 		http: &http.Server{
 			Handler:           mux,
@@ -119,7 +132,7 @@ func New(cfg config.Config) *Server {
 			WriteTimeout:      15 * time.Second,
 			IdleTimeout:       60 * time.Second,
 		},
-	}
+	}, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decodeBase64Url, encodeBase64Url } from "./base64.ts";
 import { initiate, respond, verifyPrekey } from "./handshake.ts";
-import { Pairs, parsePair, pairsVersion } from "./pairs.ts";
+import { Pairs, pairAddress, parsePair, pairsVersion } from "./pairs.ts";
 import { PrekeyStore } from "./prekeys.ts";
 import {
   type RatchetState,
@@ -12,20 +12,35 @@ import {
   responderState,
 } from "./ratchet.ts";
 import { type MemoryStore, memoryStore } from "./testing.ts";
-import { type Unlocked, loadVault } from "./vault.ts";
+import { type Keys, type Unlocked, createVault, loadVault } from "./vault.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 async function local(store: MemoryStore = memoryStore()) {
-  const vault = (await loadVault(store)) as Unlocked;
+  const loaded = await loadVault(store);
+  const vault = (
+    loaded.status === "empty" ? await createVault(store) : loaded
+  ) as Unlocked;
   const pairs = await Pairs.open(
     store,
     vault.integrity,
     vault.storage,
-    vault.keys.identity.identity,
+    vault.keys.identity,
   );
   return { store, ...vault, pairs };
+}
+
+function address(keys: Keys): string {
+  return pairAddress(keys.identity, keys.deviceId);
+}
+
+function deviceOf(keys: Keys) {
+  return {
+    id: keys.deviceId,
+    signing: keys.device.identity,
+    exchange: keys.exchange.publicKey,
+  };
 }
 
 async function handshake() {
@@ -35,19 +50,16 @@ async function handshake() {
   assert.ok(prekeys);
   const publication = await prekeys.publication();
   assert.ok(publication);
-  const staticKey = bob.keys.exchange.publicRaw;
   const signed = await verifyPrekey(
     "signed",
-    bob.keys.identity.identity,
-    staticKey,
-    publication.device,
+    bob.keys.identity,
+    deviceOf(bob.keys),
     publication.signed,
   );
   assert.ok(signed);
   const started = await initiate(alice.keys, {
-    identity: bob.keys.identity.identity,
-    staticKey,
-    device: publication.device,
+    identity: bob.keys.identity,
+    device: deviceOf(bob.keys),
     signed: { id: publication.signed.id, key: signed },
     onetime: null,
   });
@@ -56,8 +68,8 @@ async function handshake() {
     started.pending.secret,
     signed,
     {
-      initiator: alice.keys.identity.identity,
-      responder: bob.keys.identity.identity,
+      initiator: alice.keys.identity,
+      responder: bob.keys.identity,
       session: started.pending.id,
       role: "initiator",
     },
@@ -68,8 +80,8 @@ async function handshake() {
     null,
     async (keys) => {
       const est = await respond(bob.keys, keys, {
-        from: alice.keys.identity.identity,
-        fromStatic: alice.keys.exchange.publicRaw,
+        from: alice.keys.identity,
+        fromDevice: deviceOf(alice.keys),
         ...started.initiation,
       });
       if (!est) {
@@ -80,8 +92,8 @@ async function handshake() {
         { publicKey: keys.signed.key, privateKey: keys.signed.privateKey },
         decodeBase64Url(started.initiation.ratchet, 32) ?? new Uint8Array(),
         {
-          initiator: alice.keys.identity.identity,
-          responder: bob.keys.identity.identity,
+          initiator: alice.keys.identity,
+          responder: bob.keys.identity,
           session: est.id,
           role: "responder",
         },
@@ -128,8 +140,8 @@ const readText = (
 
 async function established() {
   const h = await handshake();
-  const idA = h.alice.keys.identity.identity;
-  const idB = h.bob.keys.identity.identity;
+  const idA = address(h.alice.keys);
+  const idB = address(h.bob.keys);
   assert.equal(
     await h.alice.pairs.savePending(
       idB,
@@ -156,7 +168,7 @@ async function established() {
 
 test("pending sessions only become established with a valid acceptance", async () => {
   const h = await handshake();
-  const idB = h.bob.keys.identity.identity;
+  const idB = address(h.bob.keys);
   const { pairs } = h.alice;
   assert.equal(pairs.state(idB), "none");
   assert.equal(
@@ -450,4 +462,39 @@ test("a full skipped-key state still persists, and a failed write releases nothi
     h.idA,
   );
   assert.equal(await sendText(broken, h.idB, "must not leave"), null);
+});
+
+test("a session record never loads under another device's address", async () => {
+  const h = await established();
+  const sibling = (await createVault(memoryStore())) as Unlocked;
+  const record = h.alice.store.data.get(`pairs:${h.idB}`) as Record<
+    string,
+    unknown
+  >;
+  const elsewhere = pairAddress(h.bob.keys.identity, sibling.keys.deviceId);
+  h.alice.store.data.set(`pairs:${elsewhere}`, record);
+  assert.equal(parsePair(elsewhere, record), null);
+  h.alice.store.data.set(`pairs:${elsewhere}`, {
+    ...record,
+    device: sibling.keys.deviceId,
+  });
+  const reopened = await local(h.alice.store);
+  assert.equal(reopened.pairs.state(elsewhere), "none");
+  assert.equal(reopened.pairs.state(h.idB), "established");
+  assert.equal(reopened.pairs.rejected, 1);
+});
+
+test("single-device session records from the previous version are discarded", async () => {
+  const h = await established();
+  const record = h.alice.store.data.get(`pairs:${h.idB}`) as Record<
+    string,
+    unknown
+  >;
+  const { device: _device, ...previous } = record;
+  h.alice.store.data.set(`pairs:${h.bob.keys.identity}`, { ...previous, v: 2 });
+  const reopened = await local(h.alice.store);
+  assert.equal(reopened.pairs.rejected, 0);
+  assert.equal(h.alice.store.data.has(`pairs:${h.bob.keys.identity}`), false);
+  assert.equal(reopened.pairs.state(h.idB), "established");
+  assert.equal(record.v, pairsVersion);
 });

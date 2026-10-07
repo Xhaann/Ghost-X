@@ -7,7 +7,7 @@ import {
 } from "./handshake.ts";
 import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
-import { exchangeKeySize, isFixed } from "./protocol.ts";
+import { deviceIdSize, exchangeKeySize, isFixed } from "./protocol.ts";
 import {
   type Chain,
   type RatchetState,
@@ -17,7 +17,7 @@ import {
 } from "./ratchet.ts";
 import type { KeyValueStore } from "./storage.ts";
 
-export const pairsVersion = 2;
+export const pairsVersion = 3;
 export const maxPairs = 256;
 
 export type PairState = "none" | "pending" | "established";
@@ -25,11 +25,12 @@ export type PairState = "none" | "pending" | "established";
 const macSize = 32;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-const context = encoder.encode("ghostx/pairs/v2\0");
-const blobContext = encoder.encode("ghostx/pairs/v2/ratchet\0");
+const context = encoder.encode("ghostx/pairs/v3\0");
+const blobContext = encoder.encode("ghostx/pairs/v3/ratchet\0");
 const fields = [
   "v",
   "peer",
+  "device",
   "id",
   "role",
   "state",
@@ -47,6 +48,7 @@ type Blob = { iv: string; ciphertext: string };
 type Fields = {
   v: number;
   peer: string;
+  device: string;
   id: string;
   role: Role;
   state: "pending" | "established";
@@ -103,6 +105,7 @@ function macInput(f: Fields): Uint8Array<ArrayBuffer> {
     JSON.stringify([
       f.v,
       f.peer,
+      f.device,
       f.id,
       f.role,
       f.state,
@@ -128,14 +131,28 @@ function concat(...parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
 
 function blobData(f: {
   peer: string;
+  device: string;
   id: string;
   role: Role;
   stamp: number;
 }): Uint8Array<ArrayBuffer> {
   return concat(
     blobContext,
-    encoder.encode(JSON.stringify([f.peer, f.id, f.role, f.stamp])),
+    encoder.encode(JSON.stringify([f.peer, f.device, f.id, f.role, f.stamp])),
   );
+}
+
+export function pairAddress(peer: string, device: string): string {
+  return `${peer}/${device}`;
+}
+
+export function splitAddress(
+  address: string,
+): { peer: string; device: string } | null {
+  const [peer, device, ...rest] = address.split("/");
+  return rest.length === 0 && isIdentity(peer) && isFixed(device, deviceIdSize)
+    ? { peer, device }
+    : null;
 }
 
 async function owns(pair: {
@@ -187,7 +204,8 @@ export function parsePair(key: string, value: unknown): StoredPair | null {
     names.length !== fields.length ||
     !fields.every((name) => names.includes(name)) ||
     !isIdentity(r.peer) ||
-    r.peer !== key ||
+    !isFixed(r.device, deviceIdSize) ||
+    pairAddress(r.peer as string, r.device as string) !== key ||
     !isFixed(r.id, initiationIdSize) ||
     (r.role !== "initiator" && r.role !== "responder") ||
     (r.state !== "pending" && r.state !== "established") ||
@@ -375,13 +393,25 @@ export class Pairs {
     self: string,
   ): Promise<Pairs> {
     const pairs = new Pairs(store, integrity, storage, self);
+    const previous: string[] = [];
     for (const { key, value } of await store.getAll("pairs")) {
+      if (
+        typeof value === "object" &&
+        value !== null &&
+        (value as { v?: unknown }).v === 2
+      ) {
+        previous.push(key);
+        continue;
+      }
       const record = await pairs.#verify(key, value);
       if (record) {
         pairs.#records.set(key, record);
       } else {
         pairs.#rejected += 1;
       }
+    }
+    if (previous.length > 0) {
+      await store.delete("pairs", previous);
     }
     return pairs;
   }
@@ -390,33 +420,37 @@ export class Pairs {
     return this.#rejected;
   }
 
-  onChange(listener: (peer: string) => void): () => void {
+  onChange(listener: (address: string) => void): () => void {
     return this.#changes.add(listener);
   }
 
-  state(peer: string): PairState {
-    return this.#records.get(peer)?.state ?? "none";
+  state(address: string): PairState {
+    return this.#records.get(address)?.state ?? "none";
   }
 
-  role(peer: string): Role | null {
-    return this.#records.get(peer)?.role ?? null;
+  role(address: string): Role | null {
+    return this.#records.get(address)?.role ?? null;
   }
 
-  id(peer: string): string | null {
-    return this.#records.get(peer)?.id ?? null;
+  id(address: string): string | null {
+    return this.#records.get(address)?.id ?? null;
   }
 
   savePending(
-    peer: string,
+    address: string,
     ephemeral: string,
     pending: Pending,
     ratchet: RatchetState,
   ): Promise<boolean> {
+    const target = splitAddress(address);
+    if (!target) {
+      return Promise.resolve(false);
+    }
     return this.#enqueue(() =>
       this.#write(
         {
           v: pairsVersion,
-          peer,
+          ...target,
           id: pending.id,
           role: "initiator",
           state: "pending",
@@ -433,15 +467,19 @@ export class Pairs {
   }
 
   saveResponder(
-    peer: string,
+    address: string,
     ephemeral: string,
     ratchet: RatchetState,
   ): Promise<boolean> {
+    const target = splitAddress(address);
+    if (!target) {
+      return Promise.resolve(false);
+    }
     return this.#enqueue(() =>
       this.#write(
         {
           v: pairsVersion,
-          peer,
+          ...target,
           id: ratchet.binding.session,
           role: "responder",
           state: "established",
@@ -457,24 +495,24 @@ export class Pairs {
     ).then((r) => r === true);
   }
 
-  discard(peer: string, id: string): Promise<boolean> {
+  discard(address: string, id: string): Promise<boolean> {
     return this.#enqueue(async () => {
-      await this.#reload(peer);
-      const record = this.#records.get(peer);
+      await this.#reload(address);
+      const record = this.#records.get(address);
       if (!record || record.id !== id || record.state !== "pending") {
         return false;
       }
-      await this.#store.delete("pairs", [peer]);
-      this.#records.delete(peer);
-      this.#changes.emit(peer);
+      await this.#store.delete("pairs", [address]);
+      this.#records.delete(address);
+      this.#changes.emit(address);
       return true;
     }).then((r) => r === true);
   }
 
-  accept(peer: string, ephemeral: string, accept: string): Promise<boolean> {
+  accept(address: string, ephemeral: string, accept: string): Promise<boolean> {
     return this.#enqueue(async () => {
-      await this.#reload(peer);
-      const record = this.#records.get(peer);
+      await this.#reload(address);
+      const record = this.#records.get(address);
       const transcript = record && bytesOf(record.transcript, 512);
       if (
         !record ||
@@ -499,14 +537,14 @@ export class Pairs {
   }
 
   transact<T>(
-    peer: string,
+    address: string,
     change: (
       state: RatchetState,
     ) => Promise<{ state: RatchetState; value: T } | null>,
   ): Promise<T | null> {
     return this.#enqueue(async () => {
-      await this.#reload(peer);
-      const record = this.#records.get(peer);
+      await this.#reload(address);
+      const record = this.#records.get(address);
       if (!record || record.state !== "established") {
         return null;
       }
@@ -541,13 +579,14 @@ export class Pairs {
     return run.catch(() => undefined);
   }
 
-  async #reload(peer: string): Promise<void> {
-    const value = await this.#store.get("pairs", peer);
-    const record = value === undefined ? null : await this.#verify(peer, value);
+  async #reload(address: string): Promise<void> {
+    const value = await this.#store.get("pairs", address);
+    const record =
+      value === undefined ? null : await this.#verify(address, value);
     if (record) {
-      this.#records.set(peer, record);
+      this.#records.set(address, record);
     } else {
-      this.#records.delete(peer);
+      this.#records.delete(address);
     }
   }
 
@@ -636,20 +675,21 @@ export class Pairs {
       ...next,
       mac: encodeBase64Url(new Uint8Array(mac)),
     };
-    if (!parsePair(next.peer, record)) {
+    const address = pairAddress(next.peer, next.device);
+    if (!parsePair(address, record)) {
       return false;
     }
-    await this.#store.put("pairs", next.peer, record);
-    this.#records.set(next.peer, record);
+    await this.#store.put("pairs", address, record);
+    this.#records.set(address, record);
     const excess = [...this.#records.values()]
       .sort((a, b) => a.stamp - b.stamp)
       .slice(0, Math.max(0, this.#records.size - maxPairs))
-      .map((r) => r.peer);
+      .map((r) => pairAddress(r.peer, r.device));
     if (excess.length > 0) {
       await this.#store.delete("pairs", excess);
       excess.forEach((peer) => this.#records.delete(peer));
     }
-    this.#changes.emit(next.peer);
+    this.#changes.emit(address);
     return true;
   }
 }

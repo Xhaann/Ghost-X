@@ -17,8 +17,17 @@ func testConfig() config.Config {
 	return config.Config{Addr: "127.0.0.1:0", ShutdownTimeout: 2 * time.Second}
 }
 
+func newServer(t *testing.T, cfg config.Config) *Server {
+	t.Helper()
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}
+
 func TestHealth(t *testing.T) {
-	srv := New(testConfig())
+	srv := newServer(t, testConfig())
 
 	rec := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -29,7 +38,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestHealthRejectsOtherMethods(t *testing.T) {
-	srv := New(testConfig())
+	srv := newServer(t, testConfig())
 
 	rec := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/healthz", nil))
@@ -40,7 +49,7 @@ func TestHealthRejectsOtherMethods(t *testing.T) {
 }
 
 func TestUnknownRoute(t *testing.T) {
-	srv := New(testConfig())
+	srv := newServer(t, testConfig())
 
 	rec := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -56,7 +65,7 @@ func TestServeShutsDownOnCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(testConfig())
+	srv := newServer(t, testConfig())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -92,7 +101,7 @@ func TestRunInvalidAddr(t *testing.T) {
 	cfg := testConfig()
 	cfg.Addr = "127.0.0.1:-1"
 
-	if err := New(cfg).Run(context.Background()); err == nil {
+	if err := newServer(t, cfg).Run(context.Background()); err == nil {
 		t.Fatal("Run() error = nil, want error")
 	}
 }
@@ -103,7 +112,7 @@ func TestServeClosesWebSockets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(testConfig())
+	srv := newServer(t, testConfig())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {

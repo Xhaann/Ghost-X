@@ -33,7 +33,7 @@ func startServer(t *testing.T) (*Server, string) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	srv := New(testConfig())
+	srv := newServer(t, testConfig())
 	go func() {
 		done <- srv.Serve(ctx, ln)
 	}()
