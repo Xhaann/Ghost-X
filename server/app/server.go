@@ -20,6 +20,13 @@ import (
 	"github.com/Xhaann/ghost-x/server/socket"
 )
 
+const (
+	RosterRate          = 5.0
+	RosterBurst         = 50.0
+	IdentityRosterRate  = 0.1
+	IdentityRosterBurst = 6.0
+)
+
 type Server struct {
 	cfg      config.Config
 	hub      *socket.Hub
@@ -69,6 +76,13 @@ func New(cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	devices.SetLimits(device.Limits{
+		Rate:          RosterRate,
+		Burst:         RosterBurst,
+		IdentityRate:  IdentityRosterRate,
+		IdentityBurst: IdentityRosterBurst,
+		Now:           time.Now,
+	})
 	present := presence.NewRegistry()
 	prekeys := prekey.NewRegistry(devices.Authorized)
 	queued := queue.NewRegistry(time.Now, devices.Authorized)

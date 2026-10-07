@@ -141,6 +141,8 @@ func Register(devices *device.Registry) Handler {
 			return Reply{}, &Error{Code: CodeRegistryFull}
 		case errors.Is(err, device.ErrReused):
 			return Reply{}, &Error{Code: CodeRevoked}
+		case errors.Is(err, device.ErrRate):
+			return Reply{}, &Error{Code: CodeRateLimited}
 		case err != nil:
 			return Reply{}, err
 		}

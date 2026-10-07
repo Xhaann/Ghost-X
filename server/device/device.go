@@ -1,6 +1,7 @@
 package device
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/Xhaann/ghost-x/server/identity"
 )
@@ -37,6 +39,7 @@ var (
 	ErrSignature  = errors.New("device: invalid device signature")
 	ErrPersist    = errors.New("device: roster could not be stored")
 	ErrCorrupted  = errors.New("device: stored rosters are invalid")
+	ErrRate       = errors.New("device: too many roster changes")
 	strictEncoder = base64.RawURLEncoding.Strict()
 )
 
@@ -145,6 +148,33 @@ type stored struct {
 	Revoked []string `json:"revoked"`
 }
 
+type Limits struct {
+	Rate          float64
+	Burst         float64
+	IdentityRate  float64
+	IdentityBurst float64
+	Now           func() time.Time
+}
+
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func (b *bucket) take(rate, burst float64, now time.Time) bool {
+	if b.last.IsZero() {
+		b.tokens = burst
+	} else if elapsed := now.Sub(b.last).Seconds(); elapsed > 0 {
+		b.tokens = min(burst, b.tokens+elapsed*rate)
+	}
+	b.last = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
 type Registry struct {
 	mu       sync.Mutex
 	path     string
@@ -152,6 +182,13 @@ type Registry struct {
 	sessions map[any]Admission
 	kicks    map[any]func()
 	revoked  []func(owner, device string)
+
+	write   sync.Mutex
+	lines   int
+	size    int64
+	limits  Limits
+	global  bucket
+	buckets map[string]*bucket
 }
 
 func Open(path string) (*Registry, error) {
@@ -160,6 +197,7 @@ func Open(path string) (*Registry, error) {
 		rosters:  make(map[string]*entry),
 		sessions: make(map[any]Admission),
 		kicks:    make(map[any]func()),
+		buckets:  make(map[string]*bucket),
 	}
 	if path == "" {
 		return r, nil
@@ -171,26 +209,93 @@ func Open(path string) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	var records []stored
-	if err := json.Unmarshal(data, &records); err != nil || len(records) > MaxIdentities {
-		return nil, ErrCorrupted
-	}
-	for _, record := range records {
-		roster := record.Roster
-		if _, err := Verify(roster); err != nil || len(record.Revoked) > MaxRevoked {
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '[' {
+		var records []stored
+		if err := json.Unmarshal(data, &records); err != nil || len(records) > MaxIdentities {
 			return nil, ErrCorrupted
 		}
-		if _, dup := r.rosters[roster.Identity]; dup {
-			return nil, ErrCorrupted
-		}
-		for _, id := range record.Revoked {
-			if _, ok := decodeFixed(id, IDSize); !ok || slices.ContainsFunc(roster.Devices, func(d Device) bool { return d.ID == id }) {
+		for _, record := range records {
+			if _, dup := r.rosters[record.Roster.Identity]; dup {
 				return nil, ErrCorrupted
 			}
+			if err := r.load(record); err != nil {
+				return nil, err
+			}
 		}
-		r.rosters[roster.Identity] = newEntry(roster, record.Revoked)
+		if err := r.compact(); err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+	complete := bytes.LastIndexByte(data, '\n') + 1
+	if complete < len(data) {
+		if err := os.Truncate(path, int64(complete)); err != nil {
+			return nil, err
+		}
+	}
+	r.size = int64(complete)
+	for line := range bytes.SplitSeq(data[:complete], []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		var record stored
+		if err := json.Unmarshal(line, &record); err != nil {
+			return nil, ErrCorrupted
+		}
+		if current := r.rosters[record.Roster.Identity]; current != nil && record.Roster.Version <= current.roster.Version {
+			return nil, ErrCorrupted
+		}
+		if err := r.load(record); err != nil {
+			return nil, err
+		}
+		r.lines++
+	}
+	if len(r.rosters) > MaxIdentities {
+		return nil, ErrCorrupted
 	}
 	return r, nil
+}
+
+func (r *Registry) load(record stored) error {
+	roster := record.Roster
+	if _, err := Verify(roster); err != nil || len(record.Revoked) > MaxRevoked {
+		return ErrCorrupted
+	}
+	for _, id := range record.Revoked {
+		if _, ok := decodeFixed(id, IDSize); !ok || slices.ContainsFunc(roster.Devices, func(d Device) bool { return d.ID == id }) {
+			return ErrCorrupted
+		}
+	}
+	r.rosters[roster.Identity] = newEntry(roster, record.Revoked)
+	return nil
+}
+
+func (r *Registry) SetLimits(l Limits) {
+	r.write.Lock()
+	defer r.write.Unlock()
+	r.limits = l
+}
+
+func (r *Registry) allow(owner string) bool {
+	l := r.limits
+	if l.Now == nil {
+		return true
+	}
+	now := l.Now()
+	b := r.buckets[owner]
+	if b == nil {
+		b = &bucket{}
+	}
+	probe := *b
+	if !probe.take(l.IdentityRate, l.IdentityBurst, now) {
+		return false
+	}
+	if !r.global.take(l.Rate, l.Burst, now) {
+		return false
+	}
+	*b = probe
+	r.buckets[owner] = b
+	return true
 }
 
 func newEntry(roster Roster, revoked []string) *entry {
@@ -292,73 +397,12 @@ func (r *Registry) Publish(roster Roster) error {
 		return err
 	}
 	roster = cloneRoster(roster)
-	r.mu.Lock()
-	current := r.rosters[roster.Identity]
-	switch {
-	case current == nil && len(r.rosters) >= MaxIdentities:
-		r.mu.Unlock()
-		return ErrLimit
-	case current != nil && roster.Version < current.roster.Version:
-		r.mu.Unlock()
-		return ErrStale
-	case current != nil && roster.Version == current.roster.Version:
-		same := sameRoster(current.roster, roster)
-		r.mu.Unlock()
-		if same {
-			return nil
-		}
-		return ErrStale
+	r.write.Lock()
+	removed, kicks, hooks, err := r.publish(roster)
+	r.write.Unlock()
+	if err != nil {
+		return err
 	}
-	if current != nil {
-		for _, d := range roster.Devices {
-			if slices.Contains(current.revoked, d.ID) {
-				r.mu.Unlock()
-				return ErrReused
-			}
-		}
-	}
-	previous := current
-	var revoked []string
-	if previous != nil {
-		revoked = slices.Clone(previous.revoked)
-		for _, d := range previous.roster.Devices {
-			if !slices.ContainsFunc(roster.Devices, func(n Device) bool { return n.ID == d.ID }) {
-				revoked = append(revoked, d.ID)
-			}
-		}
-		if len(revoked) > MaxRevoked {
-			revoked = revoked[len(revoked)-MaxRevoked:]
-		}
-	}
-	r.rosters[roster.Identity] = newEntry(roster, revoked)
-	if err := r.persist(); err != nil {
-		if previous == nil {
-			delete(r.rosters, roster.Identity)
-		} else {
-			r.rosters[roster.Identity] = previous
-		}
-		r.mu.Unlock()
-		return ErrPersist
-	}
-	var removed []string
-	if previous != nil {
-		for _, d := range previous.roster.Devices {
-			if !slices.ContainsFunc(roster.Devices, func(n Device) bool { return n.ID == d.ID }) {
-				removed = append(removed, d.ID)
-			}
-		}
-	}
-	var kicks []func()
-	for session, admission := range r.sessions {
-		if admission.Identity.String() == roster.Identity && slices.Contains(removed, admission.Device) {
-			delete(r.sessions, session)
-			if kick := r.kicks[session]; kick != nil {
-				kicks = append(kicks, kick)
-			}
-		}
-	}
-	hooks := slices.Clone(r.revoked)
-	r.mu.Unlock()
 	for _, d := range removed {
 		for _, hook := range hooks {
 			hook(roster.Identity, d)
@@ -370,32 +414,145 @@ func (r *Registry) Publish(roster Roster) error {
 	return nil
 }
 
-func (r *Registry) persist() error {
+func (r *Registry) publish(roster Roster) ([]string, []func(), []func(owner, device string), error) {
+	r.mu.Lock()
+	current := r.rosters[roster.Identity]
+	count := len(r.rosters)
+	r.mu.Unlock()
+	switch {
+	case current == nil && count >= MaxIdentities:
+		return nil, nil, nil, ErrLimit
+	case current != nil && roster.Version < current.roster.Version:
+		return nil, nil, nil, ErrStale
+	case current != nil && roster.Version == current.roster.Version:
+		if sameRoster(current.roster, roster) {
+			return nil, nil, nil, nil
+		}
+		return nil, nil, nil, ErrStale
+	}
+	var removed, revoked []string
+	if current != nil {
+		for _, d := range roster.Devices {
+			if slices.Contains(current.revoked, d.ID) {
+				return nil, nil, nil, ErrReused
+			}
+		}
+		revoked = slices.Clone(current.revoked)
+		for _, d := range current.roster.Devices {
+			if !slices.ContainsFunc(roster.Devices, func(n Device) bool { return n.ID == d.ID }) {
+				removed = append(removed, d.ID)
+			}
+		}
+		revoked = append(revoked, removed...)
+		if len(revoked) > MaxRevoked {
+			revoked = revoked[len(revoked)-MaxRevoked:]
+		}
+	}
+	if !r.allow(roster.Identity) {
+		return nil, nil, nil, ErrRate
+	}
+	if err := r.append(stored{Roster: roster, Revoked: nonNil(revoked)}); err != nil {
+		return nil, nil, nil, ErrPersist
+	}
+	next := newEntry(roster, revoked)
+	r.mu.Lock()
+	r.rosters[roster.Identity] = next
+	var kicks []func()
+	for session, admission := range r.sessions {
+		if admission.Identity.String() == roster.Identity && slices.Contains(removed, admission.Device) {
+			delete(r.sessions, session)
+			if kick := r.kicks[session]; kick != nil {
+				kicks = append(kicks, kick)
+			}
+		}
+	}
+	hooks := slices.Clone(r.revoked)
+	r.mu.Unlock()
+	r.lines++
+	if r.lines > 2*count+1024 {
+		r.compact()
+	}
+	return removed, kicks, hooks, nil
+}
+
+func nonNil(list []string) []string {
+	if list == nil {
+		return []string{}
+	}
+	return list
+}
+
+func (r *Registry) append(record stored) error {
 	if r.path == "" {
 		return nil
 	}
+	line, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	line = append(line, '\n')
+	_, statErr := os.Stat(r.path)
+	created := errors.Is(statErr, os.ErrNotExist)
+	f, err := os.OpenFile(r.path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < r.size {
+		return ErrCorrupted
+	}
+	if info.Size() > r.size {
+		if err := f.Truncate(r.size); err != nil {
+			return err
+		}
+	}
+	if _, err = f.Write(line); err == nil {
+		err = f.Sync()
+	}
+	if err == nil && created {
+		err = syncDir(filepath.Dir(r.path))
+	}
+	if err != nil {
+		f.Truncate(r.size)
+		return err
+	}
+	r.size += int64(len(line))
+	return nil
+}
+
+func (r *Registry) compact() error {
+	if r.path == "" {
+		return nil
+	}
+	r.mu.Lock()
 	all := make([]stored, 0, len(r.rosters))
 	for _, e := range r.rosters {
-		revoked := e.revoked
-		if revoked == nil {
-			revoked = []string{}
-		}
-		all = append(all, stored{Roster: e.roster, Revoked: revoked})
+		all = append(all, stored{Roster: e.roster, Revoked: nonNil(e.revoked)})
 	}
+	r.mu.Unlock()
 	slices.SortFunc(all, func(a, b stored) int {
 		if a.Roster.Identity < b.Roster.Identity {
 			return -1
 		}
 		return 1
 	})
-	data, err := json.Marshal(all)
-	if err != nil {
+	var data []byte
+	for _, record := range all {
+		line, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		data = append(append(data, line...), '\n')
+	}
+	dir := filepath.Dir(r.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(r.path), ".devices-*")
+	tmp, err := os.CreateTemp(dir, ".devices-*")
 	if err != nil {
 		return err
 	}
@@ -418,7 +575,22 @@ func (r *Registry) persist() error {
 		os.Remove(name)
 		return err
 	}
-	return os.Rename(name, r.path)
+	if err := os.Rename(name, r.path); err != nil {
+		os.Remove(name)
+		return err
+	}
+	r.lines = len(all)
+	r.size = int64(len(data))
+	return syncDir(dir)
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func cloneRoster(r Roster) Roster {

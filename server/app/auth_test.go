@@ -387,3 +387,21 @@ func TestProtectedOperationRequiresReauthenticationAfterReconnect(t *testing.T) 
 		t.Fatalf("whoami after re-authentication = %+v", msg)
 	}
 }
+
+func TestServerLimitsRosterChangesPerIdentity(t *testing.T) {
+	_, url := startServer(t)
+	conn := dialApp(t, url)
+	id := devicetest.NewIdentity()
+	rosters := []device.Roster{id.Add(id.NewDevice())}
+	for len(rosters) <= int(IdentityRosterBurst) {
+		rosters = append(rosters, id.Next())
+	}
+	for i, r := range rosters[:len(rosters)-1] {
+		if msg := roundTrip(t, conn, rosterFrame(r)); msg.Type != "registered" {
+			t.Fatalf("change %d = %+v", i, msg)
+		}
+	}
+	expectError(t, roundTrip(t, conn, rosterFrame(rosters[len(rosters)-1])), "rate_limited")
+	other := dialApp(t, url)
+	expectError(t, roundTrip(t, other, rosterFrame(id.Next())), "rate_limited")
+}

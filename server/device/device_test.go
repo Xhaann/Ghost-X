@@ -5,13 +5,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Xhaann/ghost-x/server/device"
 	"github.com/Xhaann/ghost-x/server/device/devicetest"
@@ -220,7 +223,7 @@ func TestRevocationSurvivesRestart(t *testing.T) {
 func TestCorruptedStoreFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	for name, content := range map[string]string{
-		"garbage":        "{",
+		"garbage":        "{\n",
 		"tampered":       "",
 		"duplicate":      "",
 		"revoked listed": "",
@@ -330,8 +333,8 @@ func TestPersistFailureRollsBack(t *testing.T) {
 	if err := r.Publish(id.Add(a, b)); err != nil {
 		t.Fatal(err)
 	}
-	os.Chmod(dir, 0o500)
-	defer os.Chmod(dir, 0o700)
+	os.Chmod(path, 0o400)
+	defer os.Chmod(path, 0o600)
 	if err := r.Publish(id.Remove(b)); !errors.Is(err, device.ErrPersist) {
 		t.Fatalf("unpersisted revocation = %v", err)
 	}
@@ -403,4 +406,430 @@ func TestRevokedDevicesCannotBeAuthorizedAgain(t *testing.T) {
 	if err := reopened.Publish(id.Next()); err != nil {
 		t.Fatalf("a newly generated device = %v", err)
 	}
+}
+
+func lines(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+}
+
+func TestPreviousStoreFormatMigratesIntact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	id := devicetest.NewIdentity()
+	a, b := id.NewDevice(), id.NewDevice()
+	id.Add(a, b)
+	current := id.Remove(b)
+	other := devicetest.NewIdentity()
+	second := other.Add(other.NewDevice())
+	data, _ := json.Marshal([]map[string]any{
+		{"roster": current, "revoked": []string{b.ID}},
+		{"roster": second, "revoked": []string{}},
+	})
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := device.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Len() != 2 || !r.Authorized(id.Identity, a.ID) || r.Authorized(id.Identity, b.ID) {
+		t.Fatal("migrated state differs")
+	}
+	if err := r.Publish(id.Add(b)); !errors.Is(err, device.ErrReused) {
+		t.Fatalf("revocation lost in migration: %v", err)
+	}
+	if got := lines(t, path); len(got) != 2 || !strings.HasPrefix(got[0], "{") {
+		t.Fatalf("store not converted: %q", got)
+	}
+	reopened, err := device.Open(path)
+	if err != nil || reopened.Len() != 2 || reopened.Authorized(id.Identity, b.ID) {
+		t.Fatalf("converted store reopen = %v", err)
+	}
+}
+
+func TestEachChangeAppendsOneRecordAndTheLogStaysBounded(t *testing.T) {
+	r, path := open(t)
+	id := devicetest.NewIdentity()
+	d := id.NewDevice()
+	if err := r.Publish(id.Add(d)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Publish(id.Sign(id.Version, id.Devices)); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(lines(t, path)); n != 1 {
+		t.Fatalf("identical replay appended: %d lines", n)
+	}
+	for range 1100 {
+		extra := id.NewDevice()
+		if err := r.Publish(id.Add(extra)); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Publish(id.Remove(extra)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(lines(t, path)); n > 2*r.Len()+1025 {
+		t.Fatalf("log grew without compaction: %d lines", n)
+	}
+	reopened, err := device.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, _ := r.Roster(id.Identity)
+	again, _ := reopened.Roster(id.Identity)
+	if again.Version != current.Version || again.Signature != current.Signature {
+		t.Fatal("reopened state differs after compaction")
+	}
+	if err := reopened.Publish(id.Add(id.Devices[0])); err == nil {
+		t.Fatal("device accepted twice")
+	}
+	info, _ := os.Stat(path)
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %v", info.Mode().Perm())
+	}
+}
+
+func TestAnUnacknowledgedTornRecordIsDroppedAndCorruptionFailsClosed(t *testing.T) {
+	r, path := open(t)
+	id := devicetest.NewIdentity()
+	a, b := id.NewDevice(), id.NewDevice()
+	if err := r.Publish(id.Add(a, b)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Publish(id.Remove(b)); err != nil {
+		t.Fatal(err)
+	}
+	good, _ := os.ReadFile(path)
+	next, _ := json.Marshal(map[string]any{"roster": id.Add(id.NewDevice()), "revoked": []string{b.ID}})
+	for cut := 1; cut < len(next); cut += len(next) / 7 {
+		os.WriteFile(path, append(slices.Clone(good), next[:cut]...), 0o600)
+		reopened, err := device.Open(path)
+		if err != nil {
+			t.Fatalf("torn tail of %d bytes: %v", cut, err)
+		}
+		if reopened.Authorized(id.Identity, b.ID) || !reopened.Authorized(id.Identity, a.ID) {
+			t.Fatal("torn tail changed acknowledged state")
+		}
+		if data, _ := os.ReadFile(path); string(data) != string(good) {
+			t.Fatal("torn tail not removed")
+		}
+	}
+	records := lines(t, path)
+	for name, content := range map[string]string{
+		"corrupt line":       records[0] + "\n{\n" + records[1] + "\n",
+		"version regression": records[1] + "\n" + records[0] + "\n",
+		"replayed line":      records[0] + "\n" + records[0] + "\n",
+		"tampered signature": strings.Replace(records[1], `"signature":"`, `"signature":"A`, 1) + "\n",
+	} {
+		os.WriteFile(path, []byte(content), 0o600)
+		if _, err := device.Open(path); !errors.Is(err, device.ErrCorrupted) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestConcurrentPublishesNeverLoseAnUpdate(t *testing.T) {
+	r, path := open(t)
+	ids := make([]*devicetest.Identity, 24)
+	rosters := make([][]device.Roster, len(ids))
+	for i := range ids {
+		ids[i] = devicetest.NewIdentity()
+		for range 4 {
+			rosters[i] = append(rosters[i], ids[i].Add(ids[i].NewDevice()))
+		}
+	}
+	var wg sync.WaitGroup
+	for i := range ids {
+		for _, roster := range rosters[i] {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := r.Publish(roster)
+				if err != nil && !errors.Is(err, device.ErrStale) {
+					t.Error(err)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	reopened, err := device.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		live, _ := r.Roster(id.Identity)
+		disk, _ := reopened.Roster(id.Identity)
+		if live.Signature != disk.Signature || live.Version != disk.Version {
+			t.Fatalf("identity %d: memory v%d, disk v%d", i, live.Version, disk.Version)
+		}
+		if final := rosters[i][3]; live.Version != final.Version {
+			if err := r.Publish(final); err != nil {
+				t.Fatalf("identity %d cannot reach its newest roster: %v", i, err)
+			}
+		}
+	}
+}
+
+func TestAStalledWriterNeverBlocksAuthorization(t *testing.T) {
+	r, _ := open(t)
+	id := devicetest.NewIdentity()
+	d := id.NewDevice()
+	if err := r.Publish(id.Add(d)); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	r.SetLimits(device.Limits{Rate: 1000, Burst: 1000, IdentityRate: 1000, IdentityBurst: 1000, Now: func() time.Time {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		return time.Now()
+	}})
+	other := devicetest.NewIdentity()
+	done := make(chan error, 1)
+	go func() { done <- r.Publish(other.Add(other.NewDevice())) }()
+	<-entered
+	finished := make(chan struct{})
+	go func() {
+		r.Authorized(id.Identity, d.ID)
+		r.Key(id.Identity, d.ID)
+		r.Roster(id.Identity)
+		admit(r, "reader", id, d)
+		r.Release("reader")
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readers blocked behind a registry write")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRosterChangesAreRateLimitedGloballyAndPerIdentity(t *testing.T) {
+	r, _ := open(t)
+	now := time.Unix(1_700_000_000, 0)
+	var mu sync.Mutex
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		now = now.Add(d)
+		mu.Unlock()
+	}
+	r.SetLimits(device.Limits{Rate: 1, Burst: 10, IdentityRate: 0.1, IdentityBurst: 3, Now: clock})
+	id := devicetest.NewIdentity()
+	d := id.NewDevice()
+	first := id.Add(d)
+	for i := range 3 {
+		roster := first
+		if i > 0 {
+			roster = id.Next()
+		}
+		if err := r.Publish(roster); err != nil {
+			t.Fatalf("change %d: %v", i, err)
+		}
+	}
+	if err := r.Publish(id.Sign(id.Version, id.Devices)); err != nil {
+		t.Fatalf("identical replay was limited: %v", err)
+	}
+	if err := r.Publish(id.Next()); !errors.Is(err, device.ErrRate) {
+		t.Fatalf("fourth change = %v", err)
+	}
+	advance(10 * time.Second)
+	if err := r.Publish(id.Sign(id.Version, id.Devices)); err != nil {
+		t.Fatalf("change after refill: %v", err)
+	}
+	var wg sync.WaitGroup
+	var accepted, limited atomic.Int32
+	for range 40 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			other := devicetest.NewIdentity()
+			switch err := r.Publish(other.Add(other.NewDevice())); {
+			case err == nil:
+				accepted.Add(1)
+			case errors.Is(err, device.ErrRate):
+				limited.Add(1)
+			default:
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if accepted.Load() != 9 || limited.Load() != 31 {
+		t.Fatalf("concurrent new identities: %d accepted, %d limited", accepted.Load(), limited.Load())
+	}
+	before := r.Len()
+	advance(5 * time.Second)
+	for range 5 {
+		other := devicetest.NewIdentity()
+		if err := r.Publish(other.Add(other.NewDevice())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r.Len() != before+5 {
+		t.Fatal("refill not applied")
+	}
+}
+
+func TestTheRegistryRefusesNewIdentitiesAtCapacity(t *testing.T) {
+	r, err := device.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first *devicetest.Identity
+	for i := range device.MaxIdentities {
+		id := devicetest.NewIdentity()
+		if err := r.Publish(id.Add(id.NewDevice())); err != nil {
+			t.Fatalf("identity %d: %v", i, err)
+		}
+		if first == nil {
+			first = id
+		}
+	}
+	extra := devicetest.NewIdentity()
+	if err := r.Publish(extra.Add(extra.NewDevice())); !errors.Is(err, device.ErrLimit) {
+		t.Fatalf("identity beyond capacity = %v", err)
+	}
+	if r.Len() != device.MaxIdentities {
+		t.Fatalf("Len() = %d", r.Len())
+	}
+	if err := r.Publish(first.Add(first.NewDevice())); err != nil {
+		t.Fatalf("existing identity blocked at capacity: %v", err)
+	}
+}
+
+func TestDiskWritesNeverHoldTheReaderLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "devices.json")
+	r, err := device.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := devicetest.NewIdentity()
+	d := id.NewDevice()
+	if err := r.Publish(id.Add(d)); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := os.ReadFile(path)
+	os.Remove(path)
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	other := devicetest.NewIdentity()
+	done := make(chan error, 1)
+	go func() { done <- r.Publish(other.Add(other.NewDevice())) }()
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("write did not block on the pipe: %v", err)
+	default:
+	}
+	finished := make(chan struct{})
+	go func() {
+		r.Authorized(id.Identity, d.ID)
+		r.Key(id.Identity, d.ID)
+		r.Roster(id.Identity)
+		admit(r, "reader", id, d)
+		r.Release("reader")
+		r.Len()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readers blocked behind a disk write")
+	}
+	reader, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(io.Discard, reader)
+	<-done
+	reader.Close()
+	os.Remove(path)
+	os.WriteFile(path, stored, 0o600)
+}
+
+func TestUnacknowledgedBytesAreRemovedBeforeTheNextRecord(t *testing.T) {
+	r, path := open(t)
+	id := devicetest.NewIdentity()
+	a, b := id.NewDevice(), id.NewDevice()
+	if err := r.Publish(id.Add(a)); err != nil {
+		t.Fatal(err)
+	}
+	acknowledged, _ := os.ReadFile(path)
+	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	f.WriteString(`{"roster":{"identity":"torn`)
+	f.Close()
+	if err := r.Publish(id.Add(b)); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.HasPrefix(string(data), string(acknowledged)) || strings.Contains(string(data), "torn") {
+		t.Fatal("unacknowledged bytes survived the next append")
+	}
+	reopened, err := device.Open(path)
+	if err != nil || !reopened.Authorized(id.Identity, b.ID) {
+		t.Fatalf("store after recovery: %v", err)
+	}
+	os.WriteFile(path, acknowledged[:len(acknowledged)/2], 0o600)
+	c := id.NewDevice()
+	if err := r.Publish(id.Add(c)); !errors.Is(err, device.ErrPersist) {
+		t.Fatalf("append after the store shrank = %v", err)
+	}
+	if r.Authorized(id.Identity, c.ID) {
+		t.Fatal("unpersisted change applied")
+	}
+}
+
+func FuzzOpenStore(f *testing.F) {
+	seed := devicetest.NewIdentity()
+	roster := seed.Add(seed.NewDevice())
+	line, _ := json.Marshal(map[string]any{"roster": roster, "revoked": []string{}})
+	legacy, _ := json.Marshal([]map[string]any{{"roster": roster, "revoked": []string{}}})
+	f.Add(append(line, '\n'))
+	f.Add(legacy)
+	f.Add(append(append(append([]byte{}, line...), '\n'), line[:20]...))
+	f.Add([]byte("{\n"))
+	f.Add([]byte(""))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		path := filepath.Join(t.TempDir(), "devices.json")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r, err := device.Open(path)
+		if err != nil {
+			return
+		}
+		if r.Len() > device.MaxIdentities {
+			t.Fatalf("loaded %d identities", r.Len())
+		}
+		next := devicetest.NewIdentity()
+		if err := r.Publish(next.Add(next.NewDevice())); err != nil && !errors.Is(err, device.ErrLimit) {
+			t.Fatalf("publish after loading = %v", err)
+		}
+		reopened, err := device.Open(path)
+		if err != nil {
+			t.Fatalf("store unreadable after a publish: %v", err)
+		}
+		if reopened.Len() != r.Len() {
+			t.Fatalf("reopened %d identities, had %d", reopened.Len(), r.Len())
+		}
+	})
 }

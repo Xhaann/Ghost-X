@@ -160,3 +160,28 @@ func FuzzRegisterPayload(f *testing.F) {
 		}
 	})
 }
+
+func TestRegistrationReportsRosterRateLimits(t *testing.T) {
+	r := freshRegistry(t)
+	now := time.Unix(1_700_000_000, 0)
+	r.SetLimits(device.Limits{Rate: 100, Burst: 100, IdentityRate: 0.01, IdentityBurst: 2, Now: func() time.Time { return now }})
+	id := devicetest.NewIdentity()
+	d := id.NewDevice()
+	for i, roster := range []device.Roster{id.Add(d), id.Next()} {
+		conn := deviceRouter(r).Conn(auth.NewRegistry(time.Now, nil, r).Open(), discard)
+		if resp := decodeResponse(t, conn.Handle(registerFrame(roster))); resp.Type != "registered" {
+			t.Fatalf("change %d = %+v", i, resp)
+		}
+	}
+	limited := id.Next()
+	conn := deviceRouter(r).Conn(auth.NewRegistry(time.Now, nil, r).Open(), discard)
+	expectCode(t, conn.Handle(registerFrame(limited)), CodeRateLimited)
+	current, _ := r.Roster(id.Identity)
+	if current.Version != limited.Version-1 {
+		t.Fatalf("limited roster stored: v%d", current.Version)
+	}
+	replay := deviceRouter(r).Conn(auth.NewRegistry(time.Now, nil, r).Open(), discard)
+	if resp := decodeResponse(t, replay.Handle(registerFrame(current))); resp.Type != "registered" {
+		t.Fatalf("identical replay limited: %+v", resp)
+	}
+}
