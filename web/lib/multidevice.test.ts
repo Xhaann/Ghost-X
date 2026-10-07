@@ -336,3 +336,103 @@ test("a device revoked between sealing and sending is dropped without re-encrypt
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.ok(!bodies(b2).includes("sealed before revocation"));
 });
+
+test("a revoked device's retained session is deleted and its messages are refused even if a server delivers them", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const a = await secureDevice(port);
+  const [b1, b2] = await identity(port);
+  await connected(a, b1.id, 2);
+  await b2.messenger.send(a.id, "before revocation");
+  await until(() => bodies(a).includes("before revocation"), "genuine");
+  const revoked = await b1.devices.revoke(b1.client, b2.deviceId);
+  assert.ok(revoked.ok);
+  assert.equal(await a.messenger.lookup(b1.id), true);
+  await until(() => a.pairs.state(address(b2)) === "none", "session pruned");
+  assert.equal(a.pairs.state(address(b1)), "established");
+
+  const id = createMessageId();
+  const sealed = await b2.pairing.seal(
+    a.id,
+    a.deviceId,
+    id,
+    "after revocation",
+  );
+  assert.ok(sealed, "the revoked device still holds its own ratchet");
+  const initiations = frames(a.sent, "bundle").length;
+  a.deliver(
+    JSON.stringify({
+      type: "message",
+      payload: {
+        id,
+        from: b1.id,
+        device: b2.deviceId,
+        ciphertext: Buffer.from(sealed).toString("base64url"),
+      },
+    }),
+  );
+  await until(() => a.inbox.length === 2, "forged delivery processed");
+  assert.equal(a.inbox[1].body, null);
+  assert.ok(!bodies(a).includes("after revocation"));
+  assert.equal(frames(a.sent, "bundle").length, initiations);
+
+  await a.shutdown();
+  const reloaded = await secureDevice(port, { store: a.store });
+  assert.equal(reloaded.pairs.state(address(b2)), "none");
+  assert.equal(reloaded.pairs.state(address(b1)), "established");
+  await b1.messenger.send(a.id, "still talking");
+  await until(() => bodies(reloaded).includes("still talking"), "b1 continues");
+});
+
+test("a message claiming a device outside the sender's verified roster is refused without starting a session", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const [a, b] = [await secureDevice(port), await secureDevice(port)];
+  await b.messenger.send(a.id, "genuine");
+  await until(() => bodies(a).includes("genuine"), "genuine");
+  const stranger = await secureDevice(port);
+  const forged = deliveries(a)[0];
+  const bundles = frames(a.sent, "bundle").length;
+  a.deliver(
+    JSON.stringify({
+      type: "message",
+      payload: { ...forged, id: createMessageId(), device: stranger.deviceId },
+    }),
+  );
+  await until(() => a.inbox.length === 2, "forged processed");
+  assert.equal(a.inbox[1].body, null);
+  assert.equal(frames(a.sent, "bundle").length, bundles);
+  assert.equal(a.pairs.state(`${b.id}/${stranger.deviceId}`), "none");
+});
+
+test("a revoked device is refused after a reload even before its session is pruned", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const a = await secureDevice(port);
+  const [b1, b2] = await identity(port);
+  await connected(a, b1.id, 2);
+  await b2.messenger.send(a.id, "before");
+  await until(() => bodies(a).includes("before"), "genuine");
+  await a.shutdown();
+  assert.ok((await b1.devices.revoke(b1.client, b2.deviceId)).ok);
+  const reloaded = await secureDevice(port, { store: a.store });
+  assert.equal(reloaded.pairs.state(address(b2)), "established");
+  assert.equal(reloaded.rosters.cached(b1.id), null);
+  const id = createMessageId();
+  const sealed = await b2.pairing.seal(a.id, a.deviceId, id, "after reload");
+  assert.ok(sealed);
+  reloaded.deliver(
+    JSON.stringify({
+      type: "message",
+      payload: {
+        id,
+        from: b1.id,
+        device: b2.deviceId,
+        ciphertext: Buffer.from(sealed).toString("base64url"),
+      },
+    }),
+  );
+  await until(() => reloaded.inbox.length === 1, "processed");
+  assert.equal(reloaded.inbox[0].body, null);
+  await until(() => reloaded.pairs.state(address(b2)) === "none", "pruned");
+});

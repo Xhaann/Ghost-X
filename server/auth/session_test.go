@@ -55,6 +55,13 @@ func (d *directory) Admit(session any, owner identity.Identity, device string, v
 	return nil
 }
 
+func (d *directory) Authorized(owner, device string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.keys[owner+"/"+device]
+	return ok
+}
+
 func (d *directory) Release(session any) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -583,5 +590,57 @@ func TestRevokedDeviceCannotAuthenticateAndCloseReleases(t *testing.T) {
 	known.revoke(signer)
 	if err := signer.prove(t, r.Open()); !errors.Is(err, ErrFailed) {
 		t.Fatalf("revoked device = %v", err)
+	}
+}
+
+type observed struct {
+	mu     sync.Mutex
+	closed int
+}
+
+func (o *observed) Authenticated(*Session, identity.Identity, string) {}
+
+func (o *observed) Closed(*Session, identity.Identity) {
+	o.mu.Lock()
+	o.closed++
+	o.mu.Unlock()
+}
+
+func TestRevocationEndsAnAuthenticatedSession(t *testing.T) {
+	watch := &observed{}
+	r := NewRegistry(time.Now, watch, known)
+	signer := newSigner(t)
+	s := r.Open()
+	if err := signer.prove(t, s); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Identity(); !ok {
+		t.Fatal("authorized session not authenticated")
+	}
+	before := known.released.Load()
+	known.revoke(signer)
+	for range 2 {
+		if id, ok := s.Identity(); ok || id.String() != (identity.Identity{}).String() {
+			t.Fatal("revoked device still authenticated")
+		}
+	}
+	if s.State() != Revoked {
+		t.Fatalf("state = %v", s.State())
+	}
+	if _, ok := s.Device(); ok {
+		t.Fatal("revoked session still reports a device")
+	}
+	if known.released.Load() != before+1 || watch.closed != 1 {
+		t.Fatalf("released %d, closed %d", known.released.Load()-before, watch.closed)
+	}
+	if _, err := s.Challenge(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("challenge on a revoked session = %v", err)
+	}
+	s.Close()
+	if known.released.Load() != before+1 || watch.closed != 1 || s.State() != Revoked {
+		t.Fatal("closing a revoked session released twice")
+	}
+	if r.Len() != 0 {
+		t.Fatalf("revoked session still registered: %d", r.Len())
 	}
 }

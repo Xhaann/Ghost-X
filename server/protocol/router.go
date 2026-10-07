@@ -59,6 +59,9 @@ func (c *Conn) dispatch(req Request) (Reply, error) {
 	}
 	if handler, ok := c.router.protected[req.Type]; ok {
 		id, authenticated := c.session.Identity()
+		if !authenticated && c.session.State() == auth.Revoked {
+			return Reply{}, &Error{Code: CodeRevoked}
+		}
 		if !authenticated {
 			return Reply{}, &Error{Code: CodeAuthRequired}
 		}

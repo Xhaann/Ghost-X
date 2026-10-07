@@ -1,5 +1,5 @@
 import type { Client } from "./client.ts";
-import type { DeviceEntry } from "./device.ts";
+import { type DeviceEntry, type Roster, rosterDevice } from "./device.ts";
 import {
   type ResponderKeys,
   handshakeVersion,
@@ -159,6 +159,9 @@ export class Pairing implements Channel {
           this.#enqueue(() => this.#accept(message.payload));
         }
       }),
+      this.#rosters.onUpdate((roster) =>
+        this.#enqueue(() => this.#prune(roster)),
+      ),
       source.onState((state) => {
         this.#generation += 1;
         this.#published = false;
@@ -305,7 +308,10 @@ export class Pairing implements Channel {
       return "rejected";
     }
     const address = pairAddress(peer, device);
-    if (!splitAddress(address)) {
+    if (
+      !splitAddress(address) ||
+      !(await this.#rosters.resolve(peer, device))
+    ) {
       return "rejected";
     }
     const current = this.#pairs.state(address);
@@ -337,6 +343,14 @@ export class Pairing implements Channel {
       return "accepted";
     }
     return recorded || failed ? "failed" : "rejected";
+  }
+
+  async #prune(roster: Roster): Promise<void> {
+    for (const device of this.#pairs.devices(roster.identity)) {
+      if (!rosterDevice(roster, device)) {
+        await this.#pairs.remove(pairAddress(roster.identity, device));
+      }
+    }
   }
 
   async #initiate(

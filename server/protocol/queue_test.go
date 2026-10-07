@@ -280,8 +280,10 @@ func TestSendRequiresAuthenticationAndAnAuthorizedDevice(t *testing.T) {
 	if err := testDevices.Publish(pair[0].owner.Remove(pair[1].device)); err != nil {
 		t.Fatal(err)
 	}
-	expectCode(t, revoked.conn.Handle(queueSend(bob, newMessageID(), ratchetCiphertext(200))), CodeStaleDevices)
-	expectCode(t, revoked.conn.Handle([]byte(`{"type":"fetch","id":"f1","payload":{}}`)), CodeStaleDevices)
+	expectCode(t, revoked.conn.Handle(queueSend(bob, newMessageID(), ratchetCiphertext(200))), CodeRevoked)
+	expectCode(t, revoked.conn.Handle([]byte(`{"type":"fetch","id":"f1","payload":{}}`)), CodeRevoked)
+	expectCode(t, revoked.conn.Handle(ackRequest(bob, newMessageID())), CodeRevoked)
+	expectCode(t, revoked.conn.Handle(clearRequest(bob, newMessageID())), CodeRevoked)
 	if f.queue.Queued(bob.address()) != 0 {
 		t.Fatal("revoked device queued a message")
 	}

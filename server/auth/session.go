@@ -33,6 +33,7 @@ const (
 	Authenticated
 	Failed
 	Closed
+	Revoked
 )
 
 func Message(nonce, owner, device []byte) []byte {
@@ -45,6 +46,7 @@ func Message(nonce, owner, device []byte) []byte {
 
 type Devices interface {
 	Admit(session any, owner identity.Identity, device string, verify func(identity.Identity) bool) error
+	Authorized(owner, device string) bool
 	Release(session any)
 }
 
@@ -116,8 +118,14 @@ func (s *Session) State() State {
 
 func (s *Session) Identity() (identity.Identity, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.identity, s.state == Authenticated
+	id, device, authenticated := s.identity, s.device, s.state == Authenticated
+	if !authenticated || s.registry.devices.Authorized(id.String(), device) {
+		s.mu.Unlock()
+		return id, authenticated
+	}
+	s.mu.Unlock()
+	s.end(Revoked)
+	return identity.Identity{}, false
 }
 
 func (s *Session) Device() (string, bool) {
@@ -182,13 +190,17 @@ func (s *Session) Authenticate(encoded, device, signature string) (identity.Iden
 }
 
 func (s *Session) Close() {
+	s.end(Closed)
+}
+
+func (s *Session) end(final State) {
 	s.mu.Lock()
-	if s.state == Closed {
+	if s.state == Closed || s.state == Revoked {
 		s.mu.Unlock()
 		return
 	}
 	wasAuthenticated, id := s.state == Authenticated, s.identity
-	s.state = Closed
+	s.state = final
 	s.nonce = nil
 	s.identity = identity.Identity{}
 	s.device = ""
@@ -204,7 +216,7 @@ func (s *Session) Close() {
 
 func (s *Session) open() error {
 	switch s.state {
-	case Closed:
+	case Closed, Revoked:
 		return ErrClosed
 	case Authenticated, Failed:
 		return ErrFailed

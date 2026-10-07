@@ -498,3 +498,26 @@ test("single-device session records from the previous version are discarded", as
   assert.equal(reopened.pairs.state(h.idB), "established");
   assert.equal(record.v, pairsVersion);
 });
+
+test("removing a device's session deletes it durably and only for that device", async () => {
+  const h = await established();
+  const other = pairAddress(
+    h.bob.keys.identity,
+    ((await createVault(memoryStore())) as Unlocked).keys.deviceId,
+  );
+  assert.deepEqual(h.alice.pairs.devices(h.bob.keys.identity), [
+    h.bob.keys.deviceId,
+  ]);
+  const changes: string[] = [];
+  h.alice.pairs.onChange((address) => changes.push(address));
+  assert.equal(await h.alice.pairs.remove(other), false);
+  assert.equal(await h.alice.pairs.remove(h.idB), true);
+  assert.equal(await h.alice.pairs.remove(h.idB), false);
+  assert.deepEqual(changes, [h.idB]);
+  assert.equal(h.alice.pairs.state(h.idB), "none");
+  assert.deepEqual(h.alice.pairs.devices(h.bob.keys.identity), []);
+  assert.equal(h.alice.store.data.has(`pairs:${h.idB}`), false);
+  const reopened = await local(h.alice.store);
+  assert.equal(reopened.pairs.state(h.idB), "none");
+  assert.equal(h.bob.pairs.state(h.idA), "established");
+});

@@ -301,6 +301,9 @@ func (r *Registry) Ack(s *auth.Session, from identity.Identity, fromDevice, id s
 	if !ok {
 		return ErrUnauthenticated
 	}
+	if !r.authorized(split(recipient)) {
+		return ErrRevoked
+	}
 	box := r.inboxes[recipient]
 	if box == nil {
 		return nil
@@ -330,6 +333,9 @@ func (r *Registry) Clear(s *auth.Session, to identity.Identity, device, id strin
 	sender, ok := r.identities[s]
 	if !ok {
 		return ErrUnauthenticated
+	}
+	if !r.authorized(split(sender)) {
+		return ErrRevoked
 	}
 	recipient := to.String()
 	notes := r.outboxes[sender]

@@ -1081,3 +1081,92 @@ func TestRevokedDevicesLoseQueuesAndCannotUseTheQueue(t *testing.T) {
 	}
 	w.check()
 }
+
+func TestRevokedSessionCannotUseAnyQueueOperation(t *testing.T) {
+	w := newWorld(t)
+	alice := newDevices(t, 2)
+	bob := newUser(t)
+	sender := w.online(bob)
+	revoked := w.online(alice[1])
+	queued := w.send(sender, alice[1])
+	if err := devices.Publish(alice[0].owner.Remove(alice[1].device)); err != nil {
+		t.Fatal(err)
+	}
+	for name, err := range map[string]error{
+		"enqueue":   w.put(revoked.session, bob, Message{ID: messageID(), Ciphertext: sealed(120)}),
+		"subscribe": w.queue.Subscribe(revoked.session),
+		"ack":       w.queue.Ack(revoked.session, bob.id, bob.device.ID, queued.ID),
+		"clear":     w.queue.Clear(revoked.session, bob.id, bob.device.ID, queued.ID),
+	} {
+		if !errors.Is(err, ErrRevoked) {
+			t.Errorf("%s by a revoked device = %v", name, err)
+		}
+	}
+	if _, ok := revoked.session.Identity(); ok || revoked.session.State() != auth.Revoked {
+		t.Fatalf("revoked session still authenticated: %v", revoked.session.State())
+	}
+	if _, err := revoked.session.Challenge(); !errors.Is(err, auth.ErrClosed) {
+		t.Fatalf("revoked session challenge = %v", err)
+	}
+	if err := w.put(w.online(alice[0]).session, bob, Message{ID: messageID(), Ciphertext: sealed(120)}); err != nil {
+		t.Fatalf("sibling device blocked: %v", err)
+	}
+}
+
+func TestConcurrentRevocationNeverLeavesTheRevokedDeviceUsable(t *testing.T) {
+	for round := range 150 {
+		registry, _ := roster.Open("")
+		q := NewRegistry(time.Now, registry.Authorized)
+		registry.OnRevoke(q.RemoveDevice)
+		sessions := auth.NewRegistry(time.Now, q, registry)
+		owner := devicetest.NewIdentity()
+		kept, gone := owner.NewDevice(), owner.NewDevice()
+		peer := devicetest.NewIdentity()
+		peerDevice := peer.NewDevice()
+		if registry.Publish(owner.Add(kept, gone)) != nil || registry.Publish(peer.Add(peerDevice)) != nil {
+			t.Fatal("setup")
+		}
+		peerID, _ := identity.Parse(peer.Identity)
+		open := func() *auth.Session {
+			s := sessions.Open()
+			q.Attach(s, func(Push) bool { return true })
+			return s
+		}
+		sending := open()
+		nonce, _ := sending.Challenge()
+		if _, err := sending.Authenticate(owner.Identity, gone.ID, gone.AuthSignature(owner, nonce)); err != nil {
+			t.Fatal(err)
+		}
+		reconnect := open()
+		again, _ := reconnect.Challenge()
+		var wg sync.WaitGroup
+		var sendErr, authErr error
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			sendErr = q.Enqueue(sending, peerID, messageID(), []Envelope{{Device: peerDevice.ID, Ciphertext: sealed(120)}})
+		}()
+		go func() {
+			defer wg.Done()
+			_, authErr = reconnect.Authenticate(owner.Identity, gone.ID, gone.AuthSignature(owner, again))
+		}()
+		go func() {
+			defer wg.Done()
+			if err := registry.Publish(owner.Remove(gone)); err != nil {
+				t.Error(err)
+			}
+		}()
+		wg.Wait()
+		if n := q.Queued(Address(peer.Identity, peerDevice.ID)); n != 0 {
+			t.Fatalf("round %d: message from the revoked device survived revocation (send %v)", round, sendErr)
+		}
+		for name, s := range map[string]*auth.Session{"sending": sending, "reconnect": reconnect} {
+			if _, ok := s.Identity(); ok {
+				t.Fatalf("round %d: %s session still authenticated after revocation (auth %v)", round, name, authErr)
+			}
+		}
+		if err := q.Subscribe(reconnect); err == nil {
+			t.Fatalf("round %d: revoked device subscribed", round)
+		}
+	}
+}

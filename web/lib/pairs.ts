@@ -436,6 +436,25 @@ export class Pairs {
     return this.#records.get(address)?.id ?? null;
   }
 
+  devices(peer: string): string[] {
+    return [...this.#records.values()]
+      .filter((r) => r.peer === peer)
+      .map((r) => r.device);
+  }
+
+  remove(address: string): Promise<boolean> {
+    return this.#enqueue(async () => {
+      await this.#reload(address);
+      if (!this.#records.has(address)) {
+        return false;
+      }
+      await this.#store.delete("pairs", [address]);
+      this.#records.delete(address);
+      this.#changes.emit(address);
+      return true;
+    }).then((r) => r === true);
+  }
+
   savePending(
     address: string,
     ephemeral: string,
