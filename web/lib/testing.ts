@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before } from "node:test";
@@ -16,9 +16,10 @@ import {
 } from "./encryption.ts";
 import { IdentityKey, parseIdentity } from "./identity.ts";
 import type { KeyValueStore, StoreName } from "./storage.ts";
-import type { TransportState } from "./transport.ts";
+import type { Transport, TransportKind, TransportState } from "./transport.ts";
 import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
+import { type Link, LocalTransport } from "./local.ts";
 import { History } from "./history.ts";
 import {
   Messenger,
@@ -105,6 +106,7 @@ export async function startServer(port: number): Promise<ChildProcess> {
       ...process.env,
       SERVER_ADDR: `127.0.0.1:${port}`,
       DEVICE_STORE: join(workdir, `devices-${port}.json`),
+      LOCAL_SOCKET: localSocket(port),
     },
     stdio: "ignore",
   });
@@ -120,6 +122,60 @@ export async function startServer(port: number): Promise<ChildProcess> {
     await sleep(20);
   }
   throw new Error("server did not start");
+}
+
+export function localSocket(port: number): string {
+  return join(workdir, `l${port}.sock`);
+}
+
+export function unixLink(path: string): Link {
+  return {
+    connect: (handlers) =>
+      new Promise((resolve, reject) => {
+        const socket = createConnection(path);
+        let buffered = Buffer.alloc(0);
+        let connected = false;
+        socket.on("connect", () => {
+          connected = true;
+          resolve({
+            send(frame) {
+              if (socket.writableNeedDrain || socket.destroyed) {
+                return false;
+              }
+              const body = Buffer.from(frame, "utf8");
+              const header = Buffer.alloc(4);
+              header.writeUInt32BE(body.length);
+              socket.write(Buffer.concat([header, body]));
+              return true;
+            },
+            close() {
+              socket.destroy();
+            },
+          });
+        });
+        socket.on("data", (chunk) => {
+          buffered = Buffer.concat([buffered, chunk]);
+          while (buffered.length >= 4) {
+            const size = buffered.readUInt32BE(0);
+            if (buffered.length < 4 + size) {
+              break;
+            }
+            handlers.frame(buffered.subarray(4, 4 + size).toString("utf8"));
+            buffered = buffered.subarray(4 + size);
+          }
+        });
+        socket.on("error", (error) => {
+          if (!connected) {
+            reject(error);
+          }
+        });
+        socket.on("close", () => {
+          if (connected) {
+            handlers.closed();
+          }
+        });
+      }),
+  };
 }
 
 export async function stopServer(server: ChildProcess): Promise<void> {
@@ -381,6 +437,7 @@ export async function secureDevice(
     inbox?: boolean;
     link?: string;
     now?: () => number;
+    transport?: TransportKind;
   } = {},
 ) {
   const store = options.store ?? memoryStore();
@@ -402,8 +459,10 @@ export async function secureDevice(
     Outbox.open(store, storage),
   ]);
   assert.ok(devices);
-  const transport = track(
-    new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
+  const transport: Transport = track(
+    options.transport === "local"
+      ? new LocalTransport(unixLink(localSocket(port)))
+      : new WebSocketTransport(`ws://127.0.0.1:${port}/ws`, { minDelay: 50 }),
   );
   const sent: string[] = [];
   const received: string[] = [];
@@ -547,7 +606,11 @@ export type SecureDevice = Awaited<ReturnType<typeof secureDevice>>;
 export async function linkedDevice(
   port: number,
   root: SecureDevice,
-  options: { store?: MemoryStore; inbox?: boolean } = {},
+  options: {
+    store?: MemoryStore;
+    inbox?: boolean;
+    transport?: TransportKind;
+  } = {},
 ): Promise<SecureDevice> {
   const device = await secureDevice(port, {
     ...options,

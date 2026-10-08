@@ -3,8 +3,11 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -18,6 +21,7 @@ import (
 	"github.com/Xhaann/ghost-x/server/protocol"
 	"github.com/Xhaann/ghost-x/server/queue"
 	"github.com/Xhaann/ghost-x/server/socket"
+	"github.com/Xhaann/ghost-x/server/stream"
 )
 
 const (
@@ -30,6 +34,7 @@ const (
 type Server struct {
 	cfg      config.Config
 	hub      *socket.Hub
+	stream   *stream.Server
 	sessions *auth.Registry
 	presence *presence.Registry
 	devices  *device.Registry
@@ -51,8 +56,25 @@ func (o observers) Closed(s *auth.Session, id identity.Identity) {
 	}
 }
 
+type carrier interface {
+	Send(data []byte) error
+	Close(reason string)
+}
+
+type socketCarrier struct {
+	client *socket.Client
+}
+
+func (c socketCarrier) Send(data []byte) error {
+	return c.client.Send(data)
+}
+
+func (c socketCarrier) Close(reason string) {
+	c.client.Close(websocket.ClosePolicyViolation, reason)
+}
+
 type endpoint struct {
-	client  *socket.Client
+	client  carrier
 	conn    *protocol.Conn
 	session *auth.Session
 	devices *device.Registry
@@ -110,13 +132,12 @@ func New(cfg config.Config) (*Server, error) {
 		"accept":   protocol.Accept(prekeys),
 	})
 
-	opts := socket.DefaultOptions()
-	opts.Accept = func(c *socket.Client) socket.Receiver {
+	accept := func(c carrier) *endpoint {
 		session := sessions.Open()
 		push := func(data []byte) { _ = c.Send(data) }
 		devices.Attach(session, func() {
 			session.Close()
-			c.Close(websocket.ClosePolicyViolation, "device revoked")
+			c.Close("device revoked")
 		})
 		queued.Attach(session, func(p queue.Push) bool {
 			return c.Send(protocol.EncodePush(p)) == nil
@@ -126,7 +147,15 @@ func New(cfg config.Config) (*Server, error) {
 		})
 		return &endpoint{client: c, conn: router.Conn(session, push), session: session, devices: devices, prekeys: prekeys, queue: queued}
 	}
+	opts := socket.DefaultOptions()
+	opts.Accept = func(c *socket.Client) socket.Receiver {
+		return accept(socketCarrier{client: c})
+	}
 	hub := socket.NewHub(opts)
+	local := stream.DefaultOptions()
+	local.Accept = func(c *stream.Conn) stream.Receiver {
+		return accept(c)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
@@ -135,6 +164,7 @@ func New(cfg config.Config) (*Server, error) {
 	return &Server{
 		cfg:      cfg,
 		hub:      hub,
+		stream:   stream.NewServer(local),
 		sessions: sessions,
 		presence: present,
 		devices:  devices,
@@ -154,7 +184,36 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if s.cfg.LocalSocket != "" {
+		local, err := listenLocal(s.cfg.LocalSocket)
+		if err != nil {
+			ln.Close()
+			return err
+		}
+		defer os.Remove(s.cfg.LocalSocket)
+		go s.stream.Serve(local)
+	}
 	return s.Serve(ctx, ln)
+}
+
+func listenLocal(path string) (net.Listener, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode().Type() != fs.ModeSocket {
+			return nil, fmt.Errorf("local socket %q exists and is not a socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
 }
 
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
@@ -177,11 +236,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 	httpErr := s.http.Shutdown(shutdownCtx)
 	hubErr := s.hub.Shutdown(shutdownCtx)
+	streamErr := s.stream.Shutdown(shutdownCtx)
 
 	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
-	return errors.Join(httpErr, hubErr)
+	return errors.Join(httpErr, hubErr, streamErr)
 }
 
 func health(w http.ResponseWriter, _ *http.Request) {

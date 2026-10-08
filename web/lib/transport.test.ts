@@ -1,22 +1,31 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createId } from "./protocol.ts";
+import { LocalTransport } from "./local.ts";
 import { WebSocketTransport } from "./socket.ts";
 import {
   freePort,
+  localSocket,
   pingFrame,
   record,
   sleep,
   startServer,
   stopServer,
   track,
+  unixLink,
   useServer,
   waitFor,
   waitForCount,
 } from "./testing.ts";
-import type { Transport, TransportError } from "./transport.ts";
+import {
+  type Transport,
+  type TransportError,
+  maxFrameSize,
+} from "./transport.ts";
 
 useServer();
+
+const serverFrameLimit = 32 * 1024;
 
 type Factory = (port: number) => Transport;
 
@@ -26,7 +35,7 @@ function transportContract(name: string, create: Factory): void {
   test(`${name}: starts disconnected`, async () => {
     const transport = build(await freePort());
     assert.equal(transport.state, "disconnected");
-    assert.equal(transport.send(pingFrame(createId(), 1)), false);
+    assert.equal(transport.send(pingFrame(createId(), 1)), "not_connected");
   });
 
   test(`${name}: connects and closes`, async () => {
@@ -67,7 +76,7 @@ function transportContract(name: string, create: Factory): void {
     transport.open();
     await waitFor(transport, "connected");
     const id = createId();
-    assert.equal(transport.send(pingFrame(id, 1)), true);
+    assert.equal(transport.send(pingFrame(id, 1)), "sent");
     await waitForCount(received, 1);
 
     const reply = JSON.parse(received[0]);
@@ -113,10 +122,10 @@ function transportContract(name: string, create: Factory): void {
     await sleep(200);
 
     assert.equal(received.length, 0);
-    assert.equal(transport.send(pingFrame(createId(), 1)), false);
+    assert.equal(transport.send(pingFrame(createId(), 1)), "not_connected");
   });
 
-  test(`${name}: reports an unavailable peer`, async () => {
+  test(`${name}: reports a failed connection`, async () => {
     const transport = build(await freePort());
     const errors: TransportError[] = [];
     transport.onError((error) => errors.push(error));
@@ -124,7 +133,7 @@ function transportContract(name: string, create: Factory): void {
     transport.open();
     await waitForCount(errors, 1);
 
-    assert.equal(errors[0], "unavailable");
+    assert.equal(errors[0], "failed");
     assert.notEqual(transport.state, "connected");
   });
 
@@ -142,6 +151,25 @@ function transportContract(name: string, create: Factory): void {
 
     assert.equal(errors[0], "lost");
     assert.notEqual(transport.state, "connected");
+  });
+
+  test(`${name}: refuses oversized frames and stays connected`, async () => {
+    const port = await freePort();
+    await startServer(port);
+    const transport = build(port);
+    const received: string[] = [];
+    transport.onData((data) => received.push(data));
+
+    transport.open();
+    await waitFor(transport, "connected");
+    assert.equal(transport.send("x".repeat(serverFrameLimit + 1)), "oversized");
+    assert.equal(transport.send("x".repeat(maxFrameSize + 1)), "oversized");
+    assert.equal(transport.send(""), "oversized");
+    const id = createId();
+    assert.equal(transport.send(pingFrame(id, 1)), "sent");
+    await waitForCount(received, 1);
+    assert.equal(transport.state, "connected");
+    assert.equal(JSON.parse(received[0]).id, id);
   });
 
   test(`${name}: reopens after close`, async () => {
@@ -167,4 +195,9 @@ function transportContract(name: string, create: Factory): void {
 transportContract(
   "websocket",
   (port) => new WebSocketTransport(`ws://127.0.0.1:${port}/ws`),
+);
+
+transportContract(
+  "local",
+  (port) => new LocalTransport(unixLink(localSocket(port))),
 );

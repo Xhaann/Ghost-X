@@ -17,6 +17,7 @@ WebSocket endpoint: `/ws`
 | `SHUTDOWN_TIMEOUT` | `10s` |
 | `ALLOWED_ORIGINS` | same host only |
 | `DEVICE_STORE` | `ghostx/devices.json` in the user config directory |
+| `LOCAL_SOCKET` | unset; an absolute path enables the local stream carrier on a Unix socket |
 
 ## Web
 

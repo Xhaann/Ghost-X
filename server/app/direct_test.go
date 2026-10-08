@@ -22,6 +22,7 @@ import (
 
 type peer struct {
 	conn     *websocket.Conn
+	frame    func([]byte) error
 	key      key
 	messages chan message
 }
@@ -99,7 +100,11 @@ func joinPeer(t *testing.T, url string, k key) *peer {
 
 func (p *peer) write(t *testing.T, frame string) {
 	t.Helper()
-	if err := p.conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+	send := p.frame
+	if send == nil {
+		send = func(data []byte) error { return p.conn.WriteMessage(websocket.TextMessage, data) }
+	}
+	if err := send([]byte(frame)); err != nil {
 		t.Fatal(err)
 	}
 }

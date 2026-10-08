@@ -6,7 +6,12 @@ import {
   encode,
   parse,
 } from "./protocol.ts";
-import type { Transport, TransportError, TransportState } from "./transport.ts";
+import type {
+  Transport,
+  TransportError,
+  TransportKind,
+  TransportState,
+} from "./transport.ts";
 
 export class Client {
   readonly #states = new Listeners<TransportState>();
@@ -23,6 +28,10 @@ export class Client {
 
   get state(): TransportState {
     return this.#transport.state;
+  }
+
+  get kind(): TransportKind {
+    return this.#transport.kind;
   }
 
   select(transport: Transport): void {
@@ -54,7 +63,7 @@ export class Client {
   }
 
   send(message: ClientMessage, id: string = createId()): string | null {
-    return this.#transport.send(encode(message, id)) ? id : null;
+    return this.#transport.send(encode(message, id)) === "sent" ? id : null;
   }
 
   request(

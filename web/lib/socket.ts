@@ -1,5 +1,12 @@
 import { Listeners } from "./listeners.ts";
-import type { Transport, TransportError, TransportState } from "./transport.ts";
+import {
+  type SendResult,
+  type Transport,
+  type TransportError,
+  type TransportState,
+  isFrameSize,
+  maxBufferedBytes,
+} from "./transport.ts";
 
 export type WebSocketOptions = {
   minDelay?: number;
@@ -7,6 +14,7 @@ export type WebSocketOptions = {
 };
 
 export class WebSocketTransport implements Transport {
+  readonly kind = "websocket";
   readonly #url: string;
   readonly #minDelay: number;
   readonly #maxDelay: number;
@@ -41,13 +49,23 @@ export class WebSocketTransport implements Transport {
     return this.#errors.add(listener);
   }
 
-  send(data: string): boolean {
+  send(frame: string): SendResult {
     const socket = this.#socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return false;
+      return "not_connected";
     }
-    socket.send(data);
-    return true;
+    if (!isFrameSize(frame)) {
+      return "oversized";
+    }
+    if (socket.bufferedAmount > maxBufferedBytes) {
+      return "busy";
+    }
+    try {
+      socket.send(frame);
+      return "sent";
+    } catch {
+      return "failed";
+    }
   }
 
   open(): void {
@@ -79,7 +97,11 @@ export class WebSocketTransport implements Transport {
     try {
       socket = new WebSocket(this.#url);
     } catch {
-      this.close();
+      this.#active = false;
+      this.#attempt = 0;
+      this.#cancelRetry();
+      this.#release();
+      this.#setState("error");
       this.#errors.emit("unavailable");
       return;
     }
@@ -92,13 +114,17 @@ export class WebSocketTransport implements Transport {
       this.#setState("connected");
     };
     socket.onmessage = (event: MessageEvent) => {
-      if (typeof event.data === "string") {
+      if (typeof event.data !== "string" || event.data === "") {
+        this.#errors.emit("malformed");
+      } else if (!isFrameSize(event.data)) {
+        this.#errors.emit("oversized");
+      } else {
         this.#data.emit(event.data);
       }
     };
     socket.onclose = () => {
       this.#socket = null;
-      this.#errors.emit(opened ? "lost" : "unavailable");
+      this.#errors.emit(opened ? "lost" : "failed");
       this.#scheduleRetry();
     };
     this.#setState(this.#attempt === 0 ? "connecting" : "reconnecting");

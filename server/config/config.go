@@ -20,6 +20,7 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	AllowedOrigins  []string
 	DeviceStore     string
+	LocalSocket     string
 }
 
 func Load() (Config, error) {
@@ -57,6 +58,13 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("resolve device store: %w", err)
 		}
 		cfg.DeviceStore = filepath.Join(dir, "ghostx", "devices.json")
+	}
+
+	if v, ok := os.LookupEnv("LOCAL_SOCKET"); ok && v != "" {
+		if !filepath.IsAbs(v) {
+			return Config{}, fmt.Errorf("invalid LOCAL_SOCKET %q: must be an absolute path", v)
+		}
+		cfg.LocalSocket = v
 	}
 
 	if v, ok := os.LookupEnv("ALLOWED_ORIGINS"); ok && v != "" {

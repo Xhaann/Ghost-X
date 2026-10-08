@@ -112,3 +112,19 @@ func TestLoadDeviceStore(t *testing.T) {
 		t.Fatal("relative device store accepted")
 	}
 }
+
+func TestLoadLocalSocket(t *testing.T) {
+	t.Setenv("LOCAL_SOCKET", "")
+	if cfg, err := Load(); err != nil || cfg.LocalSocket != "" {
+		t.Fatalf("LocalSocket = %q, %v", cfg.LocalSocket, err)
+	}
+	path := filepath.Join(t.TempDir(), "ghostx.sock")
+	t.Setenv("LOCAL_SOCKET", path)
+	if cfg, err := Load(); err != nil || cfg.LocalSocket != path {
+		t.Fatalf("LocalSocket = %q, %v", cfg.LocalSocket, err)
+	}
+	t.Setenv("LOCAL_SOCKET", "relative.sock")
+	if _, err := Load(); err == nil {
+		t.Fatal("relative local socket accepted")
+	}
+}

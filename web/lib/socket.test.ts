@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { createServer } from "node:net";
 import { test } from "node:test";
 import { WebSocketTransport, type WebSocketOptions } from "./socket.ts";
 import {
@@ -13,7 +16,11 @@ import {
   useServer,
   waitFor,
 } from "./testing.ts";
-import type { TransportError } from "./transport.ts";
+import {
+  type TransportError,
+  maxBufferedBytes,
+  maxFrameSize,
+} from "./transport.ts";
 
 useServer();
 
@@ -108,8 +115,8 @@ test("rejects an invalid url without throwing", () => {
 
   socket.open();
 
-  assert.equal(socket.state, "disconnected");
-  assert.deepEqual(states, []);
+  assert.equal(socket.state, "error");
+  assert.deepEqual(states, ["error"]);
   assert.deepEqual(errors, ["unavailable"]);
   assert.equal(created.length, 0);
 });
@@ -306,7 +313,7 @@ test("reopens after an intentional close", async () => {
   assert.equal(openSockets().length, 1);
 });
 
-test("reports each failed attempt as unavailable", async () => {
+test("reports each failed attempt as a failed connection", async () => {
   const port = await freePort();
   const socket = transport(port, { minDelay: 40, maxDelay: 40 });
   const errors: TransportError[] = [];
@@ -316,7 +323,7 @@ test("reports each failed attempt as unavailable", async () => {
   await sleep(300);
 
   assert.ok(errors.length >= 2, `errors = ${errors.length}`);
-  assert.ok(errors.every((error) => error === "unavailable"));
+  assert.ok(errors.every((error) => error === "failed"));
 });
 
 test("reports no error on intentional close", async () => {
@@ -332,4 +339,103 @@ test("reports no error on intentional close", async () => {
   await sleep(100);
 
   assert.deepEqual(errors, []);
+});
+
+async function rawPeer(options: { send?: string; read: boolean }) {
+  const server = createServer((socket) => {
+    let handshake = "";
+    const onData = (chunk: Buffer) => {
+      handshake += chunk.toString("latin1");
+      if (!handshake.includes("\r\n\r\n")) {
+        return;
+      }
+      socket.off("data", onData);
+      if (!options.read) {
+        socket.pause();
+      }
+      const key = /Sec-WebSocket-Key: (.+)\r\n/i.exec(handshake)?.[1] ?? "";
+      const accept = createHash("sha1")
+        .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+        .digest("base64");
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+          `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      );
+      if (options.send !== undefined) {
+        const body = Buffer.from(options.send, "utf8");
+        const header =
+          body.length < 126
+            ? Buffer.from([0x81, body.length])
+            : body.length < 65536
+              ? Buffer.from([0x81, 126, body.length >> 8, body.length & 0xff])
+              : Buffer.concat([
+                  Buffer.from([0x81, 127, 0, 0, 0, 0]),
+                  Buffer.from([
+                    (body.length >>> 24) & 0xff,
+                    (body.length >>> 16) & 0xff,
+                    (body.length >>> 8) & 0xff,
+                    body.length & 0xff,
+                  ]),
+                ]);
+        socket.write(Buffer.concat([header, body]));
+      }
+    };
+    socket.on("data", onData);
+    socket.on("error", () => {});
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  track({ close: () => server.close() });
+  return (server.address() as { port: number }).port;
+}
+
+test("drops and reports inbound frames above the frame limit", async () => {
+  const port = await rawPeer({
+    send: "x".repeat(maxFrameSize + 1),
+    read: true,
+  });
+  const socket = transport(port);
+  const errors: TransportError[] = [];
+  const received: string[] = [];
+  socket.onError((e) => errors.push(e));
+  socket.onData((d) => received.push(d));
+  socket.open();
+  await waitFor(socket, "connected");
+  const deadline = Date.now() + 3000;
+  while (errors.length === 0 && Date.now() < deadline) {
+    await sleep(10);
+  }
+  assert.deepEqual(errors, ["oversized"]);
+  assert.deepEqual(received, []);
+});
+
+test("delivers inbound frames up to the frame limit", async () => {
+  const frame = "y".repeat(maxFrameSize);
+  const port = await rawPeer({ send: frame, read: true });
+  const socket = transport(port);
+  const received: string[] = [];
+  socket.onData((d) => received.push(d));
+  socket.open();
+  await waitFor(socket, "connected");
+  const deadline = Date.now() + 3000;
+  while (received.length === 0 && Date.now() < deadline) {
+    await sleep(10);
+  }
+  assert.deepEqual(received, [frame]);
+});
+
+test("reports backpressure instead of buffering without bound", async () => {
+  const port = await rawPeer({ read: false });
+  const socket = transport(port);
+  socket.open();
+  await waitFor(socket, "connected");
+  const frame = "z".repeat(maxFrameSize);
+  let result = "sent";
+  let sent = 0;
+  while (result === "sent" && sent < 20000) {
+    result = socket.send(frame);
+    sent += 1;
+  }
+  assert.equal(result, "busy");
+  assert.ok(sent * maxFrameSize < 64 * maxBufferedBytes, `sent ${sent} frames`);
 });
