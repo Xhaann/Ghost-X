@@ -5,6 +5,7 @@ import { signRoster } from "./device.ts";
 import type { Link, LinkConnection } from "./local.ts";
 import { pairAddress } from "./pairs.ts";
 import {
+  type PeerAuthorization,
   type PeerHello,
   maxPeerPending,
   maxPeerSetup,
@@ -16,8 +17,10 @@ import { createMessageId, minMessageSize } from "./protocol.ts";
 import { generateRatchetKey } from "./ratchet.ts";
 import type { SendOutcome } from "./relay.ts";
 import {
+  type MemoryStore,
   type PeerCarrier,
   type PeerDevice,
+  memoryStore,
   peerCarrier,
   peerDevice,
   sleep,
@@ -1002,6 +1005,205 @@ test("established sessions with devices the link does not reach are never used",
   assert.deepEqual(
     a.outbox.paths().map((p) => p.id),
     [parked],
+  );
+});
+
+function authorization(d: PeerDevice): PeerAuthorization | null {
+  return d.endpoint.authorization;
+}
+
+function snapshot(store: MemoryStore): MemoryStore {
+  const copy = memoryStore();
+  for (const [key, value] of store.data) {
+    copy.data.set(key, value);
+  }
+  return copy;
+}
+
+test("the authorization basis is explicit and never claims more than this device confirmed", async () => {
+  const carrier = await peerCarrier();
+  const a = await peerDevice(carrier.listen);
+  const b = await peerDevice(carrier.dial);
+  await until(authenticated(a, b), "first contact");
+  assert.deepEqual(authorization(a), {
+    roster: 1,
+    basis: "unconfirmed",
+    confirmed: null,
+  });
+  assert.ok((await a.messenger.send(b.id, "peer roster lookups")).ok);
+  assert.ok(await a.messenger.lookup(b.id));
+  assert.equal(
+    a.trust.confirmation(b.id),
+    null,
+    "a roster presented over the direct link is never confirmed",
+  );
+  assert.equal(authorization(a)?.basis, "unconfirmed");
+  b.endpoint.close();
+  await until(() => a.endpoint.state === "unauthenticated", "closed");
+  assert.equal(authorization(a), null);
+
+  const before = Date.now();
+  assert.ok(await a.trust.observe(b.devices.roster, true));
+  const again = await peerDevice(carrier.dial, { store: b.store });
+  a.endpoint.open();
+  await until(authenticated(a, again), "after an authoritative sync");
+  const confirmed = authorization(a);
+  assert.equal(confirmed?.basis, "confirmed");
+  assert.equal(confirmed?.confirmed?.version, 1);
+  assert.ok((confirmed?.confirmed?.at ?? 0) >= before);
+
+  const extra = await peerDevice(null, { root: b.id, open: false });
+  const v2 = await signRoster(b.keys.root!, 2, [
+    b.devices.own,
+    extra.devices.own,
+  ]);
+  assert.ok(v2 && (await again.devices.adopt(v2)));
+  again.endpoint.close();
+  await until(() => a.endpoint.state === "unauthenticated", "closed again");
+  const newer = await peerDevice(carrier.dial, { store: b.store });
+  a.endpoint.open();
+  await until(authenticated(a, newer), "newer self-presented roster");
+  assert.deepEqual(authorization(a), {
+    roster: 2,
+    basis: "unconfirmed",
+    confirmed: { version: 1, at: confirmed!.confirmed!.at },
+  });
+});
+
+test("rollback and equivocation stay rejected after restarting from persisted trust", async () => {
+  const carrier = await peerCarrier();
+  const a = await peerDevice(carrier.listen);
+  const b = await peerDevice(carrier.dial, { open: false });
+  const v1Store = snapshot(b.store);
+  const extra = await peerDevice(null, { root: b.id, open: false });
+  const v2 = await signRoster(b.keys.root!, 2, [
+    b.devices.own,
+    extra.devices.own,
+  ]);
+  assert.ok(v2 && (await b.devices.adopt(v2)));
+  b.endpoint.open();
+  await until(authenticated(a, b), "pinned at version 2");
+  b.endpoint.close();
+  await a.shutdown();
+
+  const restarted = await peerDevice(carrier.listen, { store: a.store });
+  assert.equal(restarted.trust.pinned(b.id), 2);
+  const rolledBack = await peerDevice(carrier.dial, { store: v1Store });
+  await until(() => restarted.endpoint.state === "failed", "rollback");
+  assert.equal(restarted.endpoint.failure, "stale");
+  assert.notEqual(rolledBack.endpoint.state, "authenticated");
+  await rolledBack.shutdown();
+
+  const twinStore = snapshot(v1Store);
+  const other = await peerDevice(null, { root: b.id, open: false });
+  const twin = await signRoster(b.keys.root!, 2, [
+    b.devices.own,
+    other.devices.own,
+  ]);
+  assert.ok(twin && twin.signature !== v2.signature);
+  const equivocating = await peerDevice(carrier.dial, {
+    store: twinStore,
+    open: false,
+  });
+  assert.ok(await equivocating.devices.adopt(twin));
+  restarted.endpoint.open();
+  equivocating.endpoint.open();
+  await until(() => restarted.endpoint.state === "failed", "equivocation");
+  assert.equal(restarted.endpoint.failure, "stale");
+  assert.equal(restarted.endpoint.peer, null);
+});
+
+test("the frame counter boundary fails closed without ever reusing a nonce", async () => {
+  const limit = 6;
+  const { a, b, carrier } = await linked({ frames: limit });
+  for (let i = 0; i < 4 && authenticated(a, b)(); i++) {
+    await a.messenger.send(b.id, `bounded ${i}`);
+  }
+  await until(
+    () => a.endpoint.state === "failed" || b.endpoint.state === "failed",
+    "limit reached",
+  );
+  const failures = [a.endpoint.failure, b.endpoint.failure];
+  assert.ok(failures.includes("limit"), JSON.stringify(failures));
+  const { out, in: inbound } = decoded(carrier);
+  for (const direction of [out, inbound]) {
+    assert.ok(
+      direction.filter((f) => f.type === "sealed").length <= limit,
+      "no frame beyond the counter limit is ever sent",
+    );
+  }
+});
+
+test("a receiver enforces its own frame limit against a peer that ignores it", async () => {
+  const carrier = await peerCarrier();
+  const b = await peerDevice(carrier.listen, { frames: 4 });
+  const a = await peerDevice(carrier.dial, { frames: 1000 });
+  await until(authenticated(a, b), "authenticated");
+  const sentByB = () =>
+    decoded(carrier).in.filter((f) => f.type === "sealed").length;
+  for (let i = 0; i < 5; i++) {
+    a.endpoint.acknowledge({
+      id: createMessageId(),
+      from: b.id,
+      device: b.deviceId,
+      ciphertext: "",
+    });
+  }
+  await until(() => b.endpoint.state === "failed", "receiver limit");
+  assert.equal(b.endpoint.failure, "limit");
+  assert.equal(
+    sentByB(),
+    0,
+    "the receiver limit fired, not its own sender limit",
+  );
+});
+
+test("frames recorded in one session never validate in a later session", async () => {
+  const recorded: string[] = [];
+  let connection = 0;
+  const carrier = await peerCarrier();
+  const b = await peerDevice(carrier.listen);
+  const a = await peerDevice({
+    connect: async (handlers) => {
+      connection += 1;
+      const current = connection;
+      const inner = await carrier.dial.connect(handlers);
+      let index = 0;
+      return {
+        send: (frame) => {
+          const i = index++;
+          if (current === 1 && i >= 2) {
+            recorded.push(frame);
+          }
+          if (current === 2 && i === 2) {
+            return inner.send(recorded[0]);
+          }
+          return inner.send(frame);
+        },
+        close: () => inner.close(),
+      };
+    },
+  });
+  await until(authenticated(a, b), "first session");
+  await a.messenger.send(b.id, "first session message");
+  await until(() => bodies(b).includes("first session message"), "delivered");
+  assert.ok(recorded.length > 0);
+  carrier.drop();
+  await until(
+    () =>
+      a.endpoint.state === "unauthenticated" &&
+      b.endpoint.state === "unauthenticated",
+    "down",
+  );
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(() => b.endpoint.state === "authenticated", "second session");
+  void a.messenger.send(b.id, "second session message");
+  await until(() => b.endpoint.state === "failed", "old frame rejected");
+  assert.equal(b.endpoint.failure, "integrity");
+  assert.equal(
+    bodies(b).filter((m) => m === "first session message").length,
+    1,
   );
 });
 

@@ -736,6 +736,7 @@ export async function peerDevice(
     now?: () => number;
     timeout?: number;
     requestTimeout?: number;
+    frames?: number;
     open?: boolean;
   } = {},
 ) {
@@ -750,6 +751,7 @@ export async function peerDevice(
     prekeys,
     timeout: options.timeout,
     requestTimeout: options.requestTimeout,
+    frames: options.frames,
   });
   const rosters = new Rosters(endpoint, trust);
   const pairing = new Pairing(endpoint, keys, rosters, prekeys, pairs);

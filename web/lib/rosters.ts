@@ -53,7 +53,10 @@ export class Rosters {
     if (!roster || roster.identity !== identity) {
       return this.cached(identity);
     }
-    const observed = await this.#trust.observe(roster);
+    const observed = await this.#trust.observe(
+      roster,
+      this.#relay.authoritative,
+    );
     if (!observed) {
       return this.cached(identity);
     }

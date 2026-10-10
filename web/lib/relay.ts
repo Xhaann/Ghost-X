@@ -32,6 +32,7 @@ export type InitiateOutcome = "initiated" | "unavailable" | "failed";
 export type SendOutcome = "queued" | ErrorCode | null;
 
 export interface Relay {
+  readonly authoritative: boolean;
   reaches(peer: string, device: string): boolean;
   roster(identity: string): Promise<WireRoster | null>;
   publish(publication: Publication): Promise<number | null>;
@@ -46,6 +47,7 @@ export interface Relay {
 }
 
 export class ServerRelay implements Relay {
+  readonly authoritative = true;
   readonly #client: Client;
 
   constructor(client: Client) {

@@ -10,10 +10,13 @@ import {
 import {
   PrekeyStore,
   consumedLimit,
+  legacyPrekeysVersion,
   lowWater,
+  maxDirect,
   maxLocalOnetime,
   parsePrekeys,
   poolSize,
+  prekeysVersion,
   signedLifetime,
 } from "./prekeys.ts";
 import { memoryStore } from "./testing.ts";
@@ -237,7 +240,8 @@ test("corrupted prekey state fails closed without touching the identity", async 
       ...original,
       signed: { ...(original.signed as object), id: 9 },
     },
-    "future version": { ...original, v: 3 },
+    "future version": { ...original, v: prekeysVersion + 1 },
+    "missing direct pool": (({ direct: _, ...rest }) => rest)(original),
     "extra field": { ...original, extra: 1 },
     "duplicate onetime": {
       ...original,
@@ -291,7 +295,7 @@ test("a previous single-device prekey state is replaced by one bound to this dev
   const fresh = await PrekeyStore.open(b.store, b.keys, b.integrity);
   assert.ok(fresh);
   assert.equal(fresh.device, b.keys.deviceId);
-  assert.equal(record(b.store).v, 2);
+  assert.equal(record(b.store).v, prekeysVersion);
   const publication = await fresh.publication();
   assert.ok(publication);
   assert.ok(
@@ -318,5 +322,224 @@ test("a previous single-device prekey state is replaced by one bound to this dev
       publication.signed,
     ),
     null,
+  );
+});
+
+async function legacyRecord(b: Awaited<ReturnType<typeof owner>>) {
+  const { direct: _, mac: __, ...rest } = record(b.store);
+  const state: Record<string, unknown> = { ...rest, v: legacyPrekeysVersion };
+  const slot = (value: unknown) =>
+    value === null
+      ? null
+      : [(value as { id: number }).id, (value as { key: string }).key];
+  const values = new TextEncoder().encode(
+    JSON.stringify([
+      state.v,
+      state.device,
+      state.nextSigned,
+      state.nextOnetime,
+      state.uses,
+      slot(state.signed),
+      slot(state.previous),
+      (state.onetime as unknown[]).map(slot),
+      state.consumed,
+    ]),
+  );
+  const context = new TextEncoder().encode("ghostx/prekeys/v2\0");
+  const input = new Uint8Array(context.length + values.length);
+  input.set(context);
+  input.set(values, context.length);
+  const mac = await crypto.subtle.sign("HMAC", b.integrity, input);
+  return { ...state, mac: encodeBase64Url(new Uint8Array(mac)) };
+}
+
+test("a version 2 prekey record migrates in place and keeps every key", async () => {
+  const b = await owner();
+  const before = record(b.store);
+  b.store.data.set("vault:prekeys", await legacyRecord(b));
+  const reopened = await PrekeyStore.open(b.store, b.keys, b.integrity);
+  assert.ok(reopened);
+  const after = record(b.store);
+  assert.equal(after.v, prekeysVersion);
+  assert.deepEqual(after.direct, []);
+  assert.deepEqual(after.signed, before.signed);
+  assert.deepEqual(after.onetime, before.onetime);
+  assert.equal(after.nextOnetime, before.nextOnetime);
+
+  const tampered = await legacyRecord(b);
+  b.store.data.set("vault:prekeys", { ...tampered, uses: 7 });
+  assert.equal(await PrekeyStore.open(b.store, b.keys, b.integrity), null);
+});
+
+test("direct prekeys are never published, are single use, and ids are never reused", async () => {
+  const b = await owner();
+  const published = await b.prekeys.publication();
+  assert.ok(published);
+  const publishedIds = published.onetime.map((p) => p.id);
+  const device: DeviceEntry = {
+    id: b.keys.deviceId,
+    signing: b.keys.device.identity,
+    exchange: b.keys.exchange.publicKey,
+  };
+  const bundle = await b.prekeys.reserve();
+  assert.ok(bundle?.onetime);
+  assert.equal(bundle.device, b.keys.deviceId);
+  assert.ok(!publishedIds.includes(bundle.onetime.id));
+  assert.ok(
+    await verifyPrekey("onetime", b.keys.identity, device, bundle.onetime),
+  );
+  assert.ok(
+    await verifyPrekey("signed", b.keys.identity, device, bundle.signed),
+  );
+  const again = await b.prekeys.publication();
+  assert.deepEqual(
+    again?.onetime.map((p) => p.id),
+    publishedIds,
+    "a reserved prekey never enters the published pool",
+  );
+
+  const signedKey = await verifyPrekey(
+    "signed",
+    b.keys.identity,
+    device,
+    bundle.signed,
+  );
+  const onetimeKey = await verifyPrekey(
+    "onetime",
+    b.keys.identity,
+    device,
+    bundle.onetime,
+  );
+  assert.ok(signedKey && onetimeKey);
+  const start = async () => {
+    const initiator = (await createVault(memoryStore())) as Unlocked;
+    const started = await initiate(initiator.keys, {
+      identity: b.keys.identity,
+      device,
+      signed: { id: bundle.signed.id, key: signedKey },
+      onetime: { id: bundle.onetime!.id, key: onetimeKey },
+    });
+    assert.ok(started);
+    return (keys: ResponderKeys) =>
+      respond(b.keys, keys, {
+        from: initiator.keys.identity,
+        fromDevice: {
+          id: initiator.keys.deviceId,
+          signing: initiator.keys.device.identity,
+          exchange: initiator.keys.exchange.publicKey,
+        },
+        ...started.initiation,
+      });
+  };
+  const other = await PrekeyStore.open(b.store, b.keys, b.integrity);
+  assert.ok(other);
+  const [first, second] = [await start(), await start()];
+  const outcomes = await Promise.all([
+    b.prekeys.consume(bundle.signed.id, bundle.onetime.id, first),
+    other.consume(bundle.signed.id, bundle.onetime.id, second),
+  ]);
+  assert.deepEqual(
+    outcomes.map((o) => o.status).sort(),
+    ["consumed", "rejected"],
+    "concurrent consumption resolves to exactly one session",
+  );
+  const retry = await b.prekeys.consume(
+    bundle.signed.id,
+    bundle.onetime.id,
+    await start(),
+  );
+  assert.equal(retry.status, "rejected", "a consumed prekey never returns");
+  assert.deepEqual(record(b.store).direct, []);
+
+  const next = await b.prekeys.reserve();
+  assert.ok(next?.onetime && next.onetime.id > bundle.onetime.id);
+  const ids = [next.onetime.id];
+  for (let i = 0; i < maxDirect + 3; i++) {
+    const reserved = await b.prekeys.reserve();
+    assert.ok(reserved?.onetime);
+    ids.push(reserved.onetime.id);
+  }
+  const kept = (record(b.store).direct as { id: number }[]).map((d) => d.id);
+  assert.equal(kept.length, maxDirect, "the direct pool is bounded");
+  assert.deepEqual(
+    kept,
+    ids.slice(-maxDirect),
+    "the oldest reservations are evicted",
+  );
+  assert.equal(new Set(ids).size, ids.length);
+  assert.ok(ids.every((id) => !publishedIds.includes(id)));
+});
+
+test("fuzzed prekey records and consumption inputs never corrupt or bypass the store", async () => {
+  const b = await owner();
+  await b.prekeys.reserve();
+  const original = record(b.store);
+  const before = await b.prekeys.publication();
+  assert.ok(before);
+  const names = Object.keys(original);
+  const junk: unknown[] = [
+    null,
+    0,
+    -1,
+    1.5,
+    2 ** 40,
+    "",
+    "x",
+    [],
+    {},
+    true,
+    NaN,
+  ];
+  let seed = 0x9e3779b9;
+  const random = (n: number) => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    return (seed >>> 0) % n;
+  };
+  const rounds = Number(process.env.FUZZ_ITERATIONS ?? 300);
+  for (let i = 0; i < rounds; i++) {
+    const mutated: Record<string, unknown> = { ...original };
+    const name = names[random(names.length)];
+    switch (random(4)) {
+      case 0:
+        delete mutated[name];
+        break;
+      case 1:
+        mutated[name] = junk[random(junk.length)];
+        break;
+      case 2:
+        mutated[name] = original[names[random(names.length)]];
+        break;
+      default:
+        mutated[`k${random(3)}`] = junk[random(junk.length)];
+    }
+    b.store.data.set("vault:prekeys", mutated);
+    const opened = await PrekeyStore.open(b.store, b.keys, b.integrity);
+    if (opened) {
+      assert.deepEqual(
+        (await opened.publication())?.onetime.map((p) => p.id),
+        before.onetime.map((p) => p.id),
+      );
+    }
+  }
+  b.store.data.set("vault:prekeys", original);
+  const store = await PrekeyStore.open(b.store, b.keys, b.integrity);
+  assert.ok(store);
+  for (let i = 0; i < rounds; i++) {
+    const signed = junk[random(junk.length)] as number;
+    const onetime = junk[random(junk.length)] as number | null;
+    let used = false;
+    const outcome = await store.consume(signed, onetime, async () => {
+      used = true;
+      return null;
+    });
+    assert.notEqual(outcome.status, "consumed");
+    assert.equal(used, false, "invalid ids never reach key agreement");
+  }
+  assert.deepEqual(
+    record(b.store),
+    original,
+    "rejected input never changes state",
   );
 });

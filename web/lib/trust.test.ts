@@ -121,9 +121,12 @@ test("explicit verification binds to the exact roster fingerprint and persists",
   assert.deepEqual(trust.view(b.identity).verified, b.print);
   const record = stored(store, b.identity);
   assert.deepEqual(Object.keys(record ?? {}).sort(), [
+    "confirmed",
+    "confirmedAt",
     "fingerprint",
     "identity",
     "mac",
+    "signature",
     "status",
     "v",
     "version",
@@ -336,4 +339,104 @@ test("fuzzed trust records never restore as verified", async () => {
       assert.deepEqual(mutated, original);
     }
   }
+});
+
+async function previousRecord(
+  integrity: CryptoKey,
+  identity: string,
+  version: number,
+): Promise<Record<string, unknown>> {
+  const fields = [2, identity, "observed", version, null];
+  const context = new TextEncoder().encode("ghostx/trust/v2\0");
+  const body = new TextEncoder().encode(JSON.stringify(fields));
+  const input = new Uint8Array(context.length + body.length);
+  input.set(context);
+  input.set(body, context.length);
+  const mac = await crypto.subtle.sign("HMAC", integrity, input);
+  return {
+    v: 2,
+    identity,
+    status: "observed",
+    version,
+    fingerprint: null,
+    mac: encodeBase64Url(new Uint8Array(mac)),
+  };
+}
+
+test("version 2 trust records upgrade in place and keep their rollback pin", async () => {
+  const { store, integrity } = await local();
+  const b = await peer();
+  await b.next();
+  await b.next();
+  await store.put(
+    "trust",
+    b.identity,
+    await previousRecord(integrity, b.identity, 2),
+  );
+  const forged = await peer();
+  await store.put("trust", forged.identity, {
+    ...(await previousRecord(integrity, forged.identity, 5)),
+    version: 1,
+  });
+  const trust = await Trust.open(store, integrity);
+  assert.equal(trust.rejected, 1, "a tampered version 2 record is rejected");
+  assert.equal(trust.pinned(b.identity), 2);
+  const upgraded = stored(store, b.identity) as Record<string, unknown>;
+  assert.equal(upgraded.v, trustVersion);
+  assert.equal(upgraded.signature, null);
+  assert.equal(upgraded.confirmed, 0);
+  assert.equal(await trust.observe(b.roster), null, "rollback still rejected");
+});
+
+test("an equivocating roster at the pinned version is rejected after a restart", async () => {
+  const { store, integrity } = await local();
+  const b = await peer();
+  const first = b.roster;
+  const trust = await Trust.open(store, integrity);
+  assert.ok(await trust.observe(first));
+  await trust.close();
+  const other = await newDevice(b.identity);
+  const twin = await signRoster(
+    b.root,
+    first.version,
+    [...b.devices, other].sort((x, y) => (x.id < y.id ? -1 : 1)),
+  );
+  assert.ok(twin && twin.signature !== first.signature);
+  const reopened = await Trust.open(store, integrity);
+  assert.equal(await reopened.observe(twin), null);
+  assert.ok(await reopened.observe(first));
+});
+
+test("only an authoritative observation confirms a roster", async () => {
+  const { store, integrity } = await local();
+  const b = await peer();
+  const trust = await Trust.open(store, integrity);
+  assert.ok(await trust.observe(b.roster));
+  assert.equal(trust.confirmation(b.identity), null);
+  const before = Date.now();
+  assert.ok(await trust.observe(b.roster, true));
+  const confirmed = trust.confirmation(b.identity);
+  assert.ok(confirmed);
+  assert.equal(confirmed.version, b.roster.version);
+  assert.equal(confirmed.signature, b.roster.signature);
+  assert.ok(confirmed.at >= before && confirmed.at <= Date.now());
+
+  const { roster: newer } = await b.next([
+    ...b.devices,
+    await newDevice(b.identity),
+  ]);
+  assert.ok(await trust.observe(newer));
+  const after = trust.confirmation(b.identity);
+  assert.equal(
+    after?.version,
+    1,
+    "a self-presented newer roster is not confirmed",
+  );
+  assert.equal(after?.signature, null);
+
+  const reopened = await Trust.open(store, integrity);
+  assert.equal(reopened.rejected, 0);
+  assert.equal(reopened.confirmation(b.identity)?.version, 1);
+  assert.ok(await reopened.observe(newer, true));
+  assert.equal(reopened.confirmation(b.identity)?.version, newer.version);
 });

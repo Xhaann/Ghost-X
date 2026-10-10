@@ -48,6 +48,7 @@ import type {
   SendOutcome,
 } from "./relay.ts";
 import type { Transport, TransportKind } from "./transport.ts";
+import type { Confirmation } from "./trust.ts";
 import type { Keys } from "./vault.ts";
 
 export const peerVersion = 1;
@@ -87,6 +88,12 @@ export type PeerHello = {
 
 export type PeerIdentity = { identity: string; device: string };
 
+export type PeerAuthorization = {
+  roster: number;
+  basis: "confirmed" | "unconfirmed";
+  confirmed: { version: number; at: number } | null;
+};
+
 export type HandshakeFrame =
   | { type: "hello"; payload: PeerHello }
   | { type: "proof"; payload: { signature: string; confirm: string } }
@@ -117,11 +124,12 @@ export interface OwnDevices {
 export interface PeerTrust {
   observe(value: unknown): Promise<Roster | null>;
   roster(identity: string): Roster | null;
+  confirmation(identity: string): Confirmation | null;
   onChange(listener: (identity: string) => void): () => void;
 }
 
 export interface BundleSource {
-  publication(): Promise<Publication | null>;
+  reserve(): Promise<WireDeviceBundle | null>;
 }
 
 export type PeerOptions = {
@@ -131,6 +139,7 @@ export type PeerOptions = {
   prekeys: BundleSource;
   timeout?: number;
   requestTimeout?: number;
+  frames?: number;
 };
 
 const encoder = new TextEncoder();
@@ -561,6 +570,7 @@ type Handshake = {
 type Waiter = (outcome: SendOutcome) => void;
 
 export class PeerEndpoint implements Relay {
+  readonly authoritative = false;
   readonly #transport: Transport;
   readonly #keys: Keys;
   readonly #devices: OwnDevices;
@@ -576,7 +586,7 @@ export class PeerEndpoint implements Relay {
     { waiters: Waiter[]; timer: ReturnType<typeof setTimeout> }
   >();
   readonly #unacknowledged = new Set<string>();
-  readonly #dispensed = new Set<number>();
+  readonly #frames: number;
   #state: AuthState = "unauthenticated";
   #failure: PeerFailure | null = null;
   #generation = 0;
@@ -599,6 +609,7 @@ export class PeerEndpoint implements Relay {
     this.#prekeys = options.prekeys;
     this.#timeout = options.timeout ?? peerTimeout;
     this.#requestTimeout = options.requestTimeout ?? peerRequestTimeout;
+    this.#frames = Math.min(options.frames ?? maxCounter, maxCounter);
     const releases = [
       transport.onState((state) => {
         if (state === "connected") {
@@ -641,6 +652,25 @@ export class PeerEndpoint implements Relay {
     return this.#state === "authenticated" && this.#session
       ? this.#session.peer
       : null;
+  }
+
+  get authorization(): PeerAuthorization | null {
+    const session = this.#session;
+    if (this.#state !== "authenticated" || !session) {
+      return null;
+    }
+    const confirmation = this.#trust.confirmation(session.peer.identity);
+    const confirmed =
+      confirmation !== null &&
+      confirmation.version === session.roster.version &&
+      confirmation.signature === session.roster.signature;
+    return {
+      roster: session.roster.version,
+      basis: confirmed ? "confirmed" : "unconfirmed",
+      confirmed: confirmation
+        ? { version: confirmation.version, at: confirmation.at }
+        : null,
+    };
   }
 
   onState(listener: (state: AuthState) => void): () => void {
@@ -1055,8 +1085,12 @@ export class PeerEndpoint implements Relay {
     generation: number,
   ): Promise<void> {
     const sealed = sealedSize(data);
-    if (!sealed || session.received >= maxCounter) {
+    if (!sealed) {
       this.#fail("integrity");
+      return;
+    }
+    if (session.received >= this.#frames) {
+      this.#fail("limit");
       return;
     }
     const counter = session.received;
@@ -1103,32 +1137,15 @@ export class PeerEndpoint implements Relay {
         if (!this.#count()) {
           return;
         }
-        const publication = await this.#prekeys.publication().catch(() => null);
+        const bundle = await this.#prekeys.reserve().catch(() => null);
         if (generation !== this.#generation) {
           return;
         }
-        if (!publication || publication.device !== this.#keys.deviceId) {
-          await this.#transmit({ type: "refused", id: frame.id, payload: {} });
-          return;
-        }
-        const onetime =
-          [...publication.onetime]
-            .reverse()
-            .find((prekey) => !this.#dispensed.has(prekey.id)) ?? null;
-        if (onetime) {
-          this.#dispensed.add(onetime.id);
-        }
-        await this.#transmit({
-          type: "bundled",
-          id: frame.id,
-          payload: {
-            bundle: {
-              device: this.#keys.deviceId,
-              signed: publication.signed,
-              onetime,
-            },
-          },
-        });
+        await this.#transmit(
+          bundle && bundle.device === this.#keys.deviceId
+            ? { type: "bundled", id: frame.id, payload: { bundle } }
+            : { type: "refused", id: frame.id, payload: {} },
+        );
         return;
       }
       case "initiate":
@@ -1268,17 +1285,31 @@ export class PeerEndpoint implements Relay {
       return Promise.resolve(false);
     }
     const run = this.#outgoing.then(async () => {
-      if (generation !== this.#generation || session.sent >= maxCounter) {
+      if (generation !== this.#generation) {
+        return false;
+      }
+      if (session.sent >= this.#frames) {
+        this.#fail("limit");
         return false;
       }
       const counter = session.sent;
       session.sent += 1;
-      const sealed = await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: frameIv(counter), additionalData: frameContext },
-        session.keys.send,
-        encoder.encode(JSON.stringify(frame)),
-      );
+      const sealed = await crypto.subtle
+        .encrypt(
+          {
+            name: "AES-GCM",
+            iv: frameIv(counter),
+            additionalData: frameContext,
+          },
+          session.keys.send,
+          encoder.encode(JSON.stringify(frame)),
+        )
+        .catch(() => null);
       if (generation !== this.#generation) {
+        return false;
+      }
+      if (!sealed) {
+        this.#fail("protocol");
         return false;
       }
       return this.#write({
@@ -1324,7 +1355,6 @@ export class PeerEndpoint implements Relay {
     this.#session = null;
     this.#backlog = 0;
     this.#setup = 0;
-    this.#dispensed.clear();
     this.#unacknowledged.clear();
     for (const finish of [...this.#replies.values()]) {
       finish(null);

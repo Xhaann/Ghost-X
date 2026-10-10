@@ -7,10 +7,15 @@ import {
 } from "./fingerprint.ts";
 import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
-import { exchangeKeySize, isFixed, isRosterVersion } from "./protocol.ts";
+import {
+  exchangeKeySize,
+  isFixed,
+  isRosterVersion,
+  signatureSize,
+} from "./protocol.ts";
 import type { KeyValueStore } from "./storage.ts";
 
-export const trustVersion = 2;
+export const trustVersion = 3;
 
 export type TrustState = "unavailable" | "unverified" | "verified" | "changed";
 
@@ -29,23 +34,39 @@ type TrustFields = {
   status: Status;
   version: number;
   fingerprint: string | null;
+  signature: string | null;
+  confirmed: number;
+  confirmedAt: number;
 };
 
 export type TrustRecord = TrustFields & { mac: string };
 
 type Observation = { roster: Roster; fingerprint: Fingerprint };
 
+export type Confirmation = {
+  version: number;
+  signature: string | null;
+  at: number;
+};
+
 const macSize = 32;
 const encoder = new TextEncoder();
-const context = encoder.encode("ghostx/trust/v2\0");
+const context = encoder.encode("ghostx/trust/v3\0");
+const previousContext = encoder.encode("ghostx/trust/v2\0");
 const legacyContext = encoder.encode("ghostx/trust/v1\0");
-const recordFields = [
+const previousFields = [
   "v",
   "identity",
   "status",
   "version",
   "fingerprint",
   "mac",
+];
+const recordFields = [
+  ...previousFields,
+  "signature",
+  "confirmed",
+  "confirmedAt",
 ];
 const legacyFields = ["v", "identity", "status", "key", "fingerprint", "mac"];
 
@@ -67,7 +88,14 @@ function macInput(f: TrustFields): Uint8Array<ArrayBuffer> {
     f.status,
     f.version,
     f.fingerprint,
+    f.signature,
+    f.confirmed,
+    f.confirmedAt,
   ]);
+}
+
+function isStatus(value: unknown): value is Status {
+  return value === "observed" || value === "verified" || value === "changed";
 }
 
 function tag(value: unknown): string {
@@ -115,13 +143,20 @@ export function parseTrustRecord(
   if (
     !record ||
     record.v !== trustVersion ||
-    (record.status !== "observed" &&
-      record.status !== "verified" &&
-      record.status !== "changed") ||
+    !isStatus(record.status) ||
     !(record.version === 0 || isRosterVersion(record.version)) ||
     (record.status === "observed"
       ? record.fingerprint !== null
-      : !isFingerprintValue(record.fingerprint))
+      : !isFingerprintValue(record.fingerprint)) ||
+    (record.version === 0
+      ? record.signature !== null
+      : record.signature !== null &&
+        !isFixed(record.signature, signatureSize)) ||
+    !(record.confirmed === 0 || isRosterVersion(record.confirmed)) ||
+    (record.confirmed as number) > (record.version as number) ||
+    !Number.isSafeInteger(record.confirmedAt) ||
+    (record.confirmedAt as number) < 0 ||
+    (record.confirmed === 0) !== (record.confirmedAt === 0)
   ) {
     return null;
   }
@@ -134,6 +169,7 @@ export class Trust {
   readonly #entries = new Map<string, TrustRecord>();
   readonly #seen = new Map<string, string>();
   readonly #observed = new Map<string, Observation>();
+  readonly #checked = new Map<string, number>();
   readonly #changes = new Listeners<string>();
   #rejected = 0;
   #queue: Promise<unknown> = Promise.resolve();
@@ -153,6 +189,7 @@ export class Trust {
       trust.#seen.set(key, tag(value));
       const record =
         (await trust.#restore(key, value)) ??
+        (await trust.#upgrade(key, value)) ??
         (await trust.#migrate(key, value));
       if (record) {
         trust.#entries.set(key, record);
@@ -179,6 +216,18 @@ export class Trust {
     return this.#observed.get(identity)?.roster ?? null;
   }
 
+  confirmation(identity: string): Confirmation | null {
+    const entry = this.#entries.get(identity);
+    if (!entry || entry.confirmed === 0) {
+      return null;
+    }
+    return {
+      version: entry.confirmed,
+      signature: entry.confirmed === entry.version ? entry.signature : null,
+      at: Math.max(entry.confirmedAt, this.#checked.get(identity) ?? 0),
+    };
+  }
+
   view(identity: string): TrustView {
     const entry = this.#entries.get(identity);
     const observed = this.#observed.get(identity);
@@ -202,7 +251,7 @@ export class Trust {
     return { identity, state, current, verified };
   }
 
-  observe(value: unknown): Promise<Roster | null> {
+  observe(value: unknown, authoritative = false): Promise<Roster | null> {
     return this.#enqueue(async () => {
       const roster = await verifyRoster(value);
       const print = roster && (await rosterFingerprint(roster));
@@ -226,9 +275,24 @@ export class Trust {
       ) {
         return null;
       }
-      if (roster.version > pinned) {
+      if (
+        entry?.signature &&
+        roster.version === pinned &&
+        roster.signature !== entry.signature
+      ) {
+        return null;
+      }
+      const now = Date.now();
+      const confirms = authoritative && entry?.confirmed !== roster.version;
+      if (
+        roster.version > pinned ||
+        (entry && entry.signature === null) ||
+        confirms
+      ) {
         const status: Status =
-          entry?.status === "verified" && entry.fingerprint !== print.value
+          roster.version > pinned &&
+          entry?.status === "verified" &&
+          entry.fingerprint !== print.value
             ? "changed"
             : (entry?.status ?? "observed");
         const record = await this.#seal({
@@ -237,12 +301,21 @@ export class Trust {
           status,
           version: roster.version,
           fingerprint: entry?.fingerprint ?? null,
+          signature: roster.signature,
+          confirmed: authoritative ? roster.version : (entry?.confirmed ?? 0),
+          confirmedAt: authoritative ? now : (entry?.confirmedAt ?? 0),
         });
         if (await this.#swap(identity, record)) {
           this.#entries.set(identity, record);
         } else if (roster.version < this.pinned(identity)) {
           return null;
         }
+      }
+      if (
+        authoritative &&
+        this.#entries.get(identity)?.confirmed === roster.version
+      ) {
+        this.#checked.set(identity, now);
       }
       this.#observed.set(identity, { roster, fingerprint: print });
       if (previous?.fingerprint.value !== print.value) {
@@ -258,12 +331,19 @@ export class Trust {
       if (!current || current.fingerprint.value !== value) {
         return false;
       }
+      const entry = this.#entries.get(identity);
+      const newer = current.roster.version >= this.pinned(identity);
       const record = await this.#seal({
         v: trustVersion,
         identity,
         status: "verified",
         version: Math.max(this.pinned(identity), current.roster.version),
         fingerprint: value,
+        signature: newer
+          ? current.roster.signature
+          : (entry?.signature ?? null),
+        confirmed: entry?.confirmed ?? 0,
+        confirmedAt: entry?.confirmedAt ?? 0,
       });
       if (!(await this.#swap(identity, record))) {
         return false;
@@ -337,6 +417,60 @@ export class Trust {
     }
   }
 
+  async #upgrade(key: string, value: unknown): Promise<TrustRecord | null> {
+    const previous = shape(key, value, previousFields);
+    const mac = previous && decodeBase64Url(previous.mac, macSize);
+    if (
+      !previous ||
+      !mac ||
+      previous.v !== 2 ||
+      !isStatus(previous.status) ||
+      !(previous.version === 0 || isRosterVersion(previous.version)) ||
+      (previous.status === "observed"
+        ? previous.fingerprint !== null
+        : !isFingerprintValue(previous.fingerprint))
+    ) {
+      return null;
+    }
+    try {
+      const authentic = await crypto.subtle.verify(
+        "HMAC",
+        this.#integrity,
+        mac,
+        withContext(previousContext, [
+          previous.v,
+          previous.identity,
+          previous.status,
+          previous.version,
+          previous.fingerprint,
+        ]),
+      );
+      if (!authentic) {
+        return null;
+      }
+      const record = await this.#seal({
+        v: trustVersion,
+        identity: key,
+        status: previous.status,
+        version: previous.version as number,
+        fingerprint: previous.fingerprint as string | null,
+        signature: null,
+        confirmed: 0,
+        confirmedAt: 0,
+      });
+      return (await this.#store.swap(
+        "trust",
+        key,
+        (current) => tag(current) === tag(value),
+        record,
+      ))
+        ? (this.#seen.set(key, tag(record)), record)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
   async #migrate(key: string, value: unknown): Promise<TrustRecord | null> {
     const legacy = shape(key, value, legacyFields);
     const mac = legacy && decodeBase64Url(legacy.mac, macSize);
@@ -372,6 +506,9 @@ export class Trust {
         status: "changed",
         version: 0,
         fingerprint: legacy.fingerprint as string,
+        signature: null,
+        confirmed: 0,
+        confirmedAt: 0,
       });
       return (await this.#store.swap(
         "trust",

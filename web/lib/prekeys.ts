@@ -7,22 +7,30 @@ import {
   initiationIdSize,
   signPrekey,
 } from "./handshake.ts";
-import { exchangeKeySize, isEpoch, isFixed, maxEpoch } from "./protocol.ts";
+import {
+  type WireDeviceBundle,
+  exchangeKeySize,
+  isEpoch,
+  isFixed,
+  maxEpoch,
+} from "./protocol.ts";
 import type { KeyValueStore } from "./storage.ts";
 import type { Keys } from "./vault.ts";
 
-export const prekeysVersion = 2;
+export const prekeysVersion = 3;
+export const legacyPrekeysVersion = 2;
 export const poolSize = 20;
 export const lowWater = 5;
 export const maxLocalOnetime = 40;
 export const signedLifetime = 50;
 export const consumedLimit = 256;
+export const maxDirect = 16;
 
 const recordKey = "prekeys";
 const macSize = 32;
 const encoder = new TextEncoder();
 const context = encoder.encode("ghostx/prekeys/v2\0");
-const fields = [
+const legacyFields = [
   "v",
   "device",
   "nextSigned",
@@ -34,6 +42,7 @@ const fields = [
   "consumed",
   "mac",
 ];
+const fields = [...legacyFields, "direct"];
 
 type Slot = { id: number; key: string; privateKey: CryptoKey };
 
@@ -47,6 +56,7 @@ type State = {
   previous: Slot | null;
   onetime: Slot[];
   consumed: string[];
+  direct: Slot[];
 };
 
 type Stored = State & { mac: string };
@@ -103,6 +113,7 @@ function macInput(state: State): Uint8Array<ArrayBuffer> {
       publicOf(state.previous),
       state.onetime.map(publicOf),
       state.consumed,
+      ...(state.v === legacyPrekeysVersion ? [] : [state.direct.map(publicOf)]),
     ]),
   );
   const out = new Uint8Array(context.length + values.length);
@@ -115,12 +126,16 @@ export function parsePrekeys(value: unknown): Stored | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
   }
-  const record = value as Record<string, unknown>;
-  const names = Object.keys(record);
+  const legacy = (value as Record<string, unknown>).v === legacyPrekeysVersion;
+  const record = legacy
+    ? { ...(value as Record<string, unknown>), direct: [] }
+    : (value as Record<string, unknown>);
+  const names = Object.keys(value);
+  const expected = legacy ? legacyFields : fields;
   if (
-    record.v !== prekeysVersion ||
-    names.length !== fields.length ||
-    !fields.every((name) => names.includes(name)) ||
+    (record.v !== prekeysVersion && !legacy) ||
+    names.length !== expected.length ||
+    !expected.every((name) => names.includes(name)) ||
     !isFixed(record.device, deviceIdSize) ||
     !isEpoch(record.nextSigned) ||
     !isEpoch(record.nextOnetime) ||
@@ -130,6 +145,9 @@ export function parsePrekeys(value: unknown): Stored | null {
     !Array.isArray(record.onetime) ||
     record.onetime.length > maxLocalOnetime ||
     !record.onetime.every(isSlot) ||
+    !Array.isArray(record.direct) ||
+    record.direct.length > maxDirect ||
+    !record.direct.every(isSlot) ||
     !Array.isArray(record.consumed) ||
     record.consumed.length > consumedLimit ||
     !record.consumed.every((id) => isFixed(id, initiationIdSize)) ||
@@ -138,7 +156,7 @@ export function parsePrekeys(value: unknown): Stored | null {
     return null;
   }
   const state = record as unknown as Stored;
-  const ids = state.onetime.map((slot) => slot.id);
+  const ids = [...state.onetime, ...state.direct].map((slot) => slot.id);
   if (
     new Set(ids).size !== ids.length ||
     ids.some((id) => id >= state.nextOnetime) ||
@@ -201,8 +219,13 @@ export class PrekeyStore {
       (existing as { v?: unknown }).v === 1;
     if (existing !== undefined && !stale) {
       const state = await PrekeyStore.#verify(existing, integrity);
-      return state && state.device === keys.deviceId
-        ? new PrekeyStore(store, keys, integrity, state)
+      if (!state || state.device !== keys.deviceId) {
+        return null;
+      }
+      const prekeys = new PrekeyStore(store, keys, integrity, state);
+      return state.v === prekeysVersion ||
+        (await prekeys.#update(async (current) => current))
+        ? prekeys
         : null;
     }
     const slots = await Promise.all(
@@ -219,6 +242,7 @@ export class PrekeyStore {
         previous: null,
         onetime: slots,
         consumed: [],
+        direct: [],
       },
       integrity,
     );
@@ -266,8 +290,9 @@ export class PrekeyStore {
   }
 
   static async #seal(state: State, integrity: CryptoKey): Promise<Stored> {
-    const mac = await crypto.subtle.sign("HMAC", integrity, macInput(state));
-    return { ...state, mac: encodeBase64Url(new Uint8Array(mac)) };
+    const current: State = { ...state, v: prekeysVersion };
+    const mac = await crypto.subtle.sign("HMAC", integrity, macInput(current));
+    return { ...current, mac: encodeBase64Url(new Uint8Array(mac)) };
   }
 
   get device(): string {
@@ -304,6 +329,34 @@ export class PrekeyStore {
       return null;
     }
     return { device: state.device, signed, onetime: onetime as Prekey[] };
+  }
+
+  async reserve(): Promise<WireDeviceBundle | null> {
+    const reserved: { slot: Slot | null } = { slot: null };
+    const updated = await this.#update(async (state) => {
+      if (state.nextOnetime >= maxEpoch) {
+        return null;
+      }
+      const slot = await generate(state.nextOnetime);
+      reserved.slot = slot;
+      return {
+        ...state,
+        direct: [...state.direct, slot].slice(-maxDirect),
+        nextOnetime: state.nextOnetime + 1,
+      };
+    });
+    const slot = reserved.slot;
+    if (!updated || !slot) {
+      return null;
+    }
+    const state = this.#state;
+    const raw = (entry: Slot) =>
+      decodeBase64Url(entry.key, exchangeKeySize) ?? new Uint8Array();
+    const [signed, onetime] = await Promise.all([
+      signPrekey("signed", this.#keys, state.signed.id, raw(state.signed)),
+      signPrekey("onetime", this.#keys, slot.id, raw(slot)),
+    ]);
+    return signed && onetime ? { device: state.device, signed, onetime } : null;
   }
 
   async replenish(available: number): Promise<boolean> {
@@ -354,7 +407,9 @@ export class PrekeyStore {
       const onetime =
         onetimeId === null
           ? null
-          : (state.onetime.find((slot) => slot.id === onetimeId) ?? null);
+          : ([...state.onetime, ...state.direct].find(
+              (slot) => slot.id === onetimeId,
+            ) ?? null);
       if (!signed || (onetimeId !== null && !onetime)) {
         return { status: "rejected" };
       }
@@ -383,6 +438,7 @@ export class PrekeyStore {
       const next: State = {
         ...state,
         onetime: state.onetime.filter((slot) => slot.id !== onetimeId),
+        direct: state.direct.filter((slot) => slot.id !== onetimeId),
         consumed: [...state.consumed, value.id].slice(-consumedLimit),
         uses: Math.min(state.uses + 1, maxEpoch),
       };
