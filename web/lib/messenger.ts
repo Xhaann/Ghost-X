@@ -1,5 +1,4 @@
 import { decodeBase64UrlRange, encodeBase64Url } from "./base64.ts";
-import type { Client } from "./client.ts";
 import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
 import { type Path, type Outbox, outboxLifetime } from "./outbox.ts";
@@ -9,7 +8,6 @@ import type { AuthSource } from "./presence.ts";
 import {
   type ErrorCode,
   type ReceiptStatus,
-  type ServerMessage,
   type WireEnvelope,
   bodySize,
   createMessageId,
@@ -19,6 +17,7 @@ import {
   maxMessageSize,
   minMessageSize,
 } from "./protocol.ts";
+import type { Delivery, Relay } from "./relay.ts";
 import type { Rosters } from "./rosters.ts";
 
 export type SendResult =
@@ -46,10 +45,8 @@ export interface Receiver {
 
 export const maxDeferred = 64;
 
-type Delivery = Extract<ServerMessage, { type: "message" }>["payload"];
-
 export class Messenger {
-  readonly #client: Client;
+  readonly #relay: Relay;
   readonly #auth: AuthSource;
   readonly #self: string;
   readonly #channel: Channel;
@@ -67,7 +64,7 @@ export class Messenger {
   #detach: (() => void) | null = null;
 
   constructor(
-    client: Client,
+    relay: Relay,
     auth: AuthSource,
     self: string,
     channel: Channel,
@@ -75,7 +72,7 @@ export class Messenger {
     outbox: Outbox,
     now: () => number = Date.now,
   ) {
-    this.#client = client;
+    this.#relay = relay;
     this.#auth = auth;
     this.#self = self;
     this.#channel = channel;
@@ -109,12 +106,12 @@ export class Messenger {
       return;
     }
     const detach = [
-      this.#client.onMessage((message) => {
+      this.#relay.onEvent((event) => {
         const generation = this.#generation;
-        if (message.type === "message") {
-          this.#enqueue(() => this.#deliver(message.payload, generation));
-        } else if (message.type === "receipt") {
-          this.#enqueue(() => this.#settle(message.payload, generation));
+        if (event.type === "message") {
+          this.#enqueue(() => this.#deliver(event.payload, generation));
+        } else if (event.type === "receipt") {
+          this.#enqueue(() => this.#settle(event.payload, generation));
         }
       }),
       this.#auth.onState((state) => {
@@ -236,11 +233,8 @@ export class Messenger {
       return failed("not_sent");
     }
     let delivered = envelopes;
-    let reply = await this.#client.request({
-      type: "send",
-      payload: { to, id, envelopes },
-    });
-    if (reply?.type === "error" && reply.payload.code === "stale_devices") {
+    let reply = await this.#relay.send(to, id, envelopes);
+    if (reply === "stale_devices") {
       const roster = await this.#rosters.fetch(to);
       delivered = envelopes.filter((e) =>
         roster?.devices.some((d) => d.id === e.device),
@@ -248,18 +242,12 @@ export class Messenger {
       if (delivered.length === 0 || delivered.length === envelopes.length) {
         return failed("stale_devices");
       }
-      reply = await this.#client.request({
-        type: "send",
-        payload: { to, id, envelopes: delivered },
-      });
+      reply = await this.#relay.send(to, id, delivered);
     }
-    if (reply?.type === "queued") {
+    if (reply === "queued") {
       return { ok: true, devices: delivered.length, pending: deferred.length };
     }
-    if (reply?.type === "error") {
-      return failed(reply.payload.code);
-    }
-    return failed("not_sent");
+    return failed(reply ?? "not_sent");
   }
 
   #flush(peer: string, device: string): Promise<void> {
@@ -280,6 +268,7 @@ export class Messenger {
     const generation = this.#generation;
     if (
       !this.#state.active ||
+      !this.#relay.reaches(peer, device) ||
       this.#channel.state(peer, device) !== "established"
     ) {
       return;
@@ -301,17 +290,12 @@ export class Messenger {
       if (!sealed) {
         return;
       }
-      const reply = await this.#client.request({
-        type: "send",
-        payload: {
-          to: peer,
-          id: pending.id,
-          envelopes: [{ device, ciphertext: encodeBase64Url(sealed) }],
-        },
-      });
-      const code = reply?.type === "error" ? reply.payload.code : null;
+      const reply = await this.#relay.send(peer, pending.id, [
+        { device, ciphertext: encodeBase64Url(sealed) },
+      ]);
+      const code = reply === "queued" ? null : reply;
       if (
-        reply?.type === "queued" ||
+        reply === "queued" ||
         code === "duplicate_message" ||
         code === "stale_devices"
       ) {
@@ -346,7 +330,7 @@ export class Messenger {
     void this.#expire(paths.filter((p) => now - p.created >= outboxLifetime));
     for (const address of this.#outbox.addresses()) {
       const target = splitAddress(address);
-      if (!target) {
+      if (!target || !this.#relay.reaches(target.peer, target.device)) {
         continue;
       }
       const state = this.#channel.state(target.peer, target.device);
@@ -370,7 +354,7 @@ export class Messenger {
 
   async #fetch(generation: number): Promise<void> {
     if (generation === this.#generation) {
-      await this.#client.request({ type: "fetch", payload: {} });
+      await this.#relay.fetch();
     }
   }
 
@@ -427,14 +411,7 @@ export class Messenger {
   }
 
   #acknowledge(delivery: Delivery): void {
-    this.#client.send({
-      type: "ack",
-      payload: {
-        from: delivery.from,
-        device: delivery.device,
-        id: delivery.id,
-      },
-    });
+    this.#relay.acknowledge(delivery);
   }
 
   #defer(delivery: Delivery): void {
@@ -471,10 +448,7 @@ export class Messenger {
       return;
     }
     if (await receiver.settle(receipt)) {
-      this.#client.send({
-        type: "clear",
-        payload: { to: receipt.to, device: receipt.device, id: receipt.id },
-      });
+      this.#relay.clear(receipt);
     }
   }
 

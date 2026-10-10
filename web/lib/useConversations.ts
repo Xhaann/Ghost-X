@@ -10,6 +10,7 @@ import { requestDeviceLock } from "./lock.ts";
 import { Messenger } from "./messenger.ts";
 import type { PairState } from "./pairs.ts";
 import { type InitiateResult, Pairing } from "./pairing.ts";
+import { ServerRelay } from "./relay.ts";
 import { Rosters } from "./rosters.ts";
 import type { TrustState, TrustView } from "./trust.ts";
 import type { LocalSession } from "./useIdentity.ts";
@@ -84,16 +85,17 @@ export function useConversations(
           return;
         }
         setRejected(rejected);
-        const rosters = new Rosters(client, trust);
+        const relay = new ServerRelay(client);
+        const rosters = new Rosters(relay, trust);
         const pairing = new Pairing(
-          client,
+          relay,
           keys,
           rosters,
           prekeys,
           session.pairs,
         );
         const messenger = new Messenger(
-          client,
+          relay,
           authenticator,
           keys.identity,
           pairing,

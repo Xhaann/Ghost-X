@@ -1,17 +1,17 @@
-import type { Client } from "./client.ts";
 import { type DeviceEntry, type Roster, rosterDevice } from "./device.ts";
 import { isIdentity } from "./identity.ts";
 import { Listeners } from "./listeners.ts";
+import type { Relay } from "./relay.ts";
 import type { Trust } from "./trust.ts";
 
 export class Rosters {
-  readonly #client: Client;
+  readonly #relay: Relay;
   readonly #trust: Trust;
   readonly #inflight = new Map<string, Promise<Roster | null>>();
   readonly #updates = new Listeners<Roster>();
 
-  constructor(client: Client, trust: Trust) {
-    this.#client = client;
+  constructor(relay: Relay, trust: Trust) {
+    this.#relay = relay;
     this.#trust = trust;
   }
 
@@ -49,14 +49,11 @@ export class Rosters {
   }
 
   async #fetch(identity: string): Promise<Roster | null> {
-    const reply = await this.#client.request({
-      type: "devices",
-      payload: { identity },
-    });
-    if (reply?.type !== "devices" || reply.payload.identity !== identity) {
+    const roster = await this.#relay.roster(identity);
+    if (!roster || roster.identity !== identity) {
       return this.cached(identity);
     }
-    const observed = await this.#trust.observe(reply.payload);
+    const observed = await this.#trust.observe(roster);
     if (!observed) {
       return this.cached(identity);
     }

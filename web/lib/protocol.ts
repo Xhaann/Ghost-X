@@ -235,11 +235,15 @@ const idPattern = /^[A-Za-z0-9_-]{1,64}$/;
 
 type Fields = Record<string, unknown>;
 
-function isObject(value: unknown): value is Fields {
+export function isObject(value: unknown): value is Fields {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasOnly(value: Fields, required: string[], optional: string[] = []) {
+export function hasOnly(
+  value: Fields,
+  required: string[],
+  optional: string[] = [],
+) {
   const keys = Object.keys(value);
   return (
     required.every((key) => keys.includes(key)) &&
@@ -272,7 +276,7 @@ function parsePrekey(value: unknown): WirePrekey | null {
   return null;
 }
 
-function parseDeviceBundle(value: unknown): WireDeviceBundle | null {
+export function parseDeviceBundle(value: unknown): WireDeviceBundle | null {
   if (
     !isObject(value) ||
     !hasOnly(value, ["device", "signed", "onetime"]) ||

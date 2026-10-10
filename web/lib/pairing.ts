@@ -1,4 +1,3 @@
-import type { Client } from "./client.ts";
 import { type DeviceEntry, type Roster, rosterDevice } from "./device.ts";
 import {
   type ResponderKeys,
@@ -17,7 +16,6 @@ import {
 } from "./pairs.ts";
 import { type PrekeyStore, lowWater } from "./prekeys.ts";
 import {
-  type ServerMessage,
   type WireDeviceBundle,
   exchangeKeySize,
   isMessageId,
@@ -34,6 +32,7 @@ import {
   ratchetEncrypt,
   responderState,
 } from "./ratchet.ts";
+import type { Relay, RelayEvent } from "./relay.ts";
 import type { Rosters } from "./rosters.ts";
 import type { Keys } from "./vault.ts";
 
@@ -74,8 +73,8 @@ type StateSource = {
   onState(listener: (state: MessengerState) => void): () => void;
 };
 
-type Initiation = Extract<ServerMessage, { type: "initiation" }>["payload"];
-type Acceptance = Extract<ServerMessage, { type: "acceptance" }>["payload"];
+type Initiated = Extract<RelayEvent, { type: "initiation" }>["payload"];
+type Accepted = Extract<RelayEvent, { type: "acceptance" }>["payload"];
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -107,7 +106,7 @@ export function unframe(plaintext: Uint8Array, id: string): string | null {
 }
 
 export class Pairing implements Channel {
-  readonly #client: Client;
+  readonly #relay: Relay;
   readonly #keys: Keys;
   readonly #rosters: Rosters;
   readonly #prekeys: PrekeyStore;
@@ -121,14 +120,14 @@ export class Pairing implements Channel {
   #detach: (() => void) | null = null;
 
   constructor(
-    client: Client,
+    relay: Relay,
     keys: Keys,
     rosters: Rosters,
     prekeys: PrekeyStore,
     pairs: Pairs,
     generate: Generate = generateRatchetKey,
   ) {
-    this.#client = client;
+    this.#relay = relay;
     this.#keys = keys;
     this.#rosters = rosters;
     this.#prekeys = prekeys;
@@ -154,11 +153,11 @@ export class Pairing implements Channel {
     }
     this.#source = source;
     const detach = [
-      this.#client.onMessage((message) => {
-        if (message.type === "initiation") {
-          this.#enqueue(() => this.#respond(message.payload));
-        } else if (message.type === "acceptance") {
-          this.#enqueue(() => this.#accept(message.payload));
+      this.#relay.onEvent((event) => {
+        if (event.type === "initiation") {
+          this.#enqueue(() => this.#respond(event.payload));
+        } else if (event.type === "acceptance") {
+          this.#enqueue(() => this.#accept(event.payload));
         }
       }),
       this.#rosters.onUpdate((roster) =>
@@ -192,15 +191,12 @@ export class Pairing implements Channel {
       if (!publication || generation !== this.#generation) {
         return false;
       }
-      const reply = await this.#client.request({
-        type: "prekeys",
-        payload: publication,
-      });
-      if (reply?.type !== "prekeys" || generation !== this.#generation) {
+      const available = await this.#relay.publish(publication);
+      if (available === null || generation !== this.#generation) {
         return false;
       }
       this.#published = true;
-      if (!(await this.#prekeys.replenish(reply.payload.available))) {
+      if (!(await this.#prekeys.replenish(available))) {
         return true;
       }
     }
@@ -236,7 +232,9 @@ export class Pairing implements Channel {
     return (roster?.devices ?? [])
       .map((d) => d.id)
       .filter(
-        (id) => this.#pairs.state(pairAddress(peer, id)) === "established",
+        (id) =>
+          this.#relay.reaches(peer, id) &&
+          this.#pairs.state(pairAddress(peer, id)) === "established",
       );
   }
 
@@ -249,7 +247,7 @@ export class Pairing implements Channel {
       const devices = this.established(peer);
       const pending = (this.#rosters.cached(peer) ?? roster).devices
         .map((d) => d.id)
-        .filter((id) => !devices.includes(id));
+        .filter((id) => this.#relay.reaches(peer, id) && !devices.includes(id));
       return {
         result: devices.length > 0 ? "established" : result,
         devices,
@@ -259,7 +257,9 @@ export class Pairing implements Channel {
     if (this.established(peer).length > 0) {
       if (
         roster.devices.some(
-          (d) => this.#pairs.state(pairAddress(peer, d.id)) === "none",
+          (d) =>
+            this.#relay.reaches(peer, d.id) &&
+            this.#pairs.state(pairAddress(peer, d.id)) === "none",
         )
       ) {
         void this.initiate(peer);
@@ -385,6 +385,7 @@ export class Pairing implements Channel {
       const state = this.#pairs.state(pairAddress(peer, d.id));
       return (
         (device === null || d.id === device) &&
+        this.#relay.reaches(peer, d.id) &&
         (state === "none" ||
           (state === "pending" &&
             replace &&
@@ -395,21 +396,13 @@ export class Pairing implements Channel {
     if (wanted.length === 0) {
       return this.established(peer).length > 0 ? "established" : "pending";
     }
-    const reply = await this.#client.request({
-      type: "bundle",
-      payload: { identity: peer },
-    });
-    if (reply?.type === "error") {
-      return reply.payload.code === "recipient_unavailable"
-        ? "unavailable"
-        : "failed";
-    }
-    if (reply?.type !== "bundle" || reply.payload.identity !== peer) {
-      return "failed";
+    const reply = await this.#relay.bundle(peer);
+    if (reply === "unavailable" || reply === "failed") {
+      return reply;
     }
     let outcome: InitiateResult = "unavailable";
     for (const entry of wanted) {
-      const bundle = reply.payload.bundles.find((b) => b.device === entry.id);
+      const bundle = reply.bundles.find((b) => b.device === entry.id);
       if (!bundle) {
         continue;
       }
@@ -436,7 +429,7 @@ export class Pairing implements Channel {
         outcome = result;
       }
     }
-    if (outcome === "unavailable" && reply.payload.bundles.length > 0) {
+    if (outcome === "unavailable" && reply.bundles.length > 0) {
       return "invalid_bundle";
     }
     return this.established(peer).length > 0 ? "established" : outcome;
@@ -492,16 +485,14 @@ export class Pairing implements Channel {
     ) {
       return "failed";
     }
-    const sent = await this.#client.request({
-      type: "initiate",
-      payload: { version: handshakeVersion, to: peer, ...result.initiation },
+    const sent = await this.#relay.initiate({
+      version: handshakeVersion,
+      to: peer,
+      ...result.initiation,
     });
-    if (sent?.type !== "initiated") {
+    if (sent !== "initiated") {
       await this.#pairs.discard(address, result.pending.id);
-      return sent?.type === "error" &&
-        sent.payload.code === "recipient_unavailable"
-        ? "unavailable"
-        : "failed";
+      return sent;
     }
     return this.#pairs.state(address) === "established"
       ? "established"
@@ -521,7 +512,7 @@ export class Pairing implements Channel {
     return run;
   }
 
-  async #respond(initiation: Initiation): Promise<void> {
+  async #respond(initiation: Initiated): Promise<void> {
     const peer = initiation.from;
     const address = pairAddress(peer, initiation.device);
     if (
@@ -578,14 +569,11 @@ export class Pairing implements Channel {
     ) {
       return;
     }
-    await this.#client.request({
-      type: "accept",
-      payload: {
-        to: peer,
-        device: initiation.device,
-        ephemeral: initiation.ephemeral,
-        confirm: outcome.value.accept,
-      },
+    await this.#relay.accept({
+      to: peer,
+      device: initiation.device,
+      ephemeral: initiation.ephemeral,
+      confirm: outcome.value.accept,
     });
     if (
       this.#prekeys.inventory.onetime.length < lowWater ||
@@ -595,7 +583,7 @@ export class Pairing implements Channel {
     }
   }
 
-  async #accept(acceptance: Acceptance): Promise<void> {
+  async #accept(acceptance: Accepted): Promise<void> {
     await this.#pairs.accept(
       pairAddress(acceptance.from, acceptance.device),
       acceptance.ephemeral,

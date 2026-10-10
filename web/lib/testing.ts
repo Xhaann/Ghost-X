@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createConnection, createServer } from "node:net";
+import { type Socket, createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before } from "node:test";
@@ -19,7 +19,12 @@ import type { KeyValueStore, StoreName } from "./storage.ts";
 import type { Transport, TransportKind, TransportState } from "./transport.ts";
 import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
-import { type Link, LocalTransport } from "./local.ts";
+import {
+  type Link,
+  type LinkConnection,
+  type LinkHandlers,
+  LocalTransport,
+} from "./local.ts";
 import { History } from "./history.ts";
 import {
   Messenger,
@@ -30,10 +35,12 @@ import {
 import { Outbox } from "./outbox.ts";
 import { Pairing } from "./pairing.ts";
 import { Pairs } from "./pairs.ts";
+import { PeerEndpoint } from "./peer.ts";
 import { PrekeyStore } from "./prekeys.ts";
 import { WebSocketTransport } from "./socket.ts";
 import { Trust } from "./trust.ts";
 import { Devices } from "./devices.ts";
+import { ServerRelay } from "./relay.ts";
 import { Rosters } from "./rosters.ts";
 import { type Unlocked, createVault, linkVault, loadVault } from "./vault.ts";
 
@@ -128,54 +135,146 @@ export function localSocket(port: number): string {
   return join(workdir, `l${port}.sock`);
 }
 
-export function unixLink(path: string): Link {
+export type Wire = { out: Buffer[]; in: Buffer[] };
+
+export function wireFrames(chunks: Buffer[]): string[] {
+  let buffered = Buffer.concat(chunks);
+  const out: string[] = [];
+  while (buffered.length >= 4) {
+    const size = buffered.readUInt32BE(0);
+    assert.ok(size > 0 && size <= 32 * 1024, "length prefix within limits");
+    assert.ok(buffered.length >= 4 + size, "complete frame");
+    out.push(buffered.subarray(4, 4 + size).toString("utf8"));
+    buffered = buffered.subarray(4 + size);
+  }
+  assert.equal(buffered.length, 0);
+  return out;
+}
+
+function framed(
+  socket: Socket,
+  handlers: LinkHandlers,
+  wire: Wire | null,
+): LinkConnection {
+  let buffered = Buffer.alloc(0);
+  socket.on("data", (chunk) => {
+    wire?.in.push(Buffer.from(chunk));
+    buffered = Buffer.concat([buffered, chunk]);
+    while (buffered.length >= 4) {
+      const size = buffered.readUInt32BE(0);
+      if (buffered.length < 4 + size) {
+        break;
+      }
+      handlers.frame(buffered.subarray(4, 4 + size).toString("utf8"));
+      buffered = buffered.subarray(4 + size);
+    }
+  });
+  socket.on("error", () => {});
+  socket.on("close", () => handlers.closed());
+  return {
+    send(frame) {
+      if (socket.writableNeedDrain || socket.destroyed) {
+        return false;
+      }
+      const body = Buffer.from(frame, "utf8");
+      const header = Buffer.alloc(4);
+      header.writeUInt32BE(body.length);
+      const bytes = Buffer.concat([header, body]);
+      wire?.out.push(bytes);
+      socket.write(bytes);
+      return true;
+    },
+    close() {
+      socket.destroy();
+    },
+  };
+}
+
+function dialer(path: string, wire: Wire | null): Link {
   return {
     connect: (handlers) =>
       new Promise((resolve, reject) => {
         const socket = createConnection(path);
-        let buffered = Buffer.alloc(0);
-        let connected = false;
-        socket.on("connect", () => {
-          connected = true;
-          resolve({
-            send(frame) {
-              if (socket.writableNeedDrain || socket.destroyed) {
-                return false;
-              }
-              const body = Buffer.from(frame, "utf8");
-              const header = Buffer.alloc(4);
-              header.writeUInt32BE(body.length);
-              socket.write(Buffer.concat([header, body]));
-              return true;
-            },
-            close() {
-              socket.destroy();
-            },
-          });
-        });
-        socket.on("data", (chunk) => {
-          buffered = Buffer.concat([buffered, chunk]);
-          while (buffered.length >= 4) {
-            const size = buffered.readUInt32BE(0);
-            if (buffered.length < 4 + size) {
-              break;
-            }
-            handlers.frame(buffered.subarray(4, 4 + size).toString("utf8"));
-            buffered = buffered.subarray(4 + size);
-          }
-        });
-        socket.on("error", (error) => {
-          if (!connected) {
-            reject(error);
-          }
-        });
-        socket.on("close", () => {
-          if (connected) {
-            handlers.closed();
-          }
+        const refused = (error: Error) => reject(error);
+        socket.once("error", refused);
+        socket.once("connect", () => {
+          socket.off("error", refused);
+          resolve(framed(socket, handlers, wire));
         });
       }),
   };
+}
+
+export function unixLink(path: string): Link {
+  return dialer(path, null);
+}
+
+export type PeerCarrier = {
+  listen: Link;
+  dial: Link;
+  wire: Wire;
+  drop(): void;
+  close(): void;
+};
+
+export async function peerCarrier(): Promise<PeerCarrier> {
+  const dir = mkdtempSync(join(tmpdir(), "ghostx-peer-"));
+  const path = join(dir, "peer.sock");
+  const accepted: Socket[] = [];
+  const waiting: ((socket: Socket) => void)[] = [];
+  const sockets = new Set<Socket>();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    const take = waiting.shift();
+    if (take) {
+      take(socket);
+    } else {
+      accepted.push(socket);
+    }
+  });
+  server.listen(path);
+  await once(server, "listening");
+  const wire: Wire = { out: [], in: [] };
+  const drop = () => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    accepted.length = 0;
+  };
+  return track<PeerCarrier>({
+    listen: {
+      connect: (handlers) =>
+        new Promise((resolve) => {
+          const take = (socket: Socket) =>
+            resolve(framed(socket, handlers, null));
+          const socket = accepted.shift();
+          if (socket) {
+            take(socket);
+          } else {
+            waiting.push(take);
+          }
+        }),
+    },
+    dial: dialer(path, wire),
+    wire,
+    drop,
+    close: () => {
+      drop();
+      waiting.length = 0;
+      server.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  });
+}
+
+export function useCleanup(): void {
+  afterEach(() => {
+    for (const item of closables) {
+      item.close();
+    }
+    closables.clear();
+  });
 }
 
 export async function stopServer(server: ChildProcess): Promise<void> {
@@ -441,24 +540,18 @@ export async function secureDevice(
   } = {},
 ) {
   const store = options.store ?? memoryStore();
-  let vault = await loadVault(store);
-  if (vault.status === "empty") {
-    vault = options.link
-      ? await linkVault(store, options.link)
-      : await createVault(store);
-  }
-  assert.equal(vault.status, "ready");
-  const { keys, integrity, storage } = vault as Unlocked;
-  const prekeys = await PrekeyStore.open(store, keys, integrity);
-  assert.ok(prekeys);
-  const [pairs, trust, history, devices, outbox] = await Promise.all([
-    Pairs.open(store, integrity, storage, keys.identity),
-    Trust.open(store, integrity),
-    History.open(store, keys, integrity, storage),
-    Devices.open(store, keys),
-    Outbox.open(store, storage),
-  ]);
-  assert.ok(devices);
+  const {
+    vault,
+    keys,
+    integrity,
+    storage,
+    prekeys,
+    pairs,
+    trust,
+    history,
+    devices,
+    outbox,
+  } = await openDevice(store, options.link);
   const transport: Transport = track(
     options.transport === "local"
       ? new LocalTransport(unixLink(localSocket(port)))
@@ -507,10 +600,11 @@ export async function secureDevice(
   };
   const client = track(new Client(transport));
   const auth = new Authenticator(client, keys, devices);
-  const rosters = new Rosters(client, trust);
-  const pairing = new Pairing(client, keys, rosters, prekeys, pairs);
+  const relay = new ServerRelay(client);
+  const rosters = new Rosters(relay, trust);
+  const pairing = new Pairing(relay, keys, rosters, prekeys, pairs);
   const messenger = new Messenger(
-    client,
+    relay,
     auth,
     keys.identity,
     pairing,
@@ -552,7 +646,7 @@ export async function secureDevice(
   return {
     id: keys.identity,
     deviceId: keys.deviceId,
-    created: (vault as Unlocked).created,
+    created: vault.created,
     devices,
     rosters,
     store,
@@ -602,6 +696,109 @@ export async function secureDevice(
 }
 
 export type SecureDevice = Awaited<ReturnType<typeof secureDevice>>;
+
+async function openDevice(store: MemoryStore, link?: string) {
+  let vault = await loadVault(store);
+  if (vault.status === "empty") {
+    vault = link ? await linkVault(store, link) : await createVault(store);
+  }
+  assert.equal(vault.status, "ready");
+  const { keys, integrity, storage } = vault as Unlocked;
+  const prekeys = await PrekeyStore.open(store, keys, integrity);
+  assert.ok(prekeys);
+  const [pairs, trust, history, devices, outbox] = await Promise.all([
+    Pairs.open(store, integrity, storage, keys.identity),
+    Trust.open(store, integrity),
+    History.open(store, keys, integrity, storage),
+    Devices.open(store, keys),
+    Outbox.open(store, storage),
+  ]);
+  assert.ok(devices);
+  return {
+    vault: vault as Unlocked,
+    keys,
+    integrity,
+    storage,
+    prekeys,
+    pairs,
+    trust,
+    history,
+    devices,
+    outbox,
+  };
+}
+
+export async function peerDevice(
+  link: Link | null,
+  options: {
+    store?: MemoryStore;
+    root?: string;
+    now?: () => number;
+    timeout?: number;
+    requestTimeout?: number;
+    open?: boolean;
+  } = {},
+) {
+  const store = options.store ?? memoryStore();
+  const material = await openDevice(store, options.root);
+  const { keys, prekeys, pairs, trust, history, devices, outbox } = material;
+  const transport = track(new LocalTransport(link, { timeout: 2000 }));
+  const endpoint = new PeerEndpoint(transport, {
+    keys,
+    devices,
+    trust,
+    prekeys,
+    timeout: options.timeout,
+    requestTimeout: options.requestTimeout,
+  });
+  const rosters = new Rosters(endpoint, trust);
+  const pairing = new Pairing(endpoint, keys, rosters, prekeys, pairs);
+  const messenger = new Messenger(
+    endpoint,
+    endpoint,
+    keys.identity,
+    pairing,
+    rosters,
+    outbox,
+    options.now,
+  );
+  const sink = memoryReceiver();
+  messenger.receive(sink.receiver);
+  let stopped = false;
+  const shutdown = async () => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    pairing.stop();
+    messenger.stop();
+    endpoint.close();
+    await Promise.all([pairs.close(), trust.close(), history.close()]);
+  };
+  track({ close: () => void shutdown() });
+  messenger.start();
+  pairing.start(messenger);
+  if (options.open !== false) {
+    endpoint.open();
+  }
+  return {
+    ...material,
+    id: keys.identity,
+    deviceId: keys.deviceId,
+    store,
+    transport,
+    endpoint,
+    rosters,
+    pairing,
+    messenger,
+    inbox: sink.inbox,
+    receipts: sink.receipts,
+    failStorage: sink.fail,
+    shutdown,
+  };
+}
+
+export type PeerDevice = Awaited<ReturnType<typeof peerDevice>>;
 
 export async function linkedDevice(
   port: number,
