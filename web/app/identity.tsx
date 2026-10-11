@@ -1,14 +1,12 @@
 "use client";
 
+import { type FormEvent, useEffect, useState } from "react";
+import type { Phase } from "@/lib/application.ts";
 import type { AuthState } from "@/lib/auth.ts";
-import type { Client } from "@/lib/client.ts";
-import type { PresenceState } from "@/lib/presence.ts";
-import { useAuth } from "@/lib/useAuth.ts";
-import { type LocalState, useIdentity } from "@/lib/useIdentity.ts";
-import { usePresence } from "@/lib/usePresence.ts";
-import { useWhoami } from "@/lib/useWhoami.ts";
-import { type FormEvent, useState } from "react";
 import { isIdentity } from "@/lib/identity.ts";
+import type { PresenceState } from "@/lib/presence.ts";
+import type { Session, SessionState, WhoamiResult } from "@/lib/session.ts";
+import type { IdentityInfo } from "@/lib/useApplication.ts";
 import DevicePanel from "./devices";
 import Messages from "./messages";
 
@@ -35,11 +33,18 @@ function presenceLabel(presence: PresenceState, self: string | undefined) {
   return "Presence not established";
 }
 
-const localLabels: Record<Exclude<LocalState["status"], "ready">, string> = {
-  loading: "Loading",
-  unavailable: "Local storage unavailable",
+const phaseLabels: Record<Exclude<Phase["phase"], "ready">, string> = {
+  initializing: "Loading",
+  no_identity: "No identity on this device",
+  fatal: "",
+};
+
+const fatalLabels: Record<
+  Extract<Phase, { phase: "fatal" }>["reason"],
+  string
+> = {
+  storage_unavailable: "Local storage unavailable",
   corrupted: "Stored identity could not be restored",
-  empty: "No identity on this device",
 };
 
 function Setup({
@@ -109,83 +114,134 @@ function Reset({ onReset }: { onReset: () => void }) {
   );
 }
 
-export default function Identity({ client }: { client: Client | null }) {
-  const { local, reset, create, link } = useIdentity();
-  const session = local.status === "ready" ? local : null;
-  const self = session?.keys.identity;
-  const { state, authenticator } = useAuth(client, session);
-  const presence = usePresence(client, authenticator);
-  const { query, result } = useWhoami(client, state);
+export default function Identity({
+  phase,
+  identity,
+  session,
+  state,
+  create,
+  link,
+  reset,
+}: {
+  phase: Phase;
+  identity: IdentityInfo | null;
+  session: Session | null;
+  state: SessionState | null;
+  create: () => void;
+  link: (identity: string) => void;
+  reset: () => void;
+}) {
+  const [result, setResult] = useState<WhoamiResult | null>(null);
+  const auth: AuthState = state?.auth ?? "unauthenticated";
+  const presence: PresenceState = state?.presence ?? {
+    status: "inactive",
+    identities: [],
+  };
+  const self = identity?.identity;
   const others = presence.identities.filter((id) => id !== self);
+
+  useEffect(() => {
+    setResult(null);
+  }, [session, auth]);
+
+  const query = () => {
+    if (!session) {
+      return;
+    }
+    void session.whoami().then((value) => {
+      if (!session.disposed) {
+        setResult(value);
+      }
+    });
+  };
 
   return (
     <section>
-      {session ? (
+      {identity ? (
         <p>
-          Identity <code data-identity>{session.keys.identity}</code>{" "}
-          <span data-origin={session.created ? "created" : "restored"}>
-            {session.created
-              ? session.keys.root
-                ? "New identity"
-                : "New linked device"
+          Identity <code data-identity>{identity.identity}</code>{" "}
+          <span data-origin={identity.created ? "created" : "restored"}>
+            {identity.created
+              ? identity.linked
+                ? "New linked device"
+                : "New identity"
               : "Restored identity"}
           </span>{" "}
-          Device <code data-device-id>{session.keys.deviceId}</code>
+          Device <code data-device-id>{identity.deviceId}</code>
         </p>
       ) : (
-        <p data-local={local.status}>
-          {localLabels[local.status as keyof typeof localLabels]}
+        <p data-local={phase.phase === "fatal" ? phase.reason : phase.phase}>
+          {phase.phase === "fatal"
+            ? fatalLabels[phase.reason]
+            : phase.phase !== "ready" && phaseLabels[phase.phase]}
         </p>
       )}
-      {local.status === "empty" && <Setup onCreate={create} onLink={link} />}
-      {session && (
+      {phase.phase === "no_identity" && (
+        <Setup onCreate={create} onLink={link} />
+      )}
+      {identity && (
         <DevicePanel
-          client={client}
-          devices={session.devices}
-          identity={session.keys.identity}
-          deviceId={session.keys.deviceId}
+          admin={session?.admin ?? null}
+          devices={identity.devices}
+          identity={identity.identity}
+          deviceId={identity.deviceId}
         />
       )}
-      {(session || local.status === "corrupted") && <Reset onReset={reset} />}
-      <p data-auth={state}>{labels[state]}</p>
-      <button
-        type="button"
-        onClick={query}
-        disabled={state !== "authenticated"}
-      >
-        Who am I
-      </button>
-      {result && (
-        <output data-whoami>
-          {result.ok
-            ? `Server identity ${result.identity}`
-            : result.required
-              ? "Authentication required"
-              : "Request failed"}
-        </output>
+      {(identity ||
+        (phase.phase === "fatal" && phase.reason === "corrupted")) && (
+        <Reset onReset={reset} />
       )}
-      {state === "authenticated" && (
+      {identity && (
         <>
-          <p data-presence={presence.status}>{presenceLabel(presence, self)}</p>
-          {presence.status === "active" &&
-            (others.length === 0 ? (
-              <p data-others="0">No other identities present</p>
-            ) : (
-              <ul data-others={others.length}>
-                {others.map((id) => (
-                  <li key={id}>
-                    <code>{id}</code>
-                  </li>
+          <p data-auth={auth}>{labels[auth]}</p>
+          {state?.kind === "websocket" && (
+            <button
+              type="button"
+              onClick={query}
+              disabled={auth !== "authenticated"}
+            >
+              Who am I
+            </button>
+          )}
+          {result && (
+            <output data-whoami>
+              {result.ok
+                ? `Server identity ${result.identity}`
+                : result.required
+                  ? "Authentication required"
+                  : "Request failed"}
+            </output>
+          )}
+          {auth === "authenticated" && state?.kind === "websocket" && (
+            <>
+              <p data-presence={presence.status}>
+                {presenceLabel(presence, self)}
+              </p>
+              {presence.status === "active" &&
+                (others.length === 0 ? (
+                  <p data-others="0">No other identities present</p>
+                ) : (
+                  <ul data-others={others.length}>
+                    {others.map((id) => (
+                      <li key={id}>
+                        <code>{id}</code>
+                      </li>
+                    ))}
+                  </ul>
                 ))}
-              </ul>
-            ))}
+            </>
+          )}
+          {state?.peer && (
+            <p data-peer={state.peer.identity}>
+              Directly linked to <code>{state.peer.identity}</code>{" "}
+              {state.authorization?.basis === "confirmed"
+                ? "with a device list last confirmed by the server"
+                : "with a device list the server has not confirmed; revocations this device has not received cannot be detected"}
+            </p>
+          )}
         </>
       )}
-      <Messages
-        client={client}
-        authenticator={authenticator}
-        session={session}
-      />
+      <Messages session={session} state={state} />
     </section>
   );
 }

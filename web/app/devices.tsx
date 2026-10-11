@@ -1,7 +1,6 @@
 "use client";
 
 import { type FormEvent, useEffect, useState } from "react";
-import type { Client } from "@/lib/client.ts";
 import {
   type DeviceEntry,
   type Roster,
@@ -11,6 +10,7 @@ import {
 } from "@/lib/device.ts";
 import type { AuthorizeResult, Devices } from "@/lib/devices.ts";
 import type { Fingerprint } from "@/lib/fingerprint.ts";
+import type { DeviceAdmin } from "@/lib/session.ts";
 
 type Failure = Extract<AuthorizeResult, { ok: false }>["reason"];
 
@@ -133,12 +133,10 @@ function LinkCode({
 }
 
 function Authorize({
-  client,
-  devices,
+  admin,
   identity,
 }: {
-  client: Client;
-  devices: Devices;
+  admin: DeviceAdmin;
   identity: string;
 }) {
   const [code, setCode] = useState("");
@@ -159,7 +157,7 @@ function Authorize({
   };
 
   const confirm = async () => {
-    const result = await devices.authorize(client, code);
+    const result = await admin.authorize(code);
     setDevice(null);
     setCode("");
     setNotice(result.ok ? "Device authorized" : failures[result.reason]);
@@ -191,12 +189,12 @@ function Authorize({
 }
 
 export default function DevicePanel({
-  client,
+  admin,
   devices,
   identity,
   deviceId,
 }: {
-  client: Client | null;
+  admin: DeviceAdmin | null;
   devices: Devices;
   identity: string;
   deviceId: string;
@@ -217,10 +215,10 @@ export default function DevicePanel({
     return <LinkCode devices={devices} identity={identity} />;
   }
   const revoke = (id: string) => async () => {
-    if (!client) {
+    if (!admin) {
       return;
     }
-    const result = await devices.revoke(client, id);
+    const result = await admin.revoke(id);
     setNotice(result.ok ? "Device revoked" : failures[result.reason]);
   };
   return (
@@ -244,15 +242,16 @@ export default function DevicePanel({
             device={device}
             current={device.id === deviceId}
             onRevoke={
-              devices.canManage && client && device.id !== deviceId
-                ? revoke(device.id)
-                : null
+              admin && device.id !== deviceId ? revoke(device.id) : null
             }
           />
         ))}
       </ul>
-      {devices.canManage && client && (
-        <Authorize client={client} devices={devices} identity={identity} />
+      {admin && <Authorize admin={admin} identity={identity} />}
+      {devices.canManage && !admin && (
+        <p data-device-admin="unavailable">
+          Managing devices requires the Internet transport
+        </p>
       )}
       {notice && <output data-device-notice>{notice}</output>}
     </div>

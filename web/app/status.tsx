@@ -1,20 +1,20 @@
 "use client";
 
-import type {
-  TransportError,
-  TransportKind,
-  TransportState,
-} from "@/lib/transport.ts";
-import { useClient } from "@/lib/useClient.ts";
-import { usePing } from "@/lib/usePing.ts";
-import Identity from "./identity";
+import { useEffect, useState } from "react";
+import type { Availability, Connection } from "@/lib/application.ts";
+import type { PingResult, Session, SessionState } from "@/lib/session.ts";
+import type { TransportError, TransportKind } from "@/lib/transport.ts";
 
-const labels: Record<TransportState, string> = {
-  disconnected: "Disconnected",
+const connectionLabels: Record<Connection["status"], string> = {
+  unavailable: "Not available on this device",
   connecting: "Connecting",
-  connected: "Connected",
   reconnecting: "Reconnecting",
-  error: "Not connected",
+  disconnected: "Not connected",
+  authenticating: "Connected, authenticating",
+  authenticated: "Connected and authenticated",
+  rejected: "Connected, but authentication failed",
+  pending: "Connected, waiting for this device to be authorized",
+  revoked: "This device is no longer authorized",
 };
 
 const errors: Record<TransportError, string> = {
@@ -31,40 +31,82 @@ const transports: { kind: TransportKind; label: string }[] = [
   { kind: "local", label: "Local link" },
 ];
 
-export default function Status({ url }: { url: string | undefined }) {
-  const { state, error, kind, client, select } = useClient(url);
-  const { ping, result } = usePing(client);
+export default function Status({
+  kind,
+  availability,
+  session,
+  state,
+  select,
+}: {
+  kind: TransportKind;
+  availability: Record<TransportKind, Availability>;
+  session: Session | null;
+  state: SessionState | null;
+  select: (kind: TransportKind) => void;
+}) {
+  const [result, setResult] = useState<PingResult | null>(null);
+
+  useEffect(() => {
+    setResult(null);
+  }, [session]);
+
+  const ping = () => {
+    if (!session) {
+      return;
+    }
+    void session.ping().then((value) => {
+      if (!session.disposed) {
+        setResult(value);
+      }
+    });
+  };
 
   return (
-    <>
-      <section>
-        <div role="group" aria-label="Transport" data-transport={kind}>
-          {transports.map((t) => (
+    <section>
+      <div role="group" aria-label="Transport" data-transport={kind}>
+        {transports.map((t) => (
+          <button
+            key={t.kind}
+            type="button"
+            aria-pressed={kind === t.kind}
+            data-availability={availability[t.kind]}
+            disabled={!session}
+            onClick={() => select(t.kind)}
+          >
+            {t.label}
+            {availability[t.kind] === "unavailable" &&
+              " (not available on this device)"}
+          </button>
+        ))}
+      </div>
+      {state && (
+        <>
+          <p
+            role="status"
+            data-transport-state={state.transport}
+            data-connection={state.connection.status}
+          >
+            {connectionLabels[state.connection.status]}
+          </p>
+          {state.error && (
+            <p data-transport-error={state.error}>{errors[state.error]}</p>
+          )}
+          {kind === "websocket" && (
             <button
-              key={t.kind}
               type="button"
-              aria-pressed={kind === t.kind}
-              disabled={!client}
-              onClick={() => select(t.kind)}
+              onClick={ping}
+              disabled={state.transport !== "connected"}
             >
-              {t.label}
+              Ping
             </button>
-          ))}
-        </div>
-        <p role="status" data-transport-state={state}>
-          {labels[state]}
-        </p>
-        {error && <p data-transport-error={error}>{errors[error]}</p>}
-        <button type="button" onClick={ping} disabled={state !== "connected"}>
-          Ping
-        </button>
-        {result && (
-          <output>
-            {result.ok ? `Round trip ${result.roundTrip} ms` : "Ping failed"}
-          </output>
-        )}
-      </section>
-      <Identity client={client} />
-    </>
+          )}
+          {result && (
+            <output>
+              {result.ok ? `Round trip ${result.roundTrip} ms` : "Ping failed"}
+            </output>
+          )}
+        </>
+      )}
+    </section>
   );
 }

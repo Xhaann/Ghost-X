@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { encodeBase64Url } from "./base64.ts";
-import { signRoster } from "./device.ts";
+import { deriveDeviceId, signRoster } from "./device.ts";
+import { ExchangeKey } from "./encryption.ts";
+import { IdentityKey } from "./identity.ts";
 import type { Link, LinkConnection } from "./local.ts";
 import { pairAddress } from "./pairs.ts";
 import {
@@ -12,6 +14,7 @@ import {
   parseHandshakeFrame,
   parseSessionFrame,
   peerProofMessage,
+  peerTranscript,
 } from "./peer.ts";
 import { createMessageId, minMessageSize } from "./protocol.ts";
 import { generateRatchetKey } from "./ratchet.ts";
@@ -571,6 +574,80 @@ test("a substituted key share or a mismatched identity never authenticates", asy
     },
   });
   await failed(mismatch, "unauthorized");
+});
+
+test("a reflected proof never authenticates a roster that copies the verifier's device key", async () => {
+  const target = await victim();
+  const { attacker, hello: own } = await attack(target);
+  const entry = own.roster.devices.find((d) => d.id === own.device);
+  assert.ok(entry);
+  const root = await IdentityKey.generate();
+  const exchange = await ExchangeKey.generate();
+  const id = await deriveDeviceId(root.identity, entry.signing);
+  assert.ok(id);
+  const roster = await signRoster(root, 1, [
+    { id, signing: entry.signing, exchange: exchange.publicKey },
+  ]);
+  assert.ok(roster, "a roster may list any public signing key");
+  const share = await generateRatchetKey();
+  const hello: PeerHello = {
+    version: 1,
+    nonce: encodeBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+    share: encodeBase64Url(share.publicKey),
+    identity: root.identity,
+    device: id,
+    roster,
+  };
+  attacker.send({ type: "hello", payload: hello });
+  await until(() => attacker.frames.length >= 2, "victim proof");
+  const reflected = parseHandshakeFrame(attacker.frames[1]);
+  assert.ok(reflected?.type === "proof");
+  const transcript = peerTranscript("local", hello, own);
+  assert.ok(transcript);
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", transcript),
+  );
+  const peerKey = await crypto.subtle.importKey(
+    "raw",
+    Buffer.from(own.share, "base64url"),
+    { name: "X25519" },
+    false,
+    [],
+  );
+  const secret = await crypto.subtle.deriveBits(
+    { name: "X25519", public: peerKey },
+    share.privateKey,
+    256,
+  );
+  const material = await crypto.subtle.importKey("raw", secret, "HKDF", false, [
+    "deriveKey",
+  ]);
+  const position =
+    Buffer.compare(
+      Buffer.from(hello.nonce, "base64url"),
+      Buffer.from(own.nonce, "base64url"),
+    ) < 0
+      ? 0
+      : 1;
+  const context = new TextEncoder().encode("ghostx/peer/keys/v1\0");
+  const info = new Uint8Array(context.length + 2);
+  info.set(context);
+  info.set([1, position], context.length);
+  const confirmKey = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: digest, info },
+    material,
+    { name: "HMAC", hash: "SHA-256", length: 256 },
+    false,
+    ["sign"],
+  );
+  const confirm = encodeBase64Url(
+    new Uint8Array(await crypto.subtle.sign("HMAC", confirmKey, digest)),
+  );
+  attacker.send({
+    type: "proof",
+    payload: { signature: reflected.payload.signature, confirm },
+  });
+  await failed(target, "signature");
 });
 
 test("a recorded handshake replayed on a new connection is rejected", async () => {

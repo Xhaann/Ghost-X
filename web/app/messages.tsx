@@ -1,17 +1,14 @@
 "use client";
 
 import { type FormEvent, useState } from "react";
-import type { Authenticator } from "@/lib/auth.ts";
-import type { Client } from "@/lib/client.ts";
 import type {
   Conversation,
   ConversationMessage,
   DeliveryState,
 } from "@/lib/conversations.ts";
 import { bodySize, maxBodySize } from "@/lib/protocol.ts";
+import type { Session, SessionState } from "@/lib/session.ts";
 import type { TrustState, TrustView } from "@/lib/trust.ts";
-import { useConversations } from "@/lib/useConversations.ts";
-import type { LocalSession } from "@/lib/useIdentity.ts";
 
 const pairingLabels: Record<string, string> = {
   pending: "Asynchronous session pending until this identity responds",
@@ -170,39 +167,32 @@ function ConversationList({
 }
 
 export default function Messages({
-  client,
-  authenticator,
   session,
+  state: current,
 }: {
-  client: Client | null;
-  authenticator: Authenticator | null;
-  session: LocalSession | null;
+  session: Session | null;
+  state: SessionState | null;
 }) {
-  const {
-    state,
-    rejected,
-    open,
-    close,
-    send,
-    verification,
-    trustOf,
-    verify,
-    pairing,
-    locked,
-  } = useConversations(client, authenticator, session);
   const [recipient, setRecipient] = useState("");
   const [body, setBody] = useState("");
   const [pending, setPending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
+  if (!session || !current) {
+    return null;
+  }
+
+  const state = current.conversations;
   const active = state.conversations.find(
     (conversation) => conversation.identity === state.active,
   );
   const tooLarge = bodySize(body) > maxBodySize;
+  const trustOf = (identity: string): TrustState =>
+    current.changed.includes(identity) ? "changed" : session.trustOf(identity);
 
   const start = (event: FormEvent) => {
     event.preventDefault();
-    setNotice(open(recipient.trim()) ? null : "Invalid identity");
+    setNotice(session.open(recipient.trim()) ? null : "Invalid identity");
     setRecipient("");
   };
 
@@ -211,7 +201,7 @@ export default function Messages({
     if (pending) {
       return;
     }
-    const attempt = send(body);
+    const attempt = session.send(body);
     if (!attempt.accepted) {
       setNotice(rejections[attempt.reason]);
       return;
@@ -223,11 +213,15 @@ export default function Messages({
     setPending(false);
   };
 
-  if (!session || !authenticator) {
-    return null;
+  if (current.messaging === "unavailable") {
+    return (
+      <p data-messaging="unavailable">
+        Encrypted messaging could not start on this device
+      </p>
+    );
   }
 
-  if (locked) {
+  if (current.messaging === "locked") {
     return (
       <p data-locked>
         Messaging is open in another tab of this browser. Close it to use
@@ -251,14 +245,14 @@ export default function Messages({
       <ConversationList
         conversations={state.conversations}
         active={state.active}
-        onOpen={(identity) => open(identity)}
+        onOpen={(identity) => session.open(identity)}
         trustOf={trustOf}
       />
-      {rejected > 0 && (
-        <p data-rejected={rejected}>
-          {rejected === 1
+      {current.rejected > 0 && (
+        <p data-rejected={current.rejected}>
+          {current.rejected === 1
             ? "1 stored message could not be restored"
-            : `${rejected} stored messages could not be restored`}
+            : `${current.rejected} stored messages could not be restored`}
         </p>
       )}
       {notice && <output data-notice>{notice}</output>}
@@ -268,17 +262,19 @@ export default function Messages({
             Conversation with <code>{active.identity}</code>
           </p>
           <p data-encryption>End-to-end encrypted to this identity</p>
-          {pairing && pairing !== "none" && (
-            <p data-pairing={pairing}>{pairingLabels[pairing]}</p>
+          {current.pairing && current.pairing !== "none" && (
+            <p data-pairing={current.pairing}>
+              {pairingLabels[current.pairing]}
+            </p>
           )}
-          {verification && (
+          {current.verification && (
             <Verification
-              key={verification.identity}
-              view={verification}
-              onVerify={verify}
+              key={current.verification.identity}
+              view={current.verification}
+              onVerify={(value) => session.verify(value)}
             />
           )}
-          <button type="button" onClick={close}>
+          <button type="button" onClick={() => session.close()}>
             Close conversation
           </button>
           {active.messages.length === 0 ? (

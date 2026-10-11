@@ -42,6 +42,7 @@ import { Trust } from "./trust.ts";
 import { Devices } from "./devices.ts";
 import { ServerRelay } from "./relay.ts";
 import { Rosters } from "./rosters.ts";
+import type { LocalSession } from "./useIdentity.ts";
 import { type Unlocked, createVault, linkVault, loadVault } from "./vault.ts";
 
 const NativeWebSocket = globalThis.WebSocket;
@@ -725,6 +726,30 @@ async function openDevice(store: MemoryStore, link?: string) {
     history,
     devices,
     outbox,
+  };
+}
+
+export async function localSession(
+  options: { store?: MemoryStore; root?: string } = {},
+): Promise<LocalSession & { store: MemoryStore }> {
+  const store = options.store ?? memoryStore();
+  const material = await openDevice(store, options.root);
+  const { keys, devices, history, trust, prekeys, pairs, outbox, vault } =
+    material;
+  track({
+    close: () =>
+      void Promise.all([history.close(), trust.close(), pairs.close()]),
+  });
+  return {
+    keys,
+    devices,
+    history,
+    trust,
+    prekeys,
+    pairs,
+    outbox,
+    created: vault.created,
+    store,
   };
 }
 
