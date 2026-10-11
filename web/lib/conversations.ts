@@ -14,7 +14,13 @@ import {
 } from "./protocol.ts";
 
 export type DeliveryState =
-  "sending" | "queued" | "delivered" | "expired" | "unavailable" | "failed";
+  | "sending"
+  | "pending"
+  | "queued"
+  | "delivered"
+  | "expired"
+  | "unavailable"
+  | "failed";
 
 type MessageBase = {
   id: string;
@@ -68,9 +74,10 @@ const ranks: Record<DeliveryState, number> = {
   sending: 0,
   failed: 1,
   unavailable: 1,
-  queued: 2,
-  expired: 3,
-  delivered: 4,
+  pending: 2,
+  queued: 3,
+  expired: 4,
+  delivered: 5,
 };
 
 export function advances(from: DeliveryState, to: DeliveryState): boolean {
@@ -115,7 +122,7 @@ const empty: ConversationsState = {
 
 function deliveryOf(result: SendResult): SettledDelivery {
   if (result.ok) {
-    return "queued";
+    return result.devices > 0 ? "queued" : "pending";
   }
   return result.reason === "recipient_unavailable" ? "unavailable" : "failed";
 }
@@ -275,6 +282,13 @@ export class Conversations implements Receiver {
     if (this.#detach) {
       this.#receive({ ...message, body: null, sequence: ++this.#sequence });
     }
+  }
+
+  async relayed(message: { to: string; id: string }): Promise<boolean> {
+    this.#settle(this.#generation, message.to, message.id, "queued");
+    return this.#history
+      ? this.#history.settle(message.to, message.id, "queued")
+      : true;
   }
 
   async settle(receipt: Receipt): Promise<boolean> {

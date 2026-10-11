@@ -394,6 +394,33 @@ test("an expiry receipt marks a queued message not delivered", async () => {
   assert.equal(message.delivery, "expired");
 });
 
+test("a message held only on this device is pending until a relay accepts it", async () => {
+  const { store, source, b } = await setup();
+  store.open(b);
+  const held = accepted(store, "held locally");
+  const partial = accepted(store, "partly relayed");
+  source.sent[0].resolve({ ok: true, devices: 0, pending: 1 });
+  source.sent[1].resolve({ ok: true, devices: 1, pending: 1 });
+  assert.equal(await held.delivery, "pending");
+  assert.equal(await partial.delivery, "queued");
+  const delivery = () =>
+    (conversation(store, b)?.messages ?? []).map((m) =>
+      m.direction === "sent" ? m.delivery : "received",
+    );
+  assert.deepEqual(delivery(), ["pending", "queued"]);
+  assert.ok(await source.receiver?.relayed?.({ to: b, id: held.id }));
+  assert.deepEqual(delivery(), ["queued", "queued"]);
+  await source.receipt({
+    to: b,
+    device: DEVICE,
+    id: held.id,
+    status: "delivered",
+  });
+  assert.deepEqual(delivery(), ["delivered", "queued"]);
+  assert.ok(await source.receiver?.relayed?.({ to: b, id: held.id }));
+  assert.deepEqual(delivery(), ["delivered", "queued"], "never regresses");
+});
+
 test("maps other failures to failed without touching other messages", async () => {
   const { store, source, b, c } = await setup();
   store.open(c);

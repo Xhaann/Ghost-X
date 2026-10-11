@@ -41,6 +41,7 @@ export interface Receiver {
   accept(message: { from: string; id: string; body: string }): Promise<boolean>;
   reject(message: { from: string; id: string }): void;
   settle(receipt: Receipt): Promise<boolean>;
+  relayed?(message: { to: string; id: string }): Promise<boolean>;
 }
 
 export const maxDeferred = 64;
@@ -300,6 +301,9 @@ export class Messenger {
         code === "stale_devices"
       ) {
         await this.#outbox.remove([pending]);
+        if (code !== "stale_devices") {
+          await this.#receiver?.relayed?.({ to: peer, id: pending.id });
+        }
       } else if (
         code === "invalid_payload" ||
         code === "recipient_unavailable" ||

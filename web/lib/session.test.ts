@@ -9,6 +9,7 @@ import {
   localSession,
   openSockets,
   peerCarrier,
+  secureDevice,
   sleep,
   startServer,
   track,
@@ -370,18 +371,51 @@ test("a pairing result for a previous conversation never overwrites the current 
   await startServer(port);
   const url = `ws://127.0.0.1:${port}/ws`;
   const a = started({ kind: "websocket", local: await localSession(), url });
-  const bLocal = await localSession();
-  const b = started({ kind: "websocket", local: bLocal, url });
+  const b = await secureDevice(port);
   await until(ready(a), "a ready");
-  await until(ready(b), "b ready");
   const stranger = encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)));
   assert.ok(a.open(stranger));
-  assert.ok(a.open(bLocal.keys.identity));
+  assert.ok(a.open(b.id));
   await until(
     () => a.state.pairing === "established" || a.state.pairing === "pending",
     "pairing for the current conversation",
   );
   await sleep(300);
   assert.notEqual(a.state.pairing, "unavailable");
-  assert.equal(a.state.conversations.active, bLocal.keys.identity);
+  assert.equal(a.state.conversations.active, b.id);
+});
+
+test("a message held locally is pending, then queued once relayed, then delivered", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const url = `ws://127.0.0.1:${port}/ws`;
+  const bLocal = await localSession();
+  const first = started({ kind: "websocket", local: bLocal, url });
+  await until(ready(first), "recipient published its keys");
+  first.dispose();
+  const a = started({ kind: "websocket", local: await localSession(), url });
+  await until(ready(a), "sender ready");
+  const seen: string[] = [];
+  a.onState((state) => {
+    const message = state.conversations.conversations
+      .find((c) => c.identity === bLocal.keys.identity)
+      ?.messages.find((m) => m.direction === "sent");
+    if (message?.direction === "sent" && seen.at(-1) !== message.delivery) {
+      seen.push(message.delivery);
+    }
+  });
+  assert.ok(a.open(bLocal.keys.identity));
+  const attempt = a.send("while the recipient is away");
+  assert.ok(attempt.accepted);
+  assert.equal(await attempt.delivery, "pending");
+  const back = started({ kind: "websocket", local: bLocal, url });
+  await until(ready(back), "recipient back");
+  await until(() => seen.at(-1) === "delivered", "delivered");
+  assert.deepEqual(seen, ["sending", "pending", "queued", "delivered"]);
+  assert.ok(
+    bodies(
+      back.state,
+      a.state.conversations.conversations[0].messages[0].from,
+    ).includes("while the recipient is away"),
+  );
 });

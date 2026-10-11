@@ -36,6 +36,7 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 const context = encoder.encode("ghostx/history/v2\0");
 const legacyContext = encoder.encode("ghostx/history/v1\0");
 const deliveries: readonly SettledDelivery[] = [
+  "pending",
   "queued",
   "delivered",
   "expired",
