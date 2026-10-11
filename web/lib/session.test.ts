@@ -18,8 +18,6 @@ import {
 
 useServer();
 
-const unlocked = () => Promise.resolve(() => {});
-
 async function until(predicate: () => boolean, what: string): Promise<void> {
   const deadline = Date.now() + 8000;
   while (!predicate()) {
@@ -31,7 +29,7 @@ async function until(predicate: () => boolean, what: string): Promise<void> {
 }
 
 function started(options: SessionOptions): Session {
-  const session = new Session({ lock: unlocked, ...options });
+  const session = new Session(options);
   track({ close: () => session.dispose() });
   session.start();
   return session;
@@ -279,42 +277,33 @@ test("local sessions on a real carrier authenticate each other directly and exch
   assert.equal(a.state.peer, null);
 });
 
-test("a session disposed while waiting for the device lock never starts messaging", async () => {
+test("messaging reports starting until history is restored and a disposed session never starts it", async () => {
   const local = await localSession();
-  let grant: ((unlock: () => void) => void) | null = null;
-  let released = 0;
-  const session = new Session({
-    kind: "local",
-    local,
-    link: null,
-    lockNotice: 50,
-    lock: () =>
-      new Promise((resolve) => {
-        grant = resolve;
-      }),
-  });
+  const restore = local.history.restore.bind(local.history);
+  let finish: (() => void) | null = null;
+  local.history.restore = () =>
+    new Promise((resolve) => {
+      finish = () => void restore().then(resolve);
+    });
+  const session = new Session({ kind: "local", local, link: null });
   const states: SessionState[] = [];
   session.onState((state) => states.push(state));
   session.start();
-  await until(() => session.state.messaging === "locked", "locked notice");
+  assert.equal(session.state.messaging, "starting");
+  assert.equal(session.open(local.keys.identity), false);
   session.dispose();
   const count = states.length;
-  grant!(() => {
-    released += 1;
-  });
+  finish!();
   await sleep(100);
-  assert.equal(released, 1, "a late lock is released immediately");
   assert.equal(states.length, count, "no state after dispose");
+  assert.equal(session.state.messaging, "starting");
   assert.equal(session.open(local.keys.identity), false);
 
-  const refused = started({
-    kind: "local",
-    local,
-    link: null,
-    lock: () => Promise.reject(new Error("unsupported")),
-  });
-  await until(() => refused.state.messaging === "unavailable", "no locks");
-  refused.dispose();
+  const failing = await localSession();
+  failing.history.restore = () => Promise.reject(new Error("unreadable"));
+  const broken = started({ kind: "local", local: failing, link: null });
+  await until(() => broken.state.messaging === "unavailable", "failure");
+  assert.deepEqual(broken.state.conversations.conversations, []);
 });
 
 test("a revoked device and a replaced identity are reflected without stale state", async () => {

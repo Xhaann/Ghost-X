@@ -38,7 +38,24 @@ export function phaseView(phase: Phase): View | null {
         tone: "progress",
         symbol: "…",
       };
+    case "waiting":
+      return {
+        label: "Ghost X is open in another tab",
+        detail:
+          "Only one tab at a time can use this device's keys. This tab has not loaded them and will take over automatically when the other tab closes.",
+        tone: "warning",
+        symbol: "○",
+      };
     case "fatal":
+      if (phase.reason === "unsupported") {
+        return {
+          label: "This browser is not supported",
+          detail:
+            "Ghost X needs the Web Locks API to make sure only one tab uses your keys at a time. Use a current version of Chrome, Edge, Firefox or Safari.",
+          tone: "danger",
+          symbol: "!",
+        };
+      }
       return phase.reason === "storage_unavailable"
         ? {
             label: "Secure storage is unavailable",

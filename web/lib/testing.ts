@@ -42,7 +42,7 @@ import { Trust } from "./trust.ts";
 import { Devices } from "./devices.ts";
 import { ServerRelay } from "./relay.ts";
 import { Rosters } from "./rosters.ts";
-import type { LocalSession } from "./useIdentity.ts";
+import type { LocalSession } from "./owner.ts";
 import { type Unlocked, createVault, linkVault, loadVault } from "./vault.ts";
 
 const NativeWebSocket = globalThis.WebSocket;

@@ -404,10 +404,10 @@ export default function Messages({
     }
   }, [active]);
 
-  if (!session || !state || !conversations) {
+  if (!session || !state || !conversations || state.messaging === "starting") {
     return (
       <Notice tone="progress" symbol="…">
-        <p>Starting secure messaging…</p>
+        <p data-messaging="starting">Starting secure messaging…</p>
       </Notice>
     );
   }
@@ -416,20 +416,8 @@ export default function Messages({
     return (
       <Notice tone="danger" symbol="!" urgent>
         <p data-messaging="unavailable">
-          Encrypted messaging could not start on this device. Its message keys
-          could not be loaded, or this browser cannot limit messaging to one
-          tab.
-        </p>
-      </Notice>
-    );
-  }
-
-  if (state.messaging === "locked") {
-    return (
-      <Notice tone="warning" symbol="○">
-        <p data-locked>
-          Messaging is open in another tab of this browser. Close it to use
-          messaging here.
+          Encrypted messaging could not start on this device because its message
+          keys or history could not be loaded.
         </p>
       </Notice>
     );

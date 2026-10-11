@@ -9,7 +9,6 @@ import {
 import type { AuthorizeResult } from "./devices.ts";
 import { Listeners } from "./listeners.ts";
 import { type Link, LocalTransport } from "./local.ts";
-import { requestDeviceLock } from "./lock.ts";
 import { Messenger } from "./messenger.ts";
 import type { PairState } from "./pairs.ts";
 import { type InitiateResult, Pairing } from "./pairing.ts";
@@ -29,9 +28,9 @@ import type {
   TransportState,
 } from "./transport.ts";
 import type { TrustState, TrustView } from "./trust.ts";
-import type { LocalSession } from "./useIdentity.ts";
+import type { LocalSession } from "./owner.ts";
 
-export type Messaging = "starting" | "ready" | "locked" | "unavailable";
+export type Messaging = "starting" | "ready" | "unavailable";
 
 export type PairingState = PairState | InitiateResult;
 
@@ -67,8 +66,6 @@ export type SessionOptions = {
   local: LocalSession;
   url?: string;
   link?: Link | null;
-  lock?: (signal: AbortSignal) => Promise<() => void>;
-  lockNotice?: number;
 };
 
 type AuthSource = {
@@ -95,8 +92,6 @@ export class Session {
   readonly #presence: Presence | null;
   readonly #pairing: Pairing | null;
   readonly #messenger: Messenger | null;
-  readonly #lock: (signal: AbortSignal) => Promise<() => void>;
-  readonly #lockNotice: number;
   readonly #states = new Listeners<SessionState>();
   readonly #releases: (() => void)[] = [];
   #conversations: Conversations | null = null;
@@ -113,17 +108,12 @@ export class Session {
   #state: SessionState;
   #started = false;
   #disposed = false;
-  #abort: AbortController | null = null;
-  #unlock: (() => void) | null = null;
-  #notice: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: SessionOptions) {
     const { local } = options;
     const { keys, devices, trust, prekeys, pairs, outbox } = local;
     this.kind = options.kind;
     this.#local = local;
-    this.#lock = options.lock ?? requestDeviceLock;
-    this.#lockNotice = options.lockNotice ?? 500;
     let relay: Relay;
     if (options.kind === "websocket") {
       this.#transport = new WebSocketTransport(options.url ?? "");
@@ -236,12 +226,6 @@ export class Session {
     }
     this.#disposed = true;
     this.#focus += 1;
-    this.#abort?.abort();
-    this.#abort = null;
-    if (this.#notice) {
-      clearTimeout(this.#notice);
-      this.#notice = null;
-    }
     this.#conversations?.stop();
     this.#pairing?.stop();
     this.#messenger?.stop();
@@ -250,8 +234,6 @@ export class Session {
     this.#endpoint?.close();
     this.#client?.close();
     this.#releases.splice(0).forEach((release) => release());
-    this.#unlock?.();
-    this.#unlock = null;
   }
 
   open(identity: string): boolean {
@@ -329,28 +311,9 @@ export class Session {
       this.#messaging = "unavailable";
       return;
     }
-    const controller = new AbortController();
-    this.#abort = controller;
-    this.#notice = setTimeout(() => {
-      this.#notice = null;
-      if (this.#messaging === "starting") {
-        this.#messaging = "locked";
-        this.#publish();
-      }
-    }, this.#lockNotice);
-    this.#lock(controller.signal)
-      .then(async (unlock) => {
-        if (this.#disposed) {
-          unlock();
-          return;
-        }
-        this.#unlock = unlock;
-        if (this.#notice) {
-          clearTimeout(this.#notice);
-          this.#notice = null;
-        }
-        const { keys, history } = this.#local;
-        const { restored, rejected } = await history.restore();
+    const { keys, history } = this.#local;
+    history.restore().then(
+      ({ restored, rejected }) => {
         if (this.#disposed) {
           return;
         }
@@ -366,18 +329,14 @@ export class Session {
         conversations.start();
         this.#messaging = "ready";
         this.#publish();
-      })
-      .catch(() => {
-        if (this.#disposed) {
-          return;
+      },
+      () => {
+        if (!this.#disposed) {
+          this.#messaging = "unavailable";
+          this.#publish();
         }
-        if (this.#notice) {
-          clearTimeout(this.#notice);
-          this.#notice = null;
-        }
-        this.#messaging = controller.signal.aborted ? "locked" : "unavailable";
-        this.#publish();
-      });
+      },
+    );
   }
 
   #observeFocus(state: ConversationsState): void {

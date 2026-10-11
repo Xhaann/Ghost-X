@@ -25,11 +25,21 @@ export type Capabilities = {
 };
 
 export type LocalStatus =
-  "loading" | "unavailable" | "corrupted" | "empty" | "ready";
+  | "loading"
+  | "waiting"
+  | "unsupported"
+  | "unavailable"
+  | "corrupted"
+  | "empty"
+  | "ready";
 
 export type Phase =
   | { phase: "initializing" }
-  | { phase: "fatal"; reason: "storage_unavailable" | "corrupted" }
+  | { phase: "waiting" }
+  | {
+      phase: "fatal";
+      reason: "storage_unavailable" | "corrupted" | "unsupported";
+    }
   | { phase: "no_identity" }
   | { phase: "ready" };
 
@@ -79,6 +89,10 @@ export function phaseOf(status: LocalStatus): Phase {
   switch (status) {
     case "loading":
       return { phase: "initializing" };
+    case "waiting":
+      return { phase: "waiting" };
+    case "unsupported":
+      return { phase: "fatal", reason: "unsupported" };
     case "unavailable":
       return { phase: "fatal", reason: "storage_unavailable" };
     case "corrupted":

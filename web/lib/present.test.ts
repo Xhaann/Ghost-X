@@ -85,6 +85,8 @@ function everyView(): View[] {
     phaseView({ phase: "initializing" })!,
     phaseView({ phase: "fatal", reason: "storage_unavailable" })!,
     phaseView({ phase: "fatal", reason: "corrupted" })!,
+    phaseView({ phase: "waiting" })!,
+    phaseView({ phase: "fatal", reason: "unsupported" })!,
   ];
 }
 
@@ -280,4 +282,18 @@ test("conversation previews are bounded and honest about undecryptable messages"
   const long = "x".repeat(5000);
   assert.equal(conversationPreview(received(long)), "x".repeat(60));
   assert.equal(conversationPreview({ ...sent, body: long }).length, 65);
+});
+
+test("a tab waiting for the device is told it has not loaded keys and is never shown as ready", () => {
+  const waiting = phaseView({ phase: "waiting" })!;
+  assert.equal(waiting.tone, "warning");
+  assert.match(waiting.label, /another tab/);
+  assert.match(waiting.detail, /has not loaded/);
+  assert.match(waiting.detail, /automatically/);
+  const unsupported = phaseView({ phase: "fatal", reason: "unsupported" })!;
+  assert.equal(unsupported.tone, "danger");
+  assert.match(unsupported.detail, /only one tab/);
+  for (const view of [waiting, unsupported]) {
+    assert.doesNotMatch(view.label, /ready|connected/i);
+  }
 });
