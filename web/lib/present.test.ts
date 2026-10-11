@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Connection } from "./application.ts";
 import { encodeBase64Url } from "./base64.ts";
-import type { DeliveryState } from "./conversations.ts";
+import type { ConversationMessage, DeliveryState } from "./conversations.ts";
 import {
   type View,
   authorizationView,
   composerState,
   connectionView,
+  conversationPreview,
+  conversationTrust,
   deliveryView,
   groupDigits,
   linkError,
@@ -243,4 +245,39 @@ test("composer limits, rejections, identifiers and fingerprints are presented sa
   assert.equal(phaseView({ phase: "ready" }), null);
   assert.equal(pairingView("none"), null);
   assert.equal(pairingView(null), null);
+});
+
+test("the conversation list labels trust in text and never as verified unless it is", () => {
+  for (const state of trusts) {
+    const label = conversationTrust(state);
+    if (state === "verified" || state === "changed") {
+      assert.deepEqual(label, trustView(state));
+      assert.ok(label && label.label && label.symbol);
+    } else {
+      assert.equal(label, null);
+    }
+  }
+  assert.equal(conversationTrust("unavailable")?.label, undefined);
+  assert.equal(conversationTrust("changed")?.label, "Identity changed");
+});
+
+test("conversation previews are bounded and honest about undecryptable messages", () => {
+  const base = { id: "m", from: "a", to: "b", sequence: 1 };
+  const received = (body: string | null): ConversationMessage => ({
+    ...base,
+    direction: "received",
+    body,
+  });
+  const sent: ConversationMessage = {
+    ...base,
+    direction: "sent",
+    body: "hello",
+    delivery: "queued",
+  };
+  assert.equal(conversationPreview(undefined), "No messages yet");
+  assert.equal(conversationPreview(received(null)), "Could not be decrypted");
+  assert.equal(conversationPreview(sent), "You: hello");
+  const long = "x".repeat(5000);
+  assert.equal(conversationPreview(received(long)), "x".repeat(60));
+  assert.equal(conversationPreview({ ...sent, body: long }).length, 65);
 });

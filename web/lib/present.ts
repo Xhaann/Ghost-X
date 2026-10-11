@@ -1,5 +1,9 @@
 import type { Availability, Connection, Phase } from "./application.ts";
-import type { DeliveryState, SendAttempt } from "./conversations.ts";
+import type {
+  ConversationMessage,
+  DeliveryState,
+  SendAttempt,
+} from "./conversations.ts";
 import { isIdentity } from "./identity.ts";
 import type { PeerAuthorization } from "./peer.ts";
 import type { PresenceState } from "./presence.ts";
@@ -243,6 +247,23 @@ const trustViews: Record<TrustState, View> = {
 
 export function trustView(state: TrustState): View {
   return trustViews[state];
+}
+
+export function conversationTrust(state: TrustState): View | null {
+  return state === "verified" || state === "changed" ? trustViews[state] : null;
+}
+
+export function conversationPreview(
+  message: ConversationMessage | undefined,
+): string {
+  if (!message) {
+    return "No messages yet";
+  }
+  if (message.body === null) {
+    return "Could not be decrypted";
+  }
+  const text = message.body.slice(0, 60);
+  return message.direction === "sent" ? `You: ${text}` : text;
 }
 
 const deliveryViews: Record<DeliveryState, View> = {

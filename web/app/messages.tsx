@@ -12,6 +12,8 @@ import {
   type Section,
   composerState,
   connectionView,
+  conversationPreview,
+  conversationTrust,
   deliveryView,
   pairingView,
   presenceOf,
@@ -157,17 +159,6 @@ function MessageItem({ message }: { message: ConversationMessage }) {
   );
 }
 
-function preview(message: ConversationMessage | undefined): string {
-  if (!message) {
-    return "No messages yet";
-  }
-  if (message.body === null) {
-    return "Could not be decrypted";
-  }
-  const text = message.body.slice(0, 60);
-  return message.direction === "sent" ? `You: ${text}` : text;
-}
-
 function ConversationButton({
   conversation,
   active,
@@ -179,34 +170,40 @@ function ConversationButton({
   trust: TrustState;
   onOpen: () => void;
 }) {
+  const label = conversationTrust(trust);
   return (
     <button
       type="button"
       className="conversation"
       data-conversation={conversation.identity}
       aria-current={active ? "true" : undefined}
-      aria-label={`Conversation with ${conversation.identity}${
-        conversation.unread > 0 ? `, ${conversation.unread} unread` : ""
-      }${trust === "changed" ? ", identity changed" : ""}`}
       onClick={onOpen}
     >
       <span className="row between">
-        <code>{shortIdentifier(conversation.identity)}</code>
+        <span>
+          <span className="visually-hidden">Conversation with </span>
+          <code>{shortIdentifier(conversation.identity)}</code>
+        </span>
         {conversation.unread > 0 && (
           <span className="nav-count" data-unread={conversation.unread}>
             {conversation.unread}
+            <span className="visually-hidden"> unread</span>
           </span>
         )}
       </span>
-      <span className="row small">
-        {trust === "changed" ? (
-          <span className="tone-danger" data-changed>
-            ! Identity changed
+      <span className="conversation-summary small">
+        {label && (
+          <span
+            className={`conversation-trust tone-${label.tone}`}
+            data-changed={trust === "changed" ? "" : undefined}
+          >
+            <span aria-hidden="true">{label.symbol} </span>
+            {label.label}
           </span>
-        ) : trust === "verified" ? (
-          <span className="tone-success">✓ Verified</span>
-        ) : null}
-        <span className="muted">{preview(conversation.messages.at(-1))}</span>
+        )}
+        <span className="conversation-preview muted">
+          {conversationPreview(conversation.messages.at(-1))}
+        </span>
       </span>
     </button>
   );

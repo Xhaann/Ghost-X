@@ -4,7 +4,7 @@
   --surface: #ffffff;
   --surface-muted: #eef0f3;
   --border: #d5d9e0;
-  --border-strong: #aab1bc;
+  --border-strong: #7f8794;
   --text: #15181d;
   --text-muted: #4f5764;
   --accent: #2350c4;
@@ -47,7 +47,7 @@
     --surface: #171a20;
     --surface-muted: #1f232b;
     --border: #2d323c;
-    --border-strong: #4a5160;
+    --border-strong: #6b7384;
     --text: #e8ebef;
     --text-muted: #a7afba;
     --accent: #8db0ff;
@@ -538,7 +538,12 @@ button.choice:hover:not(:disabled) {
 
 .messages {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-4);
+}
+
+.messages-list {
+  min-width: 0;
 }
 
 .conversation-list {
@@ -561,6 +566,24 @@ button.choice:hover:not(:disabled) {
   font: inherit;
   text-align: left;
   cursor: pointer;
+}
+
+.conversation-summary {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.conversation-trust {
+  flex: none;
+}
+
+.conversation-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .conversation:hover {
