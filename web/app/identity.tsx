@@ -1,247 +1,172 @@
 "use client";
 
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useState } from "react";
 import type { Phase } from "@/lib/application.ts";
-import type { AuthState } from "@/lib/auth.ts";
-import { isIdentity } from "@/lib/identity.ts";
-import type { PresenceState } from "@/lib/presence.ts";
-import type { Session, SessionState, WhoamiResult } from "@/lib/session.ts";
+import { linkError, phaseView } from "@/lib/present.ts";
 import type { IdentityInfo } from "@/lib/useApplication.ts";
-import DevicePanel from "./devices";
-import Messages from "./messages";
-
-const labels: Record<AuthState, string> = {
-  unauthenticated: "Unauthenticated",
-  authenticating: "Authenticating",
-  authenticated: "Authenticated",
-  failed: "Authentication failed",
-  pending: "Waiting for this device to be authorized",
-  revoked: "This device is no longer authorized",
-};
-
-function presenceLabel(presence: PresenceState, self: string | undefined) {
-  if (presence.status === "pending") {
-    return "Establishing presence";
-  }
-  if (
-    presence.status === "active" &&
-    self &&
-    presence.identities.includes(self)
-  ) {
-    return "Present";
-  }
-  return "Presence not established";
-}
-
-const phaseLabels: Record<Exclude<Phase["phase"], "ready">, string> = {
-  initializing: "Loading",
-  no_identity: "No identity on this device",
-  fatal: "",
-};
-
-const fatalLabels: Record<
-  Extract<Phase, { phase: "fatal" }>["reason"],
-  string
-> = {
-  storage_unavailable: "Local storage unavailable",
-  corrupted: "Stored identity could not be restored",
-};
+import { Confirm, Field, Identifier, ViewNotice } from "./ui";
 
 function Setup({
-  onCreate,
-  onLink,
+  create,
+  link,
 }: {
-  onCreate: () => void;
-  onLink: (identity: string) => void;
+  create: () => void;
+  link: (identity: string) => void;
 }) {
   const [identity, setIdentity] = useState("");
-  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const value = identity.trim();
-    if (!isIdentity(value)) {
-      setNotice("Invalid identity");
-      return;
+    const problem = linkError(identity);
+    setError(problem);
+    if (!problem) {
+      setBusy(true);
+      link(identity.trim());
     }
-    onLink(value);
   };
+
   return (
-    <div data-setup>
-      <button type="button" onClick={onCreate}>
-        Create a new identity
-      </button>
-      <form onSubmit={submit}>
-        <label>
-          Link this device to an existing identity{" "}
-          <input
-            aria-label="Identity to link"
-            value={identity}
-            onChange={(event) => setIdentity(event.target.value)}
-          />
-        </label>{" "}
-        <button type="submit">Link device</button>
-      </form>
-      {notice && <output>{notice}</output>}
+    <div className="stack" data-local="no_identity">
+      <div className="stack-small">
+        <h2>Set up this device</h2>
+        <p className="muted prose">
+          Ghost X identities are cryptographic keys created and kept on your
+          device. There is no account, password or recovery service: if this
+          device&apos;s data is lost, so is this identity.
+        </p>
+      </div>
+      <div className="choices choices-2">
+        <section className="choice" aria-labelledby="create-title">
+          <h3 id="create-title" className="choice-title">
+            New identity
+          </h3>
+          <p className="muted small">
+            Create a fresh identity. This device becomes the one that can
+            authorize your other devices.
+          </p>
+          <button
+            type="button"
+            className="button button-primary"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              create();
+            }}
+          >
+            Create a new identity
+          </button>
+        </section>
+        <section className="choice" aria-labelledby="link-title">
+          <h3 id="link-title" className="choice-title">
+            Add to an existing identity
+          </h3>
+          <form className="stack-small" onSubmit={submit} noValidate>
+            <Field
+              label="Identity to join"
+              hint="Copy it from the Connection section on the device that created the identity."
+              error={error}
+            >
+              {(props) => (
+                <input
+                  {...props}
+                  className="input mono"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={identity}
+                  onChange={(event) => setIdentity(event.target.value)}
+                />
+              )}
+            </Field>
+            <button type="submit" className="button" disabled={busy}>
+              Link this device
+            </button>
+          </form>
+        </section>
+      </div>
     </div>
   );
 }
 
-function Reset({ onReset }: { onReset: () => void }) {
-  const [confirming, setConfirming] = useState(false);
-  if (!confirming) {
-    return (
-      <button type="button" onClick={() => setConfirming(true)}>
-        Reset local data
-      </button>
-    );
-  }
-  return (
-    <p data-reset>
-      Delete this identity, its keys, and its message history from this browser?{" "}
-      <button
-        type="button"
-        onClick={() => {
-          setConfirming(false);
-          onReset();
-        }}
-      >
-        Delete
-      </button>{" "}
-      <button type="button" onClick={() => setConfirming(false)}>
-        Cancel
-      </button>
-    </p>
-  );
-}
-
-export default function Identity({
+export function Onboarding({
   phase,
-  identity,
-  session,
-  state,
   create,
   link,
   reset,
 }: {
   phase: Phase;
-  identity: IdentityInfo | null;
-  session: Session | null;
-  state: SessionState | null;
   create: () => void;
   link: (identity: string) => void;
   reset: () => void;
 }) {
-  const [result, setResult] = useState<WhoamiResult | null>(null);
-  const auth: AuthState = state?.auth ?? "unauthenticated";
-  const presence: PresenceState = state?.presence ?? {
-    status: "inactive",
-    identities: [],
-  };
-  const self = identity?.identity;
-  const others = presence.identities.filter((id) => id !== self);
-
-  useEffect(() => {
-    setResult(null);
-  }, [session, auth]);
-
-  const query = () => {
-    if (!session) {
-      return;
-    }
-    void session.whoami().then((value) => {
-      if (!session.disposed) {
-        setResult(value);
-      }
-    });
-  };
-
+  const view = phaseView(phase);
   return (
-    <section>
-      {identity ? (
-        <p>
-          Identity <code data-identity>{identity.identity}</code>{" "}
-          <span data-origin={identity.created ? "created" : "restored"}>
-            {identity.created
-              ? identity.linked
-                ? "New linked device"
-                : "New identity"
-              : "Restored identity"}
-          </span>{" "}
-          Device <code data-device-id>{identity.deviceId}</code>
-        </p>
+    <div className="onboarding stack">
+      {phase.phase === "no_identity" ? (
+        <Setup create={create} link={link} />
       ) : (
-        <p data-local={phase.phase === "fatal" ? phase.reason : phase.phase}>
-          {phase.phase === "fatal"
-            ? fatalLabels[phase.reason]
-            : phase.phase !== "ready" && phaseLabels[phase.phase]}
+        view && (
+          <div
+            className="stack"
+            data-local={phase.phase === "fatal" ? phase.reason : phase.phase}
+          >
+            <ViewNotice view={view} urgent={phase.phase === "fatal"} />
+            {phase.phase === "fatal" && phase.reason === "corrupted" && (
+              <Confirm
+                action="Reset local data"
+                question="Delete the unreadable identity and its history from this browser? This cannot be undone."
+                confirm="Delete local data"
+                onConfirm={reset}
+              />
+            )}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+export function IdentityCard({
+  identity,
+  reset,
+}: {
+  identity: IdentityInfo;
+  reset: () => void;
+}) {
+  return (
+    <section className="panel stack" aria-labelledby="identity-title">
+      <div className="stack-small">
+        <h2 id="identity-title">This identity</h2>
+        <p
+          className="muted small"
+          data-origin={identity.created ? "created" : "restored"}
+        >
+          {identity.linked
+            ? "This device is linked to the identity below."
+            : "This device created the identity below and can manage its devices."}
         </p>
-      )}
-      {phase.phase === "no_identity" && (
-        <Setup onCreate={create} onLink={link} />
-      )}
-      {identity && (
-        <DevicePanel
-          admin={session?.admin ?? null}
-          devices={identity.devices}
-          identity={identity.identity}
-          deviceId={identity.deviceId}
-        />
-      )}
-      {(identity ||
-        (phase.phase === "fatal" && phase.reason === "corrupted")) && (
-        <Reset onReset={reset} />
-      )}
-      {identity && (
-        <>
-          <p data-auth={auth}>{labels[auth]}</p>
-          {state?.kind === "websocket" && (
-            <button
-              type="button"
-              onClick={query}
-              disabled={auth !== "authenticated"}
-            >
-              Who am I
-            </button>
-          )}
-          {result && (
-            <output data-whoami>
-              {result.ok
-                ? `Server identity ${result.identity}`
-                : result.required
-                  ? "Authentication required"
-                  : "Request failed"}
-            </output>
-          )}
-          {auth === "authenticated" && state?.kind === "websocket" && (
-            <>
-              <p data-presence={presence.status}>
-                {presenceLabel(presence, self)}
-              </p>
-              {presence.status === "active" &&
-                (others.length === 0 ? (
-                  <p data-others="0">No other identities present</p>
-                ) : (
-                  <ul data-others={others.length}>
-                    {others.map((id) => (
-                      <li key={id}>
-                        <code>{id}</code>
-                      </li>
-                    ))}
-                  </ul>
-                ))}
-            </>
-          )}
-          {state?.peer && (
-            <p data-peer={state.peer.identity}>
-              Directly linked to <code>{state.peer.identity}</code>{" "}
-              {state.authorization?.basis === "confirmed"
-                ? "with a device list last confirmed by the server"
-                : "with a device list the server has not confirmed; revocations this device has not received cannot be detected"}
-            </p>
-          )}
-        </>
-      )}
-      <Messages session={session} state={state} />
+      </div>
+      <div className="stack-small" data-identity-panel>
+        <span className="field-label">Identity</span>
+        <Identifier value={identity.identity} label="Identity" />
+        <p className="small muted prose">
+          Share this with people who want to message you. It is public; your
+          private keys never leave this device.
+        </p>
+      </div>
+      <div className="stack-small">
+        <span className="field-label">This device</span>
+        <code className="identifier" data-device-id>
+          {identity.deviceId}
+        </code>
+      </div>
+      <Confirm
+        action="Reset local data"
+        question="Delete this identity, its keys and its message history from this browser? Other devices keep their copies. This cannot be undone."
+        confirm="Delete local data"
+        onConfirm={reset}
+      />
     </section>
   );
 }
