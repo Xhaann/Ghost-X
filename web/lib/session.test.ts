@@ -42,6 +42,19 @@ function ready(session: Session): () => boolean {
     session.state.conversations.connected;
 }
 
+function acknowledged(socket: WebSocket, type: string): () => boolean {
+  let seen = false;
+  socket.addEventListener("message", (event) => {
+    if (
+      typeof event.data === "string" &&
+      (JSON.parse(event.data) as { type?: unknown }).type === type
+    ) {
+      seen = true;
+    }
+  });
+  return () => seen;
+}
+
 function bodies(state: SessionState, peer: string): (string | null)[] {
   return (
     state.conversations.conversations
@@ -380,7 +393,9 @@ test("a message held locally is pending, then queued once relayed, then delivere
   const url = `ws://127.0.0.1:${port}/ws`;
   const bLocal = await localSession();
   const first = started({ kind: "websocket", local: bLocal, url });
-  await until(ready(first), "recipient published its keys");
+  const published = acknowledged(created.at(-1)!, "prekeys");
+  await until(ready(first), "recipient ready");
+  await until(published, "recipient published its keys");
   first.dispose();
   const a = started({ kind: "websocket", local: await localSession(), url });
   await until(ready(a), "sender ready");

@@ -533,13 +533,19 @@ test("identity spoofing, forged signatures and wrong carrier bindings fail close
   await failed(unconfirmed, "integrity");
 });
 
-test("a substituted key share or a mismatched identity never authenticates", async () => {
+async function substitution(
+  verifier: "dialer" | "listener" | null = null,
+): Promise<{ a: PeerDevice; b: PeerDevice }> {
   const carrier = await peerCarrier();
-  const b = await peerDevice(carrier.listen);
+  const b = await peerDevice(carrier.listen, { open: false });
   const substitute = await generateRatchetKey();
+  const proof = (frame: string) => (JSON.parse(frame) as Json).type === "proof";
   const a = await peerDevice(
     intercept(carrier.dial, {
       out: (frame, i) => {
+        if (verifier === "dialer" && proof(frame)) {
+          return [];
+        }
         if (i !== 0) {
           return [frame];
         }
@@ -554,11 +560,53 @@ test("a substituted key share or a mismatched identity never authenticates", asy
           }),
         ];
       },
+      in: (frame) => (verifier === "listener" && proof(frame) ? [] : [frame]),
     }),
+    { open: false },
   );
-  await until(() => b.endpoint.state === "failed", "substitution detected");
-  assert.equal(b.endpoint.failure, "signature");
-  assert.notEqual(a.endpoint.state, "authenticated");
+  const histories = new Map([a, b].map((d) => [d, [d.endpoint.state]]));
+  for (const [d, history] of histories) {
+    d.endpoint.onState((state) => history.push(state));
+  }
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(
+    () =>
+      [a, b].some((d) => d.endpoint.state === "failed") &&
+      [a, b].every((d) => d.endpoint.state !== "authenticating"),
+    "substitution detected",
+  );
+  for (const [d, history] of histories) {
+    assert.ok(!history.includes("authenticated"), history.join(" > "));
+    const detected = history.indexOf("failed");
+    if (detected === -1) {
+      assert.equal(d.endpoint.state, "unauthenticated");
+      assert.equal(d.endpoint.failure, null);
+    } else {
+      assert.ok(
+        history.slice(detected).every((state) => state === "failed"),
+        history.join(" > "),
+      );
+      assert.equal(d.endpoint.failure, "signature");
+    }
+  }
+  return { a, b };
+}
+
+test("a substituted key share is detected by the dialer when only it can verify a proof", async () => {
+  const { a, b } = await substitution("dialer");
+  assert.equal(a.endpoint.state, "failed");
+  assert.equal(b.endpoint.state, "unauthenticated");
+});
+
+test("a substituted key share is detected by the listener when only it can verify a proof", async () => {
+  const { a, b } = await substitution("listener");
+  assert.equal(a.endpoint.state, "unauthenticated");
+  assert.equal(b.endpoint.state, "failed");
+});
+
+test("a substituted key share or a mismatched identity never authenticates", async () => {
+  await substitution();
 
   const stranger = await peerDevice(null, { open: false });
   const claimed = await peerDevice(null, { open: false });
