@@ -355,7 +355,7 @@ export default function DevicePanel({
   };
 
   return (
-    <div className="stack">
+    <div className="columns">
       <section
         className="panel stack"
         data-device-status="authorized"

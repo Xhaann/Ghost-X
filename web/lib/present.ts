@@ -140,6 +140,31 @@ export function connectionView(connection: Connection): View {
   return connectionViews[connection.status];
 }
 
+const waiting = "Your history is available, but sending waits for a connection.";
+
+const connectionImpacts: Record<
+  Exclude<Connection["status"], "authenticated">,
+  string
+> = {
+  unavailable:
+    "Your history is available, but messages cannot be sent until you select a transport that works on this device.",
+  connecting: waiting,
+  reconnecting: waiting,
+  disconnected: waiting,
+  authenticating: waiting,
+  rejected:
+    "Your history is available, but messages cannot be sent until this device is accepted.",
+  pending:
+    "Your history is available, but this device cannot send messages until it is authorized.",
+  revoked: "This device can no longer send or receive messages.",
+};
+
+export function connectionImpact(connection: Connection): string | null {
+  return connection.status === "authenticated"
+    ? null
+    : connectionImpacts[connection.status];
+}
+
 const transportErrors: Record<TransportError, string> = {
   unavailable: "This transport is not available on this device.",
   failed: "The connection could not be opened.",

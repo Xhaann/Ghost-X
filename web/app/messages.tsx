@@ -11,6 +11,7 @@ import type { Conversation, ConversationMessage } from "@/lib/conversations.ts";
 import {
   type Section,
   composerState,
+  connectionImpact,
   connectionView,
   conversationPreview,
   conversationTrust,
@@ -433,23 +434,25 @@ export default function Messages({
   };
 
   return (
-    <div className="stack">
+    <div className="workspace">
       {!connected && state.messaging === "ready" && (
-        <Notice tone={connection.tone} symbol={connection.symbol}>
-          <p>
-            {connection.label}. {connection.detail} Your history is available,
-            but sending waits for a connection.
-          </p>
-          <div>
+        <div className="banner" data-banner={state.connection.status}>
+          <Notice tone={connection.tone} symbol={connection.symbol} silent>
+            <div className="banner-text">
+              <strong>{connection.label}</strong>
+              <p>
+                {connection.detail} {connectionImpact(state.connection)}
+              </p>
+            </div>
             <button
               type="button"
-              className="button"
+              className="button button-small"
               onClick={() => goTo("connection")}
             >
               Open connection settings
             </button>
-          </div>
-        </Notice>
+          </Notice>
+        </div>
       )}
       {state.rejected > 0 && (
         <Notice tone="warning" symbol="!">
@@ -462,15 +465,17 @@ export default function Messages({
       )}
       <div className="messages" data-view={active ? "thread" : "list"}>
         <section
-          className="messages-list panel stack"
+          className="messages-list panel"
           aria-labelledby="conversations-title"
         >
-          <h2 id="conversations-title" ref={listHeading} tabIndex={-1}>
-            Conversations
-          </h2>
-          <NewConversation session={session} self={self} />
+          <div className="messages-list-header">
+            <h2 id="conversations-title" ref={listHeading} tabIndex={-1}>
+              Conversations
+            </h2>
+            <NewConversation session={session} self={self} />
+          </div>
           {conversations.conversations.length === 0 ? (
-            <p className="muted small" data-conversations="0">
+            <p className="muted small empty-hint" data-conversations="0">
               No conversations yet. Open one with someone&apos;s identity above.
             </p>
           ) : (
@@ -505,14 +510,16 @@ export default function Messages({
               ← Back to conversations
             </button>
             <div className="thread-header">
-              <h2 id="thread-title">
-                <span className="visually-hidden">Conversation with </span>
-                <code>{shortIdentifier(active.identity)}</code>
-              </h2>
-              <details>
-                <summary>Full identity</summary>
-                <code className="identifier">{active.identity}</code>
-              </details>
+              <div className="thread-title">
+                <h2 id="thread-title">
+                  <span className="visually-hidden">Conversation with </span>
+                  <code>{shortIdentifier(active.identity)}</code>
+                </h2>
+                <details>
+                  <summary>Full identity</summary>
+                  <code className="identifier">{active.identity}</code>
+                </details>
+              </div>
               <div className="row">
                 <Pill view={trustView(trust(active.identity))} />
                 {state.kind === "websocket" && (
@@ -541,9 +548,11 @@ export default function Messages({
               )}
             </div>
             {active.messages.length === 0 ? (
-              <p className="muted small" data-messages="0">
-                No messages yet.
-              </p>
+              <div className="log log-empty">
+                <p className="muted small" data-messages="0">
+                  No messages yet.
+                </p>
+              </div>
             ) : (
               <ol
                 ref={log}
@@ -566,13 +575,13 @@ export default function Messages({
             />
           </section>
         ) : (
-          conversations.conversations.length > 0 && (
-            <section className="thread panel">
-              <p className="muted" data-selection>
-                Choose a conversation to read and reply.
-              </p>
-            </section>
-          )
+          <section className="thread thread-empty panel">
+            <p className="muted" data-selection>
+              {conversations.conversations.length > 0
+                ? "Choose a conversation to read and reply."
+                : "Open a conversation with someone's identity to start messaging."}
+            </p>
+          </section>
         )}
       </div>
     </div>

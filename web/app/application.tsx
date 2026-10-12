@@ -24,16 +24,42 @@ export default function Application({ url }: { url: string | undefined }) {
       0,
     ) ?? 0;
 
+  const workspace = identity !== null && section === "messages";
+
   return (
-    <div className="shell">
+    <div className={workspace ? "shell shell-workspace" : "shell"}>
       <a className="skip" href="#main">
         Skip to content
       </a>
       <header className="topbar">
         <div className="topbar-inner">
-          <h1>Ghost X</h1>
+          <h1 className="brand">Ghost X</h1>
+          {identity && (
+            <nav className="nav" aria-label="Sections">
+              {sections.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className="nav-item"
+                  aria-current={section === item.id ? "page" : undefined}
+                  onClick={() => setSection(item.id)}
+                >
+                  {item.label}
+                  {item.id === "messages" && unread > 0 && (
+                    <span className="nav-count">
+                      {unread}
+                      <span className="visually-hidden"> unread</span>
+                    </span>
+                  )}
+                </button>
+              ))}
+            </nav>
+          )}
           {identity && app.state && (
-            <div className="row" data-connection={app.state.connection.status}>
+            <div
+              className="topbar-status"
+              data-connection={app.state.connection.status}
+            >
               <span className="small muted">
                 {app.kind === "websocket" ? "Internet" : "Local link"}
               </span>
@@ -42,29 +68,6 @@ export default function Application({ url }: { url: string | undefined }) {
           )}
         </div>
       </header>
-      {identity && (
-        <nav className="nav" aria-label="Sections">
-          <div className="nav-inner">
-            {sections.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                className="nav-item"
-                aria-current={section === item.id ? "page" : undefined}
-                onClick={() => setSection(item.id)}
-              >
-                {item.label}
-                {item.id === "messages" && unread > 0 && (
-                  <span className="nav-count">
-                    {unread}
-                    <span className="visually-hidden"> unread</span>
-                  </span>
-                )}
-              </button>
-            ))}
-          </div>
-        </nav>
-      )}
       <main id="main" className="content" tabIndex={-1}>
         {!identity ? (
           <Onboarding
@@ -89,7 +92,7 @@ export default function Application({ url }: { url: string | undefined }) {
             connection={app.state?.connection ?? null}
           />
         ) : (
-          <div className="stack">
+          <div className="columns">
             <Connection
               kind={app.kind}
               availability={app.availability}

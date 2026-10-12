@@ -7,6 +7,7 @@ import {
   type View,
   authorizationView,
   composerState,
+  connectionImpact,
   connectionView,
   conversationPreview,
   conversationTrust,
@@ -152,6 +153,29 @@ test("connection views separate connecting, connected and failure states", () =>
   for (const error of errors) {
     assert.ok(transportError(error).endsWith("."));
   }
+});
+
+test("connection impact only promises sending once a connection can resume it", () => {
+  assert.equal(connectionImpact({ status: "authenticated" }), null);
+  for (const connection of connections) {
+    if (connection.status === "authenticated") {
+      continue;
+    }
+    const impact = connectionImpact(connection);
+    assert.ok(impact?.endsWith("."));
+    const resumes = /waits for a connection/.test(impact ?? "");
+    assert.equal(
+      resumes,
+      ["connecting", "reconnecting", "disconnected", "authenticating"].includes(
+        connection.status,
+      ),
+      connection.status,
+    );
+  }
+  assert.doesNotMatch(
+    connectionImpact({ status: "revoked" })!,
+    /history is available/,
+  );
 });
 
 test("presence is unknown unless the server confirmed it", () => {

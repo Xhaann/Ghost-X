@@ -23,16 +23,21 @@ export function Notice({
   title,
   children,
   urgent,
+  silent,
   symbol,
 }: {
   tone: Tone;
   title?: string;
   children?: ReactNode;
   urgent?: boolean;
+  silent?: boolean;
   symbol?: string;
 }) {
   return (
-    <div className={`notice tone-${tone}`} role={urgent ? "alert" : "status"}>
+    <div
+      className={`notice tone-${tone}`}
+      role={urgent ? "alert" : silent ? undefined : "status"}
+    >
       {symbol && (
         <span className="notice-symbol" aria-hidden="true">
           {symbol}
@@ -94,7 +99,7 @@ export function Identifier({ value, label }: { value: string; label: string }) {
         {value}
       </code>
       <div className="row">
-        <button type="button" className="button button-quiet" onClick={copy}>
+        <button type="button" className="button button-small" onClick={copy}>
           Copy {label.toLowerCase()}
         </button>
         <span className="small muted" role="status">
