@@ -73,6 +73,18 @@ function authenticated(...devices: PeerDevice[]): () => boolean {
   return () => devices.every((d) => d.endpoint.state === "authenticated");
 }
 
+function disconnected(...devices: PeerDevice[]): () => boolean {
+  return () =>
+    devices.every(
+      (d) =>
+        (d.endpoint.state === "unauthenticated" ||
+          (d.endpoint.state === "failed" && d.endpoint.failure === "lost")) &&
+        d.endpoint.peer === null &&
+        d.endpoint.authorization === null &&
+        (d.transport.state === "error" || d.transport.state === "disconnected"),
+    );
+}
+
 async function linked(
   options: Parameters<typeof peerDevice>[1] = {},
   wrap: (link: Link) => Link = (link) => link,
@@ -1448,8 +1460,17 @@ test("repeated connect and disconnect cycles stay deterministic", async () => {
 
 test("a disconnect during authentication or ratchet setup leaves no session and recovers", async () => {
   let cut: (() => void) | null = null;
+  let refused = false;
   const carrier = await peerCarrier();
-  const b = await peerDevice(carrier.listen);
+  const b = await peerDevice({
+    connect: async (handlers) => {
+      const connection = await carrier.listen.connect(handlers);
+      return {
+        send: (frame) => !refused && connection.send(frame),
+        close: () => connection.close(),
+      };
+    },
+  });
   const a = await peerDevice(
     intercept(carrier.dial, {
       out: (frame, i) => {
@@ -1466,14 +1487,9 @@ test("a disconnect during authentication or ratchet setup leaves no session and 
   cut = () => carrier.drop();
   a.endpoint.open();
   await until(
-    () =>
-      cut === null &&
-      a.transport.state === "error" &&
-      b.transport.state === "error",
+    () => cut === null && disconnected(a, b)(),
     "cut during authentication",
   );
-  assert.equal(a.endpoint.state, "unauthenticated");
-  assert.equal(b.endpoint.state, "unauthenticated");
   assert.equal(a.endpoint.peer, null);
   assert.equal(b.endpoint.peer, null);
 
@@ -1490,17 +1506,38 @@ test("a disconnect during authentication or ratchet setup leaves no session and 
       "ok implies delivered",
     );
   }
-  await until(
-    () =>
-      a.endpoint.state === "unauthenticated" &&
-      b.endpoint.state === "unauthenticated",
-    "down",
-  );
+  await until(disconnected(a, b), "down");
   b.endpoint.open();
   a.endpoint.open();
   await until(authenticated(a, b), "recovered");
   assert.ok((await a.messenger.send(b.id, "after recovery")).ok);
   await until(() => bodies(b).includes("after recovery"), "delivered");
+
+  const wasRefused = refused;
+  refused = true;
+  try {
+    const refusedSend = a.messenger.send(b.id, "while b cannot write");
+    await until(disconnected(a, b), "write refused");
+    assert.equal(b.endpoint.state, "failed");
+    assert.equal(b.endpoint.failure, "lost");
+    const refusedResult = await refusedSend;
+    if (refusedResult.ok) {
+      assert.ok(
+        bodies(b).includes("while b cannot write"),
+        "ok implies delivered",
+      );
+    }
+  } finally {
+    refused = wasRefused;
+  }
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered after a refused write");
+  assert.ok((await a.messenger.send(b.id, "after a refused write")).ok);
+  await until(
+    () => bodies(b).includes("after a refused write"),
+    "delivered after a refused write",
+  );
 });
 
 test("fuzzed handshake and session frames never parse loosely or crash", async () => {
