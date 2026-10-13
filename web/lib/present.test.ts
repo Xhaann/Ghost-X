@@ -487,3 +487,25 @@ test("a tab waiting for the device is told it has not loaded keys and is never s
     assert.doesNotMatch(view.label, /ready|connected/i);
   }
 });
+
+test("restoration failures say nothing was deleted and only a confirmed integrity failure mentions resetting", () => {
+  const unavailable = phaseView({
+    phase: "fatal",
+    reason: "storage_unavailable",
+  })!;
+  assert.match(unavailable.detail, /Nothing stored on this device was changed/);
+  assert.match(unavailable.detail, /Try again/);
+  assert.doesNotMatch(
+    `${unavailable.label} ${unavailable.detail}`,
+    /reset|delet|integrity/i,
+  );
+  const corrupted = phaseView({ phase: "fatal", reason: "corrupted" })!;
+  assert.match(corrupted.detail, /integrity checks/);
+  assert.match(corrupted.detail, /Nothing has been deleted/);
+  assert.match(corrupted.detail, /Try again first/);
+  assert.match(corrupted.detail, /permanently deletes/);
+  assert.ok(
+    corrupted.detail.indexOf("Try again") <
+      corrupted.detail.indexOf("permanently deletes"),
+  );
+});

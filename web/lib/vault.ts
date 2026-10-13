@@ -112,11 +112,29 @@ function generateSecrets(): Promise<[CryptoKey, CryptoKey]> {
   ]) as Promise<[CryptoKey, CryptoKey]>;
 }
 
+async function settle<T extends readonly unknown[]>(
+  restores: { [K in keyof T]: Promise<T[K]> },
+): Promise<T> {
+  const results = await Promise.allSettled(restores);
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure) {
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        (result.value as { release(): void } | null)?.release();
+      }
+    }
+    throw failure.reason;
+  }
+  return results.map(
+    (result) => (result as PromiseFulfilledResult<unknown>).value,
+  ) as unknown as T;
+}
+
 async function unlock(
   fields: Fields,
 ): Promise<Omit<Unlocked, "created"> | null> {
   const identity = fields.identity as string;
-  const [root, device, exchange] = await Promise.all([
+  const [root, device, exchange] = await settle([
     fields.root === null
       ? Promise.resolve(null)
       : IdentityKey.restore(identity, fields.root),
@@ -147,7 +165,7 @@ async function upgrade(
   store: KeyValueStore,
   fields: Fields,
 ): Promise<Omit<Unlocked, "created"> | null> {
-  const [root, exchange] = await Promise.all([
+  const [root, exchange] = await settle([
     IdentityKey.restore(fields.identity, fields.signing),
     ExchangeKey.restore(fields.exchangeKey, fields.exchange),
   ]);

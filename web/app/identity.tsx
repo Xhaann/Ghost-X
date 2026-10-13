@@ -112,6 +112,19 @@ export function Onboarding({
             data-local={phase.phase === "fatal" ? phase.reason : phase.phase}
           >
             <ViewNotice view={view} urgent={phase.phase === "fatal"} />
+            {phase.phase === "fatal" &&
+              (phase.reason === "storage_unavailable" ||
+                phase.reason === "corrupted") && (
+                <div className="row">
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    onClick={() => window.location.reload()}
+                  >
+                    Try again
+                  </button>
+                </div>
+              )}
             {phase.phase === "fatal" && phase.reason === "corrupted" && (
               <Confirm
                 action="Reset local data"

@@ -145,35 +145,25 @@ export class ExchangeKey {
     ) {
       return null;
     }
-    try {
-      const probe = (await crypto.subtle.generateKey(exchange, false, [
-        "deriveBits",
-      ])) as CryptoKeyPair;
-      const own = await crypto.subtle.importKey(
-        "raw",
-        raw,
-        exchange,
-        false,
-        [],
-      );
-      const forward = new Uint8Array(
-        await crypto.subtle.deriveBits(
-          { name: "X25519", public: probe.publicKey },
-          privateKey,
-          256,
-        ),
-      );
-      const backward = new Uint8Array(
-        await crypto.subtle.deriveBits(
-          { name: "X25519", public: own },
-          probe.privateKey,
-          256,
-        ),
-      );
-      return same(forward, backward) ? new ExchangeKey(raw, privateKey) : null;
-    } catch {
-      return null;
-    }
+    const probe = (await crypto.subtle.generateKey(exchange, false, [
+      "deriveBits",
+    ])) as CryptoKeyPair;
+    const own = await crypto.subtle.importKey("raw", raw, exchange, false, []);
+    const forward = new Uint8Array(
+      await crypto.subtle.deriveBits(
+        { name: "X25519", public: probe.publicKey },
+        privateKey,
+        256,
+      ),
+    );
+    const backward = new Uint8Array(
+      await crypto.subtle.deriveBits(
+        { name: "X25519", public: own },
+        probe.privateKey,
+        256,
+      ),
+    );
+    return same(forward, backward) ? new ExchangeKey(raw, privateKey) : null;
   }
 
   get publicRaw(): Uint8Array<ArrayBuffer> {

@@ -49,7 +49,8 @@ export class Devices {
 
   static async open(store: KeyValueStore, keys: Keys): Promise<Devices | null> {
     const stored = await store.get("vault", rosterKey);
-    let roster = stored === undefined ? null : await verifyRoster(stored);
+    let roster =
+      stored === undefined ? null : await verifyRoster(stored, true);
     if (
       stored !== undefined &&
       (!roster || roster.identity !== keys.identity)
@@ -58,8 +59,15 @@ export class Devices {
     }
     if (!roster && keys.root) {
       roster = await signRoster(keys.root, 1, [ownEntry(keys)]);
-      if (!roster || !(await store.add("vault", rosterKey, roster))) {
-        const winner = await verifyRoster(await store.get("vault", rosterKey));
+      if (!roster) {
+        throw new Error("the device roster could not be signed");
+      }
+      if (!(await store.add("vault", rosterKey, roster))) {
+        const existing = await store.get("vault", rosterKey);
+        if (existing === undefined) {
+          throw new Error("the device roster could not be stored");
+        }
+        const winner = await verifyRoster(existing, true);
         if (!winner || winner.identity !== keys.identity) {
           return null;
         }

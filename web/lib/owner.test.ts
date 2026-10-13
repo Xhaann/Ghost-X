@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { phaseOf } from "./application.ts";
+import { IdentityKey } from "./identity.ts";
 import { deviceLockName, requestDeviceLock } from "./lock.ts";
 import { type LoadedDevice, type LocalSession, loadDevice } from "./owner.ts";
 import { pairAddress } from "./pairs.ts";
+import { createMessageId } from "./protocol.ts";
 import { Session, type SessionState } from "./session.ts";
 import {
   freePort,
@@ -267,4 +269,264 @@ test("loading fails closed without exposing keys and maps to the right phases", 
     phase: "fatal",
     reason: "storage_unavailable",
   });
+});
+
+type Subtle = "sign" | "verify" | "deriveBits" | "importKey" | "generateKey";
+
+async function failing<T>(
+  method: Subtle,
+  run: () => Promise<T>,
+  when: (args: unknown[]) => boolean = () => true,
+  times = 1,
+): Promise<{ result: T; failed: number }> {
+  const subtle = crypto.subtle as unknown as Record<
+    Subtle,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const original = subtle[method];
+  let failed = 0;
+  subtle[method] = (...args: unknown[]) => {
+    if (failed < times && when(args)) {
+      failed += 1;
+      return Promise.reject(new DOMException("temporary", "OperationError"));
+    }
+    return original.apply(crypto.subtle, args);
+  };
+  try {
+    return { result: await run(), failed };
+  } finally {
+    subtle[method] = original;
+  }
+}
+
+const rosterPrefix = new TextEncoder().encode("ghostx/roster/v1\0");
+
+const rosterCheck = (args: unknown[]) => {
+  const data = new Uint8Array(args.at(-1) as Uint8Array);
+  return rosterPrefix.every((byte, i) => data[i] === byte);
+};
+
+async function withHistory() {
+  const store = memoryStore();
+  const loaded = await loadDevice(store, { setup: { kind: "create" } });
+  const local = ready(loaded.local);
+  const peer = (await IdentityKey.generate()).identity;
+  assert.ok(
+    await local.history.received({
+      id: createMessageId(),
+      peer,
+      sequence: 1,
+      read: true,
+      body: "kept across failures",
+    }),
+  );
+  await local.history.flush();
+  const identity = local.keys.identity;
+  const deviceId = local.keys.deviceId;
+  await loaded.close();
+  return { store, identity, deviceId };
+}
+
+function contents(store: ReturnType<typeof memoryStore>) {
+  return { writes: store.writes, keys: [...store.data.keys()].sort() };
+}
+
+async function recovered(
+  store: ReturnType<typeof memoryStore>,
+  identity: string,
+  deviceId: string,
+): Promise<void> {
+  const loaded = await loadDevice(store);
+  const local = ready(loaded.local);
+  assert.equal(local.keys.identity, identity, "the same identity is restored");
+  assert.equal(local.keys.deviceId, deviceId, "the same device is restored");
+  const { restored } = await local.history.restore();
+  assert.deepEqual(
+    restored.map((m) => m.body),
+    ["kept across failures"],
+  );
+  await loaded.close();
+}
+
+test("a temporary browser error while restoring keys is unavailable, never corrupted, and changes nothing", async () => {
+  for (const method of [
+    "sign",
+    "verify",
+    "deriveBits",
+    "importKey",
+    "generateKey",
+  ] as const) {
+    const { store, identity, deviceId } = await withHistory();
+    const before = contents(store);
+    const { result, failed } = await failing(method, () => loadDevice(store));
+    assert.equal(failed, 1, `${method} was exercised`);
+    assert.deepEqual(result.local, { status: "unavailable" }, method);
+    assert.deepEqual(phaseOf(result.local.status), {
+      phase: "fatal",
+      reason: "storage_unavailable",
+    });
+    await result.close();
+    assert.deepEqual(contents(store), before, `${method} changed storage`);
+    await recovered(store, identity, deviceId);
+  }
+});
+
+test("a temporary browser error while checking the stored device roster is unavailable", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  const before = contents(store);
+  const { result, failed } = await failing(
+    "verify",
+    () => loadDevice(store),
+    rosterCheck,
+  );
+  assert.equal(failed, 1);
+  assert.deepEqual(result.local, { status: "unavailable" });
+  await result.close();
+  assert.deepEqual(contents(store), before);
+  await recovered(store, identity, deviceId);
+});
+
+test("a temporary browser error while rebuilding a missing roster is unavailable and the roster is rebuilt later", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  store.data.delete("vault:roster");
+  const before = contents(store);
+  const { result, failed } = await failing(
+    "verify",
+    () => loadDevice(store),
+    rosterCheck,
+  );
+  assert.equal(failed, 1);
+  assert.deepEqual(result.local, { status: "unavailable" });
+  await result.close();
+  assert.deepEqual(contents(store), before, "no partial roster is stored");
+  await recovered(store, identity, deviceId);
+  assert.ok(store.data.has("vault:roster"));
+});
+
+function rebuildingWith(
+  store: ReturnType<typeof memoryStore>,
+  attempt: () => Promise<boolean>,
+): () => void {
+  const add = store.add;
+  store.add = (name, key, value) =>
+    name === "vault" && key === "roster" ? attempt() : add(name, key, value);
+  return () => {
+    store.add = add;
+  };
+}
+
+test("a failed write while rebuilding a missing roster is unavailable, never corrupted", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  store.data.delete("vault:roster");
+  const before = contents(store);
+  const restore = rebuildingWith(store, async () => false);
+  const failed = await loadDevice(store);
+  restore();
+  assert.deepEqual(failed.local, { status: "unavailable" });
+  assert.deepEqual(phaseOf(failed.local.status), {
+    phase: "fatal",
+    reason: "storage_unavailable",
+  });
+  await failed.close();
+  assert.deepEqual(contents(store), before, "nothing was written");
+
+  const undo = rebuildingWith(store, async () => false);
+  const get = store.get;
+  let reads = 0;
+  store.get = async (name, key) => {
+    if (name === "vault" && key === "roster" && ++reads === 2) {
+      throw new DOMException("temporary", "UnknownError");
+    }
+    return get(name, key);
+  };
+  const throwing = await loadDevice(store);
+  undo();
+  store.get = get;
+  assert.deepEqual(throwing.local, { status: "unavailable" });
+  await throwing.close();
+
+  await recovered(store, identity, deviceId);
+  assert.ok(store.data.has("vault:roster"), "the roster is rebuilt later");
+});
+
+test("a missing roster is rebuilt on a healthy store and recovered from another tab only when valid", async () => {
+  const healthy = await withHistory();
+  healthy.store.data.delete("vault:roster");
+  await recovered(healthy.store, healthy.identity, healthy.deviceId);
+  assert.ok(healthy.store.data.has("vault:roster"));
+
+  const raced = await withHistory();
+  const theirs = raced.store.data.get("vault:roster");
+  raced.store.data.delete("vault:roster");
+  const restore = rebuildingWith(raced.store, async () => {
+    raced.store.data.set("vault:roster", structuredClone(theirs));
+    return false;
+  });
+  const won = await loadDevice(raced.store);
+  restore();
+  const local = ready(won.local);
+  assert.deepEqual(local.devices.roster, theirs);
+  await won.close();
+
+  const foreign = await withHistory();
+  const stranger = await withHistory();
+  foreign.store.data.delete("vault:roster");
+  const strangerRoster = stranger.store.data.get("vault:roster");
+  const undo = rebuildingWith(foreign.store, async () => {
+    foreign.store.data.set("vault:roster", structuredClone(strangerRoster));
+    return false;
+  });
+  const rejected = await loadDevice(foreign.store);
+  undo();
+  assert.deepEqual(rejected.local, { status: "corrupted" });
+  await rejected.close();
+});
+
+test("repeated temporary failures never replace the identity or its history", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { result } = await failing("sign", () => loadDevice(store));
+    assert.deepEqual(result.local, { status: "unavailable" });
+    await result.close();
+  }
+  await recovered(store, identity, deviceId);
+  await recovered(store, identity, deviceId);
+});
+
+test("genuine integrity failures stay corrupted and are distinct from a missing identity", async () => {
+  assert.deepEqual((await loadDevice(memoryStore())).local, {
+    status: "empty",
+  });
+
+  const substituted = await withHistory();
+  const other = await withHistory();
+  const vault = substituted.store.data.get("vault:keys") as Record<
+    string,
+    unknown
+  >;
+  const foreign = other.store.data.get("vault:keys") as Record<string, unknown>;
+  substituted.store.data.set("vault:keys", {
+    ...vault,
+    device: foreign.device,
+  });
+  const before = contents(substituted.store);
+  const swapped = await loadDevice(substituted.store);
+  assert.deepEqual(swapped.local, { status: "corrupted" });
+  assert.deepEqual(phaseOf(swapped.local.status), {
+    phase: "fatal",
+    reason: "corrupted",
+  });
+  await swapped.close();
+  assert.deepEqual(contents(substituted.store), before);
+
+  const forged = await withHistory();
+  const roster = forged.store.data.get("vault:roster") as {
+    signature: string;
+  };
+  const flipped =
+    (roster.signature[0] === "A" ? "B" : "A") + roster.signature.slice(1);
+  forged.store.data.set("vault:roster", { ...roster, signature: flipped });
+  const tampered = await loadDevice(forged.store);
+  assert.deepEqual(tampered.local, { status: "corrupted" });
+  await tampered.close();
 });

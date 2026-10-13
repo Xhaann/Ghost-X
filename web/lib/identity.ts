@@ -57,22 +57,18 @@ export class IdentityKey {
     ) {
       return null;
     }
-    try {
-      const challenge = crypto.getRandomValues(new Uint8Array(32));
-      const signature = await crypto.subtle.sign(
-        algorithm,
-        privateKey,
-        challenge,
-      );
-      const valid = await verify(
-        identity,
-        challenge,
-        encodeBase64Url(new Uint8Array(signature)),
-      );
-      return valid ? new IdentityKey(identity, privateKey) : null;
-    } catch {
-      return null;
-    }
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const signature = await crypto.subtle.sign(
+      algorithm,
+      privateKey,
+      challenge,
+    );
+    const valid = await checkSignature(
+      identity,
+      challenge,
+      encodeBase64Url(new Uint8Array(signature)),
+    );
+    return valid ? new IdentityKey(identity, privateKey) : null;
   }
 
   get released(): boolean {
@@ -93,7 +89,7 @@ export class IdentityKey {
   }
 }
 
-export async function verify(
+export async function checkSignature(
   identity: unknown,
   data: Uint8Array<ArrayBuffer>,
   signature: unknown,
@@ -103,15 +99,23 @@ export async function verify(
   if (!key || !sig) {
     return false;
   }
+  const publicKey = await crypto.subtle.importKey(
+    "raw",
+    key,
+    algorithm,
+    false,
+    ["verify"],
+  );
+  return crypto.subtle.verify(algorithm, publicKey, sig, data);
+}
+
+export async function verify(
+  identity: unknown,
+  data: Uint8Array<ArrayBuffer>,
+  signature: unknown,
+): Promise<boolean> {
   try {
-    const publicKey = await crypto.subtle.importKey(
-      "raw",
-      key,
-      algorithm,
-      false,
-      ["verify"],
-    );
-    return await crypto.subtle.verify(algorithm, publicKey, sig, data);
+    return await checkSignature(identity, data, signature);
   } catch {
     return false;
   }

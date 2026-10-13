@@ -5,7 +5,12 @@ import {
   isCanonicalExchangeKey,
   isCanonicalIdentityKey,
 } from "./fingerprint.ts";
-import { type IdentityKey, parseIdentity, verify } from "./identity.ts";
+import {
+  type IdentityKey,
+  checkSignature,
+  parseIdentity,
+  verify,
+} from "./identity.ts";
 import {
   type WireDevice,
   type WireRoster,
@@ -120,7 +125,10 @@ export function rosterMessage(
   return concat(...parts);
 }
 
-export async function verifyRoster(value: unknown): Promise<Roster | null> {
+export async function verifyRoster(
+  value: unknown,
+  strict = false,
+): Promise<Roster | null> {
   const roster = parseWireRoster(value);
   if (!roster) {
     return null;
@@ -148,7 +156,8 @@ export async function verifyRoster(value: unknown): Promise<Roster | null> {
       return null;
     }
   }
-  return (await verify(roster.identity, message, roster.signature))
+  const check = strict ? checkSignature : verify;
+  return (await check(roster.identity, message, roster.signature))
     ? roster
     : null;
 }

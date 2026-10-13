@@ -61,14 +61,14 @@ export function phaseView(phase: Phase): View | null {
         ? {
             label: "Secure storage is unavailable",
             detail:
-              "This browser is blocking the storage Ghost X needs for your keys, for example in a private window. Open Ghost X in a regular window to continue.",
+              "This browser could not open the storage or keys Ghost X needs, for example in a private window or after a temporary browser error. Nothing stored on this device was changed. Try again, or open Ghost X in a regular window.",
             tone: "danger",
             symbol: "!",
           }
         : {
             label: "Your stored identity could not be restored",
             detail:
-              "The data on this device failed its integrity checks. Resetting deletes this identity and its history from this browser.",
+              "The identity stored in this browser did not pass its integrity checks, so Ghost X has not used it. Nothing has been deleted. Try again first. Reset only if this keeps happening: resetting permanently deletes this identity and its history from this browser.",
             tone: "danger",
             symbol: "!",
           };
