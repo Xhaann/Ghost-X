@@ -130,6 +130,10 @@ test("an authoritative sync confirms the basis and a server-learned revocation i
     "revoked device rejected",
   );
   assert.equal(offline.endpoint.failure, "stale");
+  await until(
+    () => revoked.transport.state !== "connected",
+    "revoked device disconnected",
+  );
   assert.notEqual(revoked.endpoint.state, "authenticated");
   assert.deepEqual(await revoked.messenger.send(a.id, "after revocation"), {
     ok: false,

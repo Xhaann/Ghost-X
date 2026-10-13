@@ -1216,6 +1216,10 @@ test("rollback and equivocation stay rejected after restarting from persisted tr
   const rolledBack = await peerDevice(carrier.dial, { store: v1Store });
   await until(() => restarted.endpoint.state === "failed", "rollback");
   assert.equal(restarted.endpoint.failure, "stale");
+  await until(
+    () => rolledBack.transport.state !== "connected",
+    "rollback disconnected",
+  );
   assert.notEqual(rolledBack.endpoint.state, "authenticated");
   await rolledBack.shutdown();
 
