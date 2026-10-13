@@ -1,5 +1,6 @@
 import type { Availability, Connection, Phase } from "./application.ts";
 import type {
+  Conversation,
   ConversationMessage,
   DeliveryState,
   SendAttempt,
@@ -178,6 +179,47 @@ export function transportError(error: TransportError): string {
   return transportErrors[error];
 }
 
+export function connectionReason(
+  connection: Connection,
+  error: TransportError | null,
+): string | null {
+  return error &&
+    (connection.status === "connecting" ||
+      connection.status === "reconnecting" ||
+      connection.status === "disconnected")
+    ? transportErrors[error]
+    : null;
+}
+
+export type ConnectionNotice = {
+  summary: string | null;
+  details: string[];
+  lastError: string | null;
+};
+
+const progressing: readonly Connection["status"][] = [
+  "connecting",
+  "reconnecting",
+  "authenticating",
+];
+
+export function connectionNotice(
+  connection: Connection,
+  error: TransportError | null,
+): ConnectionNotice {
+  const detail = connectionView(connection).detail;
+  const reason = connectionReason(connection, error);
+  const lastError = reason ? `Last error: ${reason}` : null;
+  const blocked =
+    connection.status !== "authenticated" &&
+    !progressing.includes(connection.status);
+  const summary = blocked ? (lastError ?? detail) : null;
+  const details = [detail, connectionImpact(connection), lastError].filter(
+    (line): line is string => line !== null && line !== summary,
+  );
+  return { summary, details, lastError };
+}
+
 export function transportView(
   kind: TransportKind,
   availability: Availability,
@@ -295,6 +337,8 @@ export function conversationTrust(state: TrustState): View | null {
   return state === "verified" || state === "changed" ? trustViews[state] : null;
 }
 
+const previewLength = 60;
+
 export function conversationPreview(
   message: ConversationMessage | undefined,
 ): string {
@@ -304,8 +348,32 @@ export function conversationPreview(
   if (message.body === null) {
     return "Could not be decrypted";
   }
-  const text = message.body.slice(0, 60);
+  const text = message.body.slice(0, previewLength);
   return message.direction === "sent" ? `You: ${text}` : text;
+}
+
+function previewText(message: ConversationMessage | undefined): string | null {
+  return message && message.body !== null
+    ? message.body.slice(0, previewLength)
+    : null;
+}
+
+export function filterConversations(
+  conversations: readonly Conversation[],
+  query: string,
+): readonly Conversation[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) {
+    return conversations;
+  }
+  return conversations.filter(
+    (conversation) =>
+      conversation.identity.toLowerCase().includes(needle) ||
+      (previewText(conversation.messages.at(-1))
+        ?.toLowerCase()
+        .includes(needle) ??
+        false),
+  );
 }
 
 const deliveryViews: Record<DeliveryState, View> = {
@@ -358,6 +426,11 @@ const deliveryViews: Record<DeliveryState, View> = {
 
 export function deliveryView(state: DeliveryState): View {
   return deliveryViews[state];
+}
+
+export function deliveryExplanation(state: DeliveryState): string | null {
+  const view = deliveryViews[state];
+  return state === "pending" || view.tone === "danger" ? view.detail : null;
 }
 
 export const undecryptable: View = {

@@ -51,13 +51,22 @@ export function Notice({
   );
 }
 
-export function ViewNotice({ view, urgent }: { view: View; urgent?: boolean }) {
+export function ViewNotice({
+  view,
+  urgent,
+  silent,
+}: {
+  view: View;
+  urgent?: boolean;
+  silent?: boolean;
+}) {
   return (
     <Notice
       tone={view.tone}
       title={view.label}
       symbol={view.symbol}
       urgent={urgent}
+      silent={silent}
     >
       <p>{view.detail}</p>
     </Notice>

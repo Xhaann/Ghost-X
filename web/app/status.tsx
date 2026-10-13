@@ -96,6 +96,9 @@ export default function Connection({
 }) {
   const others =
     state?.presence.status === "active" ? state.presence.identities.length : 0;
+  const urgent =
+    state?.connection.status === "revoked" ||
+    state?.connection.status === "rejected";
 
   return (
     <section className="panel stack" aria-labelledby="transport-title">
@@ -145,10 +148,8 @@ export default function Connection({
           <div data-transport-state={state.transport}>
             <ViewNotice
               view={connectionView(state.connection)}
-              urgent={
-                state.connection.status === "revoked" ||
-                state.connection.status === "rejected"
-              }
+              urgent={urgent}
+              silent={!urgent}
             />
           </div>
           {state.error && (

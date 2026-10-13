@@ -278,11 +278,15 @@ function DeviceRow({
       data-current={current ? "true" : undefined}
     >
       <div className="row between">
-        <code>{device.id}</code>
+        <div className="device-field">
+          <span className="field-label small">Device ID</span>
+          <code>{device.id}</code>
+        </div>
         {current && <span className="pill tone-progress">This device</span>}
       </div>
       {print && (
-        <div data-device-fingerprint>
+        <div className="device-field" data-device-fingerprint>
+          <span className="field-label small">Fingerprint</span>
           <Fingerprint
             digits={print.digits}
             label={`Fingerprint of device ${device.id}`}

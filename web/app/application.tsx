@@ -33,7 +33,18 @@ export default function Application({ url }: { url: string | undefined }) {
       </a>
       <header className="topbar">
         <div className="topbar-inner">
-          <h1 className="brand">Ghost X</h1>
+          <h1 className="brand">
+            <svg
+              className="brand-mark"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <path d="M5 20V10a7 7 0 0 1 14 0v10l-2.5-2-2.25 2L12 18l-2.25 2-2.25-2Z" />
+              <path d="M9.5 10.5v1.5M14.5 10.5v1.5" />
+            </svg>
+            Ghost X
+          </h1>
           {identity && (
             <nav className="nav" aria-label="Sections">
               {sections.map((item) => (
@@ -61,6 +72,7 @@ export default function Application({ url }: { url: string | undefined }) {
               data-connection={app.state.connection.status}
             >
               <span className="small muted">
+                <span className="visually-hidden">Transport: </span>
                 {app.kind === "websocket" ? "Internet" : "Local link"}
               </span>
               <Pill view={connectionView(app.state.connection)} live />

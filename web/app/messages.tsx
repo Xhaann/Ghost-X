@@ -4,6 +4,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
   useEffect,
+  useId,
   useRef,
   useState,
 } from "react";
@@ -11,11 +12,13 @@ import type { Conversation, ConversationMessage } from "@/lib/conversations.ts";
 import {
   type Section,
   composerState,
-  connectionImpact,
+  connectionNotice,
   connectionView,
   conversationPreview,
   conversationTrust,
+  deliveryExplanation,
   deliveryView,
+  filterConversations,
   pairingView,
   presenceOf,
   reachabilityView,
@@ -56,7 +59,9 @@ function Verification({
         <ViewNotice view={trustView("changed")} urgent />
       )}
       {view.state === "unavailable" && (
-        <ViewNotice view={trustView("unavailable")} />
+        <div className="notice-compact">
+          <ViewNotice view={trustView("unavailable")} />
+        </div>
       )}
       {view.state === "changed" && view.verified && (
         <details>
@@ -132,6 +137,12 @@ function MessageItem({ message }: { message: ConversationMessage }) {
       : message.body === null
         ? undecryptable
         : null;
+  const explanation =
+    message.direction === "sent"
+      ? deliveryExplanation(message.delivery)
+      : message.body === null
+        ? undecryptable.detail
+        : null;
   return (
     <li
       className={`message message-${message.direction}`}
@@ -151,9 +162,11 @@ function MessageItem({ message }: { message: ConversationMessage }) {
         >
           <span aria-hidden="true">{view.symbol} </span>
           {view.label}
-          {view.tone === "danger" && (
-            <span className="muted">. {view.detail}</span>
-          )}
+        </span>
+      )}
+      {explanation && (
+        <span className="message-explanation" data-explanation>
+          {explanation}
         </span>
       )}
     </li>
@@ -180,8 +193,8 @@ function ConversationButton({
       aria-current={active ? "true" : undefined}
       onClick={onOpen}
     >
-      <span className="row between">
-        <span>
+      <span className="row between conversation-head">
+        <span className="conversation-identity">
           <span className="visually-hidden">Conversation with </span>
           <code>{shortIdentifier(conversation.identity)}</code>
         </span>
@@ -207,6 +220,127 @@ function ConversationButton({
         </span>
       </span>
     </button>
+  );
+}
+
+function ConversationSearch({
+  query,
+  onChange,
+  shown,
+  total,
+}: {
+  query: string;
+  onChange: (query: string) => void;
+  shown: number;
+  total: number;
+}) {
+  const input = useRef<HTMLInputElement | null>(null);
+  return (
+    <div className="search" role="search">
+      <Field
+        label="Search conversations"
+        hint="Filters the conversations on this device by identity or by the latest message preview shown."
+      >
+        {(props) => (
+          <div className="search-row">
+            <input
+              {...props}
+              ref={input}
+              type="search"
+              className="input"
+              autoComplete="off"
+              spellCheck={false}
+              value={query}
+              onChange={(event) => onChange(event.target.value)}
+            />
+            {query && (
+              <button
+                type="button"
+                className="button button-small"
+                onClick={() => {
+                  onChange("");
+                  input.current?.focus();
+                }}
+              >
+                Clear search
+              </button>
+            )}
+          </div>
+        )}
+      </Field>
+      <p className="search-count small muted" role="status">
+        {query.trim()
+          ? `${shown} of ${total} ${total === 1 ? "conversation" : "conversations"}`
+          : ""}
+      </p>
+    </div>
+  );
+}
+
+function ConnectionBanner({
+  state,
+  goTo,
+}: {
+  state: SessionState;
+  goTo: (section: Section) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const details = useId();
+  const view = connectionView(state.connection);
+  const notice = connectionNotice(state.connection, state.error);
+  const line = (text: string) =>
+    text === notice.lastError ? (
+      <p
+        key={text}
+        className="small muted"
+        data-banner-error={state.error ?? undefined}
+      >
+        {text}
+      </p>
+    ) : (
+      <p key={text} className="small">
+        {text}
+      </p>
+    );
+  return (
+    <div className="banner" data-banner={state.connection.status}>
+      <Notice tone={view.tone} symbol={view.symbol} silent>
+        <div className="banner-text">
+          <p className="banner-status">
+            <strong>{view.label}</strong>{" "}
+            <span className="muted" data-banner-transport={state.kind}>
+              <span aria-hidden="true">· </span>
+              <span className="visually-hidden">Transport: </span>
+              {state.kind === "websocket" ? "Internet" : "Local link"}
+            </span>
+          </p>
+          {notice.summary && line(notice.summary)}
+          {notice.details.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="banner-toggle"
+                aria-expanded={open}
+                aria-controls={details}
+                onClick={() => setOpen((value) => !value)}
+              >
+                {open ? "Hide connection details" : "Show connection details"}
+              </button>
+              <div id={details} className="banner-details" data-open={open}>
+                {notice.details.map(line)}
+              </div>
+            </>
+          )}
+        </div>
+        <button
+          type="button"
+          className="button button-small"
+          onClick={() => goTo("connection")}
+        >
+          Open connection settings
+        </button>
+      </Notice>
+    </div>
   );
 }
 
@@ -348,7 +482,7 @@ function Composer({
           />
         )}
       </Field>
-      <div className="row between">
+      <div className="row between composer-actions">
         <span className="small muted" aria-live="polite">
           {composer.nearLimit && !composer.tooLarge
             ? `${composer.bytes} of ${composer.max} bytes`
@@ -385,6 +519,7 @@ export default function Messages({
   const log = useRef<HTMLOListElement | null>(null);
   const listHeading = useRef<HTMLHeadingElement | null>(null);
   const returning = useRef(false);
+  const [query, setQuery] = useState("");
   const conversations = state?.conversations;
   const active = conversations?.conversations.find(
     (conversation) => conversation.identity === conversations.active,
@@ -425,34 +560,18 @@ export default function Messages({
   }
 
   const connected = conversations.connected;
-  const connection = connectionView(state.connection);
   const trust = (identity: string): TrustState =>
     state.changed.includes(identity) ? "changed" : session.trustOf(identity);
   const back = () => {
     returning.current = true;
     session.close();
   };
+  const shown = filterConversations(conversations.conversations, query);
 
   return (
     <div className="workspace">
       {!connected && state.messaging === "ready" && (
-        <div className="banner" data-banner={state.connection.status}>
-          <Notice tone={connection.tone} symbol={connection.symbol} silent>
-            <div className="banner-text">
-              <strong>{connection.label}</strong>
-              <p>
-                {connection.detail} {connectionImpact(state.connection)}
-              </p>
-            </div>
-            <button
-              type="button"
-              className="button button-small"
-              onClick={() => goTo("connection")}
-            >
-              Open connection settings
-            </button>
-          </Notice>
-        </div>
+        <ConnectionBanner state={state} goTo={goTo} />
       )}
       {state.rejected > 0 && (
         <Notice tone="warning" symbol="!">
@@ -474,16 +593,31 @@ export default function Messages({
             </h2>
             <NewConversation session={session} self={self} />
           </div>
+          {conversations.conversations.length > 0 && (
+            <ConversationSearch
+              query={query}
+              onChange={setQuery}
+              shown={shown.length}
+              total={conversations.conversations.length}
+            />
+          )}
           {conversations.conversations.length === 0 ? (
             <p className="muted small empty-hint" data-conversations="0">
               No conversations yet. Open one with someone&apos;s identity above.
+            </p>
+          ) : shown.length === 0 ? (
+            <p className="muted small empty-hint" data-search-empty>
+              No conversations match &ldquo;{query.trim()}&rdquo;. Search covers
+              identities and the latest message preview shown for each
+              conversation.
             </p>
           ) : (
             <ul
               className="conversation-list"
               data-conversations={conversations.conversations.length}
+              data-shown={shown.length}
             >
-              {conversations.conversations.map((conversation) => (
+              {shown.map((conversation) => (
                 <li key={conversation.identity}>
                   <ConversationButton
                     conversation={conversation}
@@ -520,21 +654,34 @@ export default function Messages({
                   <code className="identifier">{active.identity}</code>
                 </details>
               </div>
-              <div className="row">
-                <Pill view={trustView(trust(active.identity))} />
+              <dl className="thread-meta">
+                <div>
+                  <dt>Identity</dt>
+                  <dd>
+                    <Pill view={trustView(trust(active.identity))} />
+                  </dd>
+                </div>
                 {state.kind === "websocket" && (
-                  <Pill
-                    view={reachabilityView(
-                      presenceOf(state.presence, active.identity),
-                    )}
-                  />
+                  <div>
+                    <dt>Presence</dt>
+                    <dd>
+                      <Pill
+                        view={reachabilityView(
+                          presenceOf(state.presence, active.identity),
+                        )}
+                      />
+                    </dd>
+                  </div>
                 )}
                 {pairingView(state.pairing) && (
-                  <span data-pairing={state.pairing}>
-                    <Pill view={pairingView(state.pairing)!} />
-                  </span>
+                  <div data-pairing={state.pairing}>
+                    <dt>Session</dt>
+                    <dd>
+                      <Pill view={pairingView(state.pairing)!} />
+                    </dd>
+                  </div>
                 )}
-              </div>
+              </dl>
               <p className="small muted" data-encryption>
                 Messages are end-to-end encrypted to this identity&apos;s
                 authorized devices.

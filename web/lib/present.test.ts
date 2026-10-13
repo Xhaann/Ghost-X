@@ -2,16 +2,24 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Connection } from "./application.ts";
 import { encodeBase64Url } from "./base64.ts";
-import type { ConversationMessage, DeliveryState } from "./conversations.ts";
+import type {
+  Conversation,
+  ConversationMessage,
+  DeliveryState,
+} from "./conversations.ts";
 import {
   type View,
   authorizationView,
   composerState,
   connectionImpact,
+  connectionNotice,
+  connectionReason,
   connectionView,
   conversationPreview,
   conversationTrust,
+  deliveryExplanation,
   deliveryView,
+  filterConversations,
   groupDigits,
   linkError,
   pairingView,
@@ -178,6 +186,92 @@ test("connection impact only promises sending once a connection can resume it", 
   );
 });
 
+test("a connection reason is shown only while a transport is still trying to connect", () => {
+  const errors: TransportError[] = [
+    "unavailable",
+    "failed",
+    "lost",
+    "timeout",
+    "oversized",
+    "malformed",
+  ];
+  for (const connection of connections) {
+    assert.equal(connectionReason(connection, null), null, connection.status);
+    for (const error of errors) {
+      const reason = connectionReason(connection, error);
+      if (
+        connection.status === "connecting" ||
+        connection.status === "reconnecting" ||
+        connection.status === "disconnected"
+      ) {
+        assert.equal(reason, transportError(error), connection.status);
+      } else {
+        assert.equal(reason, null, `${connection.status} with ${error}`);
+      }
+    }
+  }
+  assert.equal(connectionReason({ status: "authenticated" }, "lost"), null);
+});
+
+test("the connection notice keeps blocking problems visible and every detail available", () => {
+  const errors: (TransportError | null)[] = [
+    null,
+    "unavailable",
+    "failed",
+    "lost",
+    "timeout",
+    "oversized",
+    "malformed",
+  ];
+  const progressing = ["connecting", "reconnecting", "authenticating"];
+  for (const connection of connections) {
+    for (const error of errors) {
+      const notice = connectionNotice(connection, error);
+      const label = `${connection.status} with ${error}`;
+      const reason = connectionReason(connection, error);
+      const expected = [
+        connectionView(connection).detail,
+        connectionImpact(connection),
+        reason ? `Last error: ${reason}` : null,
+      ].filter((line): line is string => line !== null);
+      const shown = [notice.summary, ...notice.details].filter(
+        (line): line is string => line !== null,
+      );
+      assert.deepEqual([...shown].sort(), [...expected].sort(), label);
+      assert.equal(notice.lastError, reason ? `Last error: ${reason}` : null);
+      if (
+        connection.status === "authenticated" ||
+        progressing.includes(connection.status)
+      ) {
+        assert.equal(notice.summary, null, label);
+      } else {
+        assert.equal(
+          notice.summary,
+          notice.lastError ?? connectionView(connection).detail,
+          label,
+        );
+        assert.ok(!notice.details.includes(notice.summary!), label);
+      }
+    }
+  }
+});
+
+test("delivery explanations are shown only for held and failed messages", () => {
+  const explained: DeliveryState[] = [
+    "pending",
+    "expired",
+    "unavailable",
+    "failed",
+  ];
+  for (const state of deliveries) {
+    assert.equal(
+      deliveryExplanation(state),
+      explained.includes(state) ? deliveryView(state).detail : null,
+      state,
+    );
+  }
+});
+
 test("presence is unknown unless the server confirmed it", () => {
   const identity = encodeBase64Url(new Uint8Array(32));
   assert.equal(
@@ -306,6 +400,78 @@ test("conversation previews are bounded and honest about undecryptable messages"
   const long = "x".repeat(5000);
   assert.equal(conversationPreview(received(long)), "x".repeat(60));
   assert.equal(conversationPreview({ ...sent, body: long }).length, 65);
+});
+
+function conversation(
+  identity: string,
+  last?: { direction: "sent" | "received"; body: string | null },
+): Conversation {
+  const base = { id: "m", from: "a", to: "b", sequence: 1 };
+  const messages: ConversationMessage[] = !last
+    ? []
+    : last.direction === "sent"
+      ? [
+          {
+            ...base,
+            direction: "sent",
+            body: last.body ?? "",
+            delivery: "queued",
+          },
+        ]
+      : [{ ...base, direction: "received", body: last.body }];
+  return { identity, messages, unread: 0, updated: 1 };
+}
+
+test("conversation search matches identities and the preview text shown, ignoring case", () => {
+  const alice = conversation("AliceIdentityAAAA", {
+    direction: "received",
+    body: "Lunch at noon?",
+  });
+  const bob = conversation("BobIdentityBBBBBB", {
+    direction: "sent",
+    body: "See you tomorrow",
+  });
+  const all = [alice, bob];
+  assert.deepEqual(filterConversations(all, "aliceident"), [alice]);
+  assert.deepEqual(filterConversations(all, "LUNCH"), [alice]);
+  assert.deepEqual(filterConversations(all, "  tomorrow "), [bob]);
+  assert.deepEqual(filterConversations(all, "identity"), [alice, bob]);
+  assert.deepEqual(filterConversations(all, "You:"), []);
+  assert.deepEqual(filterConversations(all, "dinner"), []);
+});
+
+test("an empty search shows every conversation without changing the list", () => {
+  const all = [
+    conversation("first", { direction: "received", body: "one" }),
+    conversation("second", { direction: "received", body: "two" }),
+  ];
+  const snapshot = structuredClone(all);
+  assert.equal(filterConversations(all, ""), all);
+  assert.equal(filterConversations(all, "   "), all);
+  filterConversations(all, "two");
+  assert.deepEqual(all, snapshot);
+});
+
+test("conversations without preview text are matched by identity only", () => {
+  const empty = conversation("EmptyIdentity");
+  const unreadable = conversation("UnreadableIdentity", {
+    direction: "received",
+    body: null,
+  });
+  const all = [empty, unreadable];
+  assert.deepEqual(filterConversations(all, "messages yet"), []);
+  assert.deepEqual(filterConversations(all, "decrypted"), []);
+  assert.deepEqual(filterConversations(all, "unreadable"), [unreadable]);
+  assert.deepEqual(filterConversations(all, "empty"), [empty]);
+});
+
+test("conversation search only matches the preview length that is shown", () => {
+  const long = conversation("LongIdentity", {
+    direction: "received",
+    body: `${"x".repeat(60)}hidden`,
+  });
+  assert.deepEqual(filterConversations([long], "xxx"), [long]);
+  assert.deepEqual(filterConversations([long], "hidden"), []);
 });
 
 test("a tab waiting for the device is told it has not loaded keys and is never shown as ready", () => {
