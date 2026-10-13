@@ -220,6 +220,31 @@ func TestRevocationSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestTheFirstRecordCreatesTheStoreDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "config", "ghostx")
+	path := filepath.Join(dir, "devices.json")
+	r, err := device.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := devicetest.NewIdentity()
+	a := id.NewDevice()
+	if err := r.Publish(id.Add(a)); err != nil {
+		t.Fatalf("first record = %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("store directory = %v %v", info, err)
+	}
+	reopened, err := device.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.Authorized(id.Identity, a.ID) {
+		t.Fatal("first record lost after restart")
+	}
+}
+
 func TestCorruptedStoreFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	for name, content := range map[string]string{

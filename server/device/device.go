@@ -493,6 +493,11 @@ func (r *Registry) append(record stored) error {
 	line = append(line, '\n')
 	_, statErr := os.Stat(r.path)
 	created := errors.Is(statErr, os.ErrNotExist)
+	if created {
+		if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
+			return err
+		}
+	}
 	f, err := os.OpenFile(r.path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
