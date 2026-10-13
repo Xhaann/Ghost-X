@@ -1322,7 +1322,7 @@ test("frames recorded in one session never validate in a later session", async (
   );
   b.endpoint.open();
   a.endpoint.open();
-  await until(() => b.endpoint.state === "authenticated", "second session");
+  await until(authenticated(a, b), "second session");
   void a.messenger.send(b.id, "second session message");
   await until(() => b.endpoint.state === "failed", "old frame rejected");
   assert.equal(b.endpoint.failure, "integrity");
