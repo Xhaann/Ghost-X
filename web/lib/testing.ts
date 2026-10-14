@@ -16,7 +16,12 @@ import {
 } from "./encryption.ts";
 import { IdentityKey, parseIdentity } from "./identity.ts";
 import type { KeyValueStore, StoreName } from "./storage.ts";
-import type { Transport, TransportKind, TransportState } from "./transport.ts";
+import {
+  type Transport,
+  type TransportKind,
+  type TransportState,
+  maxBufferedBytes,
+} from "./transport.ts";
 import { Authenticator } from "./auth.ts";
 import { Client } from "./client.ts";
 import {
@@ -152,11 +157,16 @@ export function wireFrames(chunks: Buffer[]): string[] {
   return out;
 }
 
+export type CarrierConnection = LinkConnection & {
+  readonly buffered: number;
+  readonly pressured: boolean;
+};
+
 function framed(
   socket: Socket,
   handlers: LinkHandlers,
   wire: Wire | null,
-): LinkConnection {
+): CarrierConnection {
   let buffered = Buffer.alloc(0);
   socket.on("data", (chunk) => {
     wire?.in.push(Buffer.from(chunk));
@@ -173,8 +183,14 @@ function framed(
   socket.on("error", () => {});
   socket.on("close", () => handlers.closed());
   return {
+    get buffered() {
+      return socket.writableLength;
+    },
+    get pressured() {
+      return socket.writableNeedDrain;
+    },
     send(frame) {
-      if (socket.writableNeedDrain || socket.destroyed) {
+      if (socket.destroyed || socket.writableLength > maxBufferedBytes) {
         return false;
       }
       const body = Buffer.from(frame, "utf8");

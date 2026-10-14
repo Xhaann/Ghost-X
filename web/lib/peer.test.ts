@@ -4,7 +4,7 @@ import { encodeBase64Url } from "./base64.ts";
 import { deriveDeviceId, signRoster } from "./device.ts";
 import { ExchangeKey } from "./encryption.ts";
 import { IdentityKey } from "./identity.ts";
-import type { Link, LinkConnection } from "./local.ts";
+import { type Link, type LinkConnection, LocalTransport } from "./local.ts";
 import { pairAddress } from "./pairs.ts";
 import {
   type PeerAuthorization,
@@ -20,6 +20,7 @@ import { createMessageId, minMessageSize } from "./protocol.ts";
 import { generateRatchetKey } from "./ratchet.ts";
 import type { SendOutcome } from "./relay.ts";
 import {
+  type CarrierConnection,
   type MemoryStore,
   type PeerCarrier,
   type PeerDevice,
@@ -27,10 +28,15 @@ import {
   peerCarrier,
   peerDevice,
   sleep,
+  track,
   useCleanup,
   wireFrames,
 } from "./testing.ts";
-import type { TransportKind } from "./transport.ts";
+import {
+  type TransportKind,
+  maxBufferedBytes,
+  maxFrameSize,
+} from "./transport.ts";
 
 useCleanup();
 
@@ -127,6 +133,73 @@ function intercept(link: Link, edit: { out?: Edit; in?: Edit }): Link {
       };
     },
   };
+}
+
+type Probe = {
+  connection: CarrierConnection | null;
+  closes: number;
+  closed: number;
+  closers: (() => void)[];
+  write: ((frame: string, connection: CarrierConnection) => boolean) | null;
+};
+
+function probe(): Probe {
+  return { connection: null, closes: 0, closed: 0, closers: [], write: null };
+}
+
+function probed(link: Link, target: Probe): Link {
+  return {
+    connect: async (handlers) => {
+      const closed = () => {
+        target.closed += 1;
+        handlers.closed();
+      };
+      const connection = (await link.connect({
+        frame: handlers.frame,
+        closed,
+      })) as CarrierConnection;
+      target.connection = connection;
+      target.closers.push(closed);
+      return {
+        send: (frame) =>
+          target.write
+            ? target.write(frame, connection)
+            : connection.send(frame),
+        close: () => {
+          target.closes += 1;
+          connection.close();
+        },
+      };
+    },
+  };
+}
+
+function sealed(frame: string): boolean {
+  return (JSON.parse(frame) as { type?: unknown }).type === "sealed";
+}
+
+const padding = `padding:${"x".repeat(16 * 1024)}`;
+
+function unpadded(link: Link): Link {
+  return intercept(link, {
+    in: (frame) => (frame === padding ? [] : [frame]),
+  });
+}
+
+function pressure(connection: CarrierConnection): number {
+  let padded = 0;
+  while (!connection.pressured && padded < 4096 && connection.send(padding)) {
+    padded += 1;
+  }
+  return padded;
+}
+
+function overflow(connection: CarrierConnection): number {
+  let padded = 0;
+  while (padded < 4096 && connection.send(padding)) {
+    padded += 1;
+  }
+  return padded;
 }
 
 type Raw = {
@@ -1539,6 +1612,551 @@ test("a disconnect during authentication or ratchet setup leaves no session and 
     "delivered after a refused write",
   );
 });
+
+test("the local carrier absorbs backpressure up to its buffer cap and then refuses without closing", async () => {
+  const control = probe();
+  const carrier = await peerCarrier();
+  const transport = track(
+    new LocalTransport(probed(carrier.dial, control), { timeout: 2000 }),
+  );
+  const states: string[] = [];
+  const release = transport.onState((state) => states.push(state));
+  try {
+    transport.open();
+    await until(() => transport.state === "connected", "dialed");
+    const connection = control.connection;
+    assert.ok(connection);
+    states.length = 0;
+    const body = "x".repeat(16 * 1024);
+    const buffered: number[] = [];
+    let pressured = false;
+    let accepted = 0;
+    let result = "sent";
+    while (accepted < 4096) {
+      buffered.push(connection.buffered);
+      result = transport.send(`${accepted}:${body}`);
+      if (result !== "sent") {
+        break;
+      }
+      pressured ||= connection.pressured;
+      accepted += 1;
+    }
+    assert.equal(result, "busy", "an unread socket refuses a write");
+    assert.ok(pressured, "writes were accepted while the socket needed to drain");
+    const refusedAt = buffered[accepted];
+    assert.ok(
+      buffered.slice(0, accepted).every((b) => b <= maxBufferedBytes),
+      "every accepted write started at or below the cap",
+    );
+    assert.ok(refusedAt > maxBufferedBytes, "refused only above the cap");
+    assert.ok(
+      refusedAt <= maxBufferedBytes + 4 + maxFrameSize,
+      "the cap is exceeded by at most one frame",
+    );
+    assert.equal(transport.state, "connected");
+
+    const received: string[] = [];
+    await carrier.listen.connect({
+      frame: (frame) => received.push(frame),
+      closed: () => {},
+    });
+    await until(() => received.length === accepted, "accepted frames");
+    assert.deepEqual(
+      received,
+      Array.from({ length: accepted }, (_, i) => `${i}:${body}`),
+    );
+    assert.equal(transport.send("after drain"), "sent");
+    await until(() => received.length === accepted + 1, "write after drain");
+    assert.equal(received[accepted], "after drain", "the busy frame was never written");
+    assert.deepEqual(states, []);
+    assert.equal(transport.state, "connected");
+  } finally {
+    release();
+  }
+});
+
+test("a sealed write over the buffer cap ends the peer session without skipping a frame", async () => {
+  const control = probe();
+  const carrier = await peerCarrier();
+  const b = await peerDevice(unpadded(carrier.listen));
+  const a = await peerDevice(probed(carrier.dial, control));
+  await until(authenticated(a, b), "mutual authentication");
+  assert.ok((await a.messenger.send(b.id, "before pressure")).ok);
+  await until(() => bodies(b).includes("before pressure"), "delivered");
+
+  type Refusal = {
+    padded: number;
+    sent: boolean;
+    buffered: number;
+    closes: number;
+    closed: number;
+    transport: string;
+    peer: string;
+    peerTransport: string;
+  };
+  let refusal = null as Refusal | null;
+  const previous = control.write;
+  control.write = (frame, connection) => {
+    if (refusal || !sealed(frame)) {
+      return connection.send(frame);
+    }
+    const padded = overflow(connection);
+    const sent = connection.send(frame);
+    refusal = {
+      padded,
+      sent,
+      buffered: connection.buffered,
+      closes: control.closes,
+      closed: control.closed,
+      transport: a.transport.state,
+      peer: b.endpoint.state,
+      peerTransport: b.transport.state,
+    };
+    return sent;
+  };
+  try {
+    const result = await a.messenger.send(b.id, "under pressure");
+    assert.deepEqual(result, { ok: false, reason: "not_sent" });
+    assert.ok(refusal, "a sealed frame met the cap");
+    assert.ok(refusal.padded > 0, "the socket accepted writes before refusing");
+    assert.ok(refusal.buffered > maxBufferedBytes, "refused above the cap");
+    assert.equal(refusal.sent, false);
+    assert.equal(refusal.closes, 0, "nothing closed the socket");
+    assert.equal(refusal.closed, 0, "the socket had not closed");
+    assert.equal(refusal.transport, "connected");
+    assert.equal(refusal.peer, "authenticated");
+    assert.equal(refusal.peerTransport, "connected");
+
+    await until(disconnected(a, b), "session ended");
+    assert.equal(a.endpoint.state, "failed");
+    assert.equal(a.endpoint.failure, "lost");
+    assert.equal(b.endpoint.failure, null, "no frame arrived out of sequence");
+    assert.ok(!bodies(b).includes("under pressure"));
+    assert.deepEqual(await a.messenger.send(b.id, "after refusal"), {
+      ok: false,
+      reason: "authentication_required",
+    });
+    assert.equal(a.transport.send("after refusal"), "not_connected");
+  } finally {
+    control.write = previous;
+  }
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered after backpressure");
+  assert.ok((await a.messenger.send(b.id, "after pressure")).ok);
+  await until(
+    () => bodies(b).includes("after pressure"),
+    "delivered after backpressure",
+  );
+  assert.ok(!bodies(b).includes("after refusal"));
+});
+
+test("sustained traffic under backpressure below the cap keeps the session and its order", async () => {
+  const control = probe();
+  const carrier = await peerCarrier();
+  const b = await peerDevice(unpadded(carrier.listen));
+  const a = await peerDevice(probed(carrier.dial, control));
+  await until(authenticated(a, b), "mutual authentication");
+
+  const transitions: string[] = [];
+  const releases = [
+    a.endpoint.onState((state) => transitions.push(`a:${state}`)),
+    b.endpoint.onState((state) => transitions.push(`b:${state}`)),
+  ];
+  const writes: { pressured: boolean; buffered: number; sent: boolean }[] =
+    [];
+  const previous = control.write;
+  control.write = (frame, connection) => {
+    if (!sealed(frame)) {
+      return connection.send(frame);
+    }
+    pressure(connection);
+    const pressured = connection.pressured;
+    const buffered = connection.buffered;
+    const sent = connection.send(frame);
+    writes.push({ pressured, buffered, sent });
+    return sent;
+  };
+  const expected = Array.from({ length: 20 }, (_, i) => `sustained ${i}`);
+  try {
+    for (const body of expected) {
+      assert.ok((await a.messenger.send(b.id, body)).ok, body);
+    }
+    await until(
+      () => expected.every((body) => bodies(b).includes(body)),
+      "sustained delivery",
+    );
+    assert.deepEqual(
+      bodies(b).filter((body) => body?.startsWith("sustained ")),
+      expected,
+    );
+    assert.ok(writes.length >= expected.length);
+    for (const write of writes) {
+      assert.equal(write.pressured, true, "each sealed write met backpressure");
+      assert.ok(write.buffered <= maxBufferedBytes);
+      assert.equal(write.sent, true);
+    }
+    assert.deepEqual(transitions, []);
+    assert.ok(authenticated(a, b)());
+    assert.equal(b.endpoint.failure, null);
+  } finally {
+    control.write = previous;
+    for (const release of releases) {
+      release();
+    }
+  }
+});
+
+test("concurrent sends under backpressure arrive once each in submission order", async () => {
+  const control = probe();
+  const carrier = await peerCarrier();
+  const b = await peerDevice(unpadded(carrier.listen));
+  const a = await peerDevice(probed(carrier.dial, control));
+  await until(authenticated(a, b), "mutual authentication");
+  assert.ok((await a.messenger.send(b.id, "before concurrency")).ok);
+  await until(() => bodies(b).includes("before concurrency"), "delivered");
+
+  const transitions: string[] = [];
+  const releases = [
+    a.endpoint.onState((state) => transitions.push(`a:${state}`)),
+    b.endpoint.onState((state) => transitions.push(`b:${state}`)),
+  ];
+  const writes: {
+    pressured: boolean;
+    before: number;
+    after: number;
+    sent: boolean;
+  }[] = [];
+  const submitted: string[] = [];
+  const previous = control.write;
+  control.write = (frame, connection) => {
+    if (!sealed(frame)) {
+      return connection.send(frame);
+    }
+    pressure(connection);
+    const pressured = connection.pressured;
+    const before = connection.buffered;
+    const sent = connection.send(frame);
+    writes.push({ pressured, before, after: connection.buffered, sent });
+    return sent;
+  };
+  const submit = a.endpoint.send;
+  a.endpoint.send = (to, id, envelopes) => {
+    submitted.push(id);
+    return submit.call(a.endpoint, to, id, envelopes);
+  };
+  const ids = Array.from({ length: 30 }, () => createMessageId());
+  try {
+    const results = await Promise.all(
+      ids.map((id, i) => a.messenger.send(b.id, `concurrent ${i}`, id)),
+    );
+    assert.ok(results.every((result) => result.ok));
+    const marker = createMessageId();
+    assert.ok((await a.messenger.send(b.id, "after concurrency", marker)).ok);
+    await until(
+      () => bodies(b).includes("after concurrency"),
+      "everything submitted before the marker",
+    );
+    assert.equal(submitted.at(-1), marker);
+    const batch = submitted.slice(0, -1);
+    const delivered = b.inbox.filter((m) => ids.includes(m.id));
+    assert.deepEqual(
+      [...batch].sort(),
+      [...ids].sort(),
+      "each message was submitted once",
+    );
+    assert.deepEqual(
+      delivered.map((m) => m.id),
+      batch,
+      "each message arrived once, in submission order",
+    );
+    for (const m of delivered) {
+      assert.equal(m.body, `concurrent ${ids.indexOf(m.id)}`);
+    }
+    assert.ok(writes.length > ids.length);
+    for (const write of writes) {
+      assert.equal(write.sent, true);
+      assert.equal(write.pressured, true, "each sealed write met backpressure");
+      assert.ok(write.before <= maxBufferedBytes);
+      assert.ok(write.after <= maxBufferedBytes + 4 + maxFrameSize);
+    }
+    assert.deepEqual(transitions, []);
+    assert.ok(authenticated(a, b)());
+    assert.equal(a.endpoint.failure, null);
+    assert.equal(b.endpoint.failure, null, "no frame arrived out of sequence");
+  } finally {
+    Reflect.deleteProperty(a.endpoint, "send");
+    control.write = previous;
+    for (const release of releases) {
+      release();
+    }
+  }
+  assert.ok(!Object.hasOwn(a.endpoint, "send"));
+});
+
+test("a close during a buffered backlog ends the session and settles the pending send", async () => {
+  const control = probe();
+  const carrier = await peerCarrier();
+  const b = await peerDevice(unpadded(carrier.listen));
+  const a = await peerDevice(probed(carrier.dial, control));
+  await until(authenticated(a, b), "mutual authentication");
+  assert.ok((await a.messenger.send(b.id, "before backlog")).ok);
+  await until(() => bodies(b).includes("before backlog"), "delivered");
+
+  const transitions: string[] = [];
+  const release = a.endpoint.onState((state) => transitions.push(state));
+  const closed = control.closed;
+  let backlog = null as { sent: boolean; buffered: number } | null;
+  const previous = control.write;
+  control.write = (frame, connection) => {
+    if (backlog || !sealed(frame)) {
+      return connection.send(frame);
+    }
+    pressure(connection);
+    const sent = connection.send(frame);
+    backlog = { sent, buffered: connection.buffered };
+    queueMicrotask(() => carrier.drop());
+    return sent;
+  };
+  try {
+    const result = await a.messenger.send(b.id, "behind backlog");
+    assert.deepEqual(result, { ok: false, reason: "not_sent" });
+    assert.ok(backlog);
+    assert.equal(backlog.sent, true, "the sealed frame joined the backlog");
+    assert.ok(backlog.buffered > 0 && backlog.buffered <= maxBufferedBytes);
+    await until(
+      () => disconnected(a, b)() && control.closed > closed,
+      "close delivered",
+    );
+    assert.deepEqual(transitions, ["unauthenticated"]);
+    assert.equal(a.endpoint.failure, null);
+    assert.equal(b.endpoint.failure, null, "no frame arrived out of sequence");
+    assert.ok(!bodies(b).includes("behind backlog"));
+  } finally {
+    control.write = previous;
+    release();
+  }
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered after the backlog");
+  assert.ok((await a.messenger.send(b.id, "after backlog")).ok);
+  await until(() => bodies(b).includes("after backlog"), "delivered");
+});
+
+test("a handshake under backpressure below the cap completes", async () => {
+  const control = probe();
+  const carrier = await peerCarrier();
+  const b = await peerDevice(unpadded(carrier.listen));
+  let hello = null as { pressured: boolean; buffered: number; sent: boolean } | null;
+  const previous = control.write;
+  control.write = (frame, connection) => {
+    if (hello || JSON.parse(frame).type !== "hello") {
+      return connection.send(frame);
+    }
+    pressure(connection);
+    const pressured = connection.pressured;
+    const buffered = connection.buffered;
+    const sent = connection.send(frame);
+    hello = { pressured, buffered, sent };
+    return sent;
+  };
+  try {
+    const a = await peerDevice(probed(carrier.dial, control));
+    await until(authenticated(a, b), "authenticated under backpressure");
+    assert.deepEqual(hello && { pressured: hello.pressured, sent: hello.sent }, {
+      pressured: true,
+      sent: true,
+    });
+    assert.ok(hello && hello.buffered <= maxBufferedBytes);
+    assert.equal(a.endpoint.failure, null);
+    assert.equal(b.endpoint.failure, null);
+    assert.ok((await a.messenger.send(b.id, "after handshake")).ok);
+    await until(() => bodies(b).includes("after handshake"), "delivered");
+  } finally {
+    control.write = previous;
+  }
+});
+
+test("a handshake frame over the buffer cap ends the attempt and recovers", async () => {
+  const control = probe();
+  const carrier = await peerCarrier();
+  const b = await peerDevice(unpadded(carrier.listen));
+  let hello = null as { buffered: number; sent: boolean } | null;
+  const previous = control.write;
+  control.write = (frame, connection) => {
+    if (hello || JSON.parse(frame).type !== "hello") {
+      return connection.send(frame);
+    }
+    overflow(connection);
+    const sent = connection.send(frame);
+    hello = { buffered: connection.buffered, sent };
+    return sent;
+  };
+  let a: PeerDevice;
+  const transitions: string[] = [];
+  let release = () => {};
+  try {
+    a = await peerDevice(probed(carrier.dial, control), { open: false });
+    release = a.endpoint.onState((state) => transitions.push(state));
+    a.endpoint.open();
+    await until(
+      () => hello !== null && disconnected(a, b)(),
+      "handshake attempt ended",
+    );
+    assert.equal(hello?.sent, false);
+    assert.ok(hello && hello.buffered > maxBufferedBytes);
+    assert.equal(a.endpoint.state, "failed");
+    assert.equal(a.endpoint.failure, "lost");
+    assert.ok(!transitions.includes("authenticated"));
+    assert.equal(b.endpoint.failure, null);
+  } finally {
+    control.write = previous;
+    release();
+  }
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered after the handshake");
+  assert.ok((await a.messenger.send(b.id, "after recovery")).ok);
+  await until(() => bodies(b).includes("after recovery"), "delivered");
+});
+
+test("a late close from a replaced connection does not disturb the recovered session", async () => {
+  const control = probe();
+  const { a, b, carrier } = await linked({}, (link) => probed(link, control));
+  carrier.drop();
+  await until(
+    () => disconnected(a, b)() && control.closed > 0,
+    "first connection closed",
+  );
+  const [late] = control.closers;
+  assert.ok(late);
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered");
+  assert.equal(control.closers.length, 2);
+
+  const transitions: string[] = [];
+  const release = a.endpoint.onState((state) => transitions.push(state));
+  try {
+    late();
+    assert.deepEqual(transitions, []);
+    assert.equal(a.transport.state, "connected");
+    assert.equal(a.endpoint.state, "authenticated");
+    assert.ok((await a.messenger.send(b.id, "after late close")).ok);
+    await until(() => bodies(b).includes("after late close"), "delivered");
+    assert.deepEqual(transitions, []);
+  } finally {
+    release();
+  }
+});
+
+test("a write after a confirmed disconnect is refused and never reported as delivered", async () => {
+  const control = probe();
+  const { a, b, carrier } = await linked({}, (link) => probed(link, control));
+  assert.ok((await a.messenger.send(b.id, "before close")).ok);
+  await until(() => bodies(b).includes("before close"), "delivered");
+  const stale = control.connection;
+  assert.ok(stale);
+
+  carrier.drop();
+  await until(
+    () => disconnected(a, b)() && control.closed > 0,
+    "confirmed disconnect",
+  );
+  const written = carrier.wire.out.length;
+  assert.equal(stale.send("after close"), false);
+  assert.equal(a.transport.send("after close"), "not_connected");
+  assert.deepEqual(await a.messenger.send(b.id, "after close"), {
+    ok: false,
+    reason: "authentication_required",
+  });
+  assert.equal(carrier.wire.out.length, written, "nothing reached the wire");
+
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered");
+  assert.ok((await a.messenger.send(b.id, "after reconnect")).ok);
+  await until(() => bodies(b).includes("after reconnect"), "delivered");
+  assert.ok(!bodies(b).includes("after close"));
+});
+
+type Race = "refused then closed" | "destroyed then refused" | "closed then sent";
+
+async function race(order: Race): Promise<void> {
+  const control = probe();
+  const { a, b } = await linked({}, (link) => probed(link, control));
+  assert.ok((await a.messenger.send(b.id, "before race")).ok);
+  await until(() => bodies(b).includes("before race"), "delivered");
+
+  const transitions: string[] = [];
+  const release = a.endpoint.onState((state) => transitions.push(state));
+  const closed = control.closed;
+  const previous = control.write;
+  try {
+    if (order === "closed then sent") {
+      control.connection?.close();
+      await until(
+        () => control.closed > closed && a.transport.state === "error",
+        "close delivered",
+      );
+    } else {
+      let armed = true;
+      control.write = (frame, connection) => {
+        if (!armed || !sealed(frame)) {
+          return connection.send(frame);
+        }
+        armed = false;
+        if (order === "refused then closed") {
+          return false;
+        }
+        connection.close();
+        return connection.send(frame);
+      };
+    }
+    const result = await a.messenger.send(b.id, "during race");
+    await until(
+      () => disconnected(a, b)() && control.closed > closed,
+      "terminal disconnect",
+    );
+    assert.equal(b.endpoint.failure, null, "no frame arrived out of sequence");
+    assert.ok(!bodies(b).includes("during race"));
+    if (order === "closed then sent") {
+      assert.deepEqual(result, {
+        ok: false,
+        reason: "authentication_required",
+      });
+      assert.deepEqual(transitions, ["unauthenticated"]);
+      assert.equal(a.endpoint.failure, null);
+      assert.equal(a.transport.state, "error");
+    } else {
+      assert.deepEqual(result, { ok: false, reason: "not_sent" });
+      assert.deepEqual(transitions, ["failed"], "one terminal transition");
+      assert.equal(a.endpoint.failure, "lost");
+      assert.equal(
+        a.transport.state,
+        "disconnected",
+        "the later close event was ignored",
+      );
+    }
+  } finally {
+    control.write = previous;
+    release();
+  }
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered after the race");
+  assert.ok((await a.messenger.send(b.id, "after race")).ok);
+  await until(() => bodies(b).includes("after race"), "delivered after race");
+}
+
+test("a refused write followed by the close event ends the session once", () =>
+  race("refused then closed"));
+
+test("a write to a destroyed socket before its close event ends the session once", () =>
+  race("destroyed then refused"));
+
+test("a write after the close event is delivered is refused without a second transition", () =>
+  race("closed then sent"));
 
 test("fuzzed handshake and session frames never parse loosely or crash", async () => {
   const stranger = await peerDevice(null, { open: false });

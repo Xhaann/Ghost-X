@@ -13,6 +13,15 @@ export type LinkHandlers = {
 };
 
 export interface LinkConnection {
+  /**
+   * True means the frame was accepted, in order, into this connection's
+   * outbound buffer; it says nothing about whether the peer received it.
+   * Backpressure below the connection's buffer cap is absorbed, not refused.
+   * False means the frame was not accepted and will not be written later:
+   * the connection is closed or its buffer is over the cap. Frames still
+   * buffered when the connection closes are discarded, and the close is
+   * reported through `LinkHandlers.closed`.
+   */
   send(frame: string): boolean;
   close(): void;
 }
