@@ -128,3 +128,20 @@ func TestLoadLocalSocket(t *testing.T) {
 		t.Fatal("relative local socket accepted")
 	}
 }
+
+func TestLoadAuthTimeout(t *testing.T) {
+	t.Setenv("AUTH_TIMEOUT", "")
+	if cfg, err := Load(); err != nil || cfg.AuthTimeout != DefaultAuthTimeout {
+		t.Fatalf("AuthTimeout = %v, %v", cfg.AuthTimeout, err)
+	}
+	t.Setenv("AUTH_TIMEOUT", "15s")
+	if cfg, err := Load(); err != nil || cfg.AuthTimeout != 15*time.Second {
+		t.Fatalf("AuthTimeout = %v, %v", cfg.AuthTimeout, err)
+	}
+	for _, v := range []string{"soon", "0s", "-1s", "10"} {
+		t.Setenv("AUTH_TIMEOUT", v)
+		if _, err := Load(); err == nil {
+			t.Fatalf("AUTH_TIMEOUT %q accepted", v)
+		}
+	}
+}

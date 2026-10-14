@@ -13,11 +13,13 @@ import (
 const (
 	defaultAddr            = ":8080"
 	defaultShutdownTimeout = 10 * time.Second
+	DefaultAuthTimeout     = 60 * time.Second
 )
 
 type Config struct {
 	Addr            string
 	ShutdownTimeout time.Duration
+	AuthTimeout     time.Duration
 	AllowedOrigins  []string
 	DeviceStore     string
 	LocalSocket     string
@@ -27,6 +29,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		Addr:            defaultAddr,
 		ShutdownTimeout: defaultShutdownTimeout,
+		AuthTimeout:     DefaultAuthTimeout,
 	}
 
 	if v, ok := os.LookupEnv("SERVER_ADDR"); ok && v != "" {
@@ -45,6 +48,17 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid SHUTDOWN_TIMEOUT %q: must be positive", v)
 		}
 		cfg.ShutdownTimeout = d
+	}
+
+	if v, ok := os.LookupEnv("AUTH_TIMEOUT"); ok && v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid AUTH_TIMEOUT %q: %w", v, err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("invalid AUTH_TIMEOUT %q: must be positive", v)
+		}
+		cfg.AuthTimeout = d
 	}
 
 	if v, ok := os.LookupEnv("DEVICE_STORE"); ok && v != "" {

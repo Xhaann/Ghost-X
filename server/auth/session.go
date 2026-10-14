@@ -193,6 +193,20 @@ func (s *Session) Close() {
 	s.end(Closed)
 }
 
+func (s *Session) Expire() bool {
+	s.mu.Lock()
+	switch s.state {
+	case Authenticated, Closed, Revoked:
+		s.mu.Unlock()
+		return false
+	}
+	s.state = Closed
+	s.nonce = nil
+	s.mu.Unlock()
+	s.registry.remove(s)
+	return true
+}
+
 func (s *Session) end(final State) {
 	s.mu.Lock()
 	if s.state == Closed || s.state == Revoked {

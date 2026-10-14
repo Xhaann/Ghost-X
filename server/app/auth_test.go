@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/Xhaann/ghost-x/server/auth"
 	"github.com/Xhaann/ghost-x/server/device"
 	"github.com/Xhaann/ghost-x/server/device/devicetest"
 	"github.com/Xhaann/ghost-x/server/protocol"
@@ -404,4 +405,92 @@ func TestServerLimitsRosterChangesPerIdentity(t *testing.T) {
 	expectError(t, roundTrip(t, conn, rosterFrame(rosters[len(rosters)-1])), "rate_limited")
 	other := dialApp(t, url)
 	expectError(t, roundTrip(t, other, rosterFrame(id.Next())), "rate_limited")
+}
+
+func serveWithDeadline(t *testing.T, timeout time.Duration) (*Server, string) {
+	t.Helper()
+	cfg := testConfig()
+	cfg.AuthTimeout = timeout
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newServer(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("Serve() error = %v", err)
+		}
+	})
+	return srv, "ws://" + ln.Addr().String() + "/ws"
+}
+
+func closedWith(t *testing.T, conn *websocket.Conn) *websocket.CloseError {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			var closed *websocket.CloseError
+			if !errors.As(err, &closed) {
+				t.Fatalf("read error = %v, want a close frame", err)
+			}
+			return closed
+		}
+	}
+}
+
+func TestUnauthenticatedConnectionClosedAtDeadline(t *testing.T) {
+	srv, url := serveWithDeadline(t, 200*time.Millisecond)
+	conn := dialApp(t, url)
+	challenge(t, conn)
+	if srv.sessions.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", srv.sessions.Len())
+	}
+
+	closed := closedWith(t, conn)
+	if closed.Code != websocket.ClosePolicyViolation || closed.Text != "authentication timeout" {
+		t.Fatalf("close = %d %q", closed.Code, closed.Text)
+	}
+	waitUntil(t, "expired session removed", func() bool { return srv.sessions.Len() == 0 })
+}
+
+func TestAuthenticatedConnectionOutlivesDeadline(t *testing.T) {
+	srv, url := serveWithDeadline(t, 500*time.Millisecond)
+	conn := dialApp(t, url)
+	authenticateConn(t, conn, newKey(t))
+
+	idle := dialApp(t, url)
+	if closed := closedWith(t, idle); closed.Text != "authentication timeout" {
+		t.Fatalf("idle close = %d %q", closed.Code, closed.Text)
+	}
+	if msg := roundTrip(t, conn, pingRequest("p1", 1)); msg.Type != "pong" {
+		t.Fatalf("ping after the deadline = %+v", msg)
+	}
+	waitUntil(t, "only the authenticated session", func() bool { return srv.sessions.Len() == 1 })
+	if srv.sessions.Authenticated() != 1 {
+		t.Fatalf("Authenticated() = %d, want 1", srv.sessions.Authenticated())
+	}
+}
+
+func TestFailedAuthenticationClosesConnection(t *testing.T) {
+	srv, url := startServer(t)
+	conn := dialApp(t, url)
+	k := newKey(t)
+
+	for range auth.MaxFailures - 1 {
+		if msg := roundTrip(t, conn, authenticateRequest(k, challenge(t, conn))); msg.Type != "error" {
+			t.Fatalf("unregistered authentication = %+v", msg)
+		}
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(authenticateRequest(k, challenge(t, conn)))); err != nil {
+		t.Fatal(err)
+	}
+	closed := closedWith(t, conn)
+	if closed.Code != websocket.ClosePolicyViolation || closed.Text != "authentication failed" {
+		t.Fatalf("close = %d %q", closed.Code, closed.Text)
+	}
+	waitUntil(t, "failed session removed", func() bool { return srv.sessions.Len() == 0 })
 }

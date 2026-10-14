@@ -74,19 +74,24 @@ func (c socketCarrier) Close(reason string) {
 }
 
 type endpoint struct {
-	client  carrier
-	conn    *protocol.Conn
-	session *auth.Session
-	devices *device.Registry
-	prekeys *prekey.Registry
-	queue   *queue.Registry
+	client   carrier
+	conn     *protocol.Conn
+	session  *auth.Session
+	deadline *time.Timer
+	devices  *device.Registry
+	prekeys  *prekey.Registry
+	queue    *queue.Registry
 }
 
 func (e *endpoint) Receive(data []byte) {
 	_ = e.client.Send(e.conn.Handle(data))
+	if e.session.State() == auth.Failed {
+		e.client.Close("authentication failed")
+	}
 }
 
 func (e *endpoint) Close() {
+	e.deadline.Stop()
 	e.session.Close()
 	e.devices.Detach(e.session)
 	e.prekeys.Detach(e.session)
@@ -132,8 +137,17 @@ func New(cfg config.Config) (*Server, error) {
 		"accept":   protocol.Accept(prekeys),
 	})
 
+	timeout := cfg.AuthTimeout
+	if timeout <= 0 {
+		timeout = config.DefaultAuthTimeout
+	}
 	accept := func(c carrier) *endpoint {
 		session := sessions.Open()
+		deadline := time.AfterFunc(timeout, func() {
+			if session.Expire() {
+				c.Close("authentication timeout")
+			}
+		})
 		push := func(data []byte) { _ = c.Send(data) }
 		devices.Attach(session, func() {
 			session.Close()
@@ -145,7 +159,7 @@ func New(cfg config.Config) (*Server, error) {
 		prekeys.Attach(session, func(e prekey.Event) bool {
 			return c.Send(protocol.EncodeEvent(e)) == nil
 		})
-		return &endpoint{client: c, conn: router.Conn(session, push), session: session, devices: devices, prekeys: prekeys, queue: queued}
+		return &endpoint{client: c, conn: router.Conn(session, push), session: session, deadline: deadline, devices: devices, prekeys: prekeys, queue: queued}
 	}
 	opts := socket.DefaultOptions()
 	opts.Accept = func(c *socket.Client) socket.Receiver {

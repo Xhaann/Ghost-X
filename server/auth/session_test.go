@@ -644,3 +644,89 @@ func TestRevocationEndsAnAuthenticatedSession(t *testing.T) {
 		t.Fatalf("revoked session still registered: %d", r.Len())
 	}
 }
+
+func TestExpireClosesOnlyUnauthenticatedSessions(t *testing.T) {
+	r := NewRegistry(time.Now, nil, known)
+	signer := newSigner(t)
+	other := newSigner(t)
+
+	fresh := r.Open()
+	challenged := r.Open()
+	if _, err := challenged.Challenge(); err != nil {
+		t.Fatal(err)
+	}
+	failed := r.Open()
+	for range MaxFailures {
+		nonce, err := failed.Challenge()
+		if err != nil {
+			t.Fatal(err)
+		}
+		failed.Authenticate(signer.identity, signer.device, other.proof(nonce))
+	}
+	if failed.State() != Failed {
+		t.Fatalf("State() = %v, want %v", failed.State(), Failed)
+	}
+	authenticated := r.Open()
+	if err := signer.prove(t, authenticated); err != nil {
+		t.Fatal(err)
+	}
+	closed := r.Open()
+	closed.Close()
+
+	for name, s := range map[string]*Session{"fresh": fresh, "challenged": challenged, "failed": failed} {
+		if !s.Expire() {
+			t.Fatalf("%s session was not expired", name)
+		}
+		if s.State() != Closed {
+			t.Fatalf("%s State() = %v, want %v", name, s.State(), Closed)
+		}
+		if s.Expire() {
+			t.Fatalf("%s session expired twice", name)
+		}
+	}
+	if authenticated.Expire() || authenticated.State() != Authenticated {
+		t.Fatalf("authenticated session expired: State() = %v", authenticated.State())
+	}
+	if closed.Expire() {
+		t.Fatal("closed session expired")
+	}
+	if r.Len() != 1 || r.Authenticated() != 1 {
+		t.Fatalf("Len() = %d, Authenticated() = %d", r.Len(), r.Authenticated())
+	}
+	if _, err := fresh.Challenge(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Challenge() after expiry = %v", err)
+	}
+}
+
+func TestExpireAndAuthenticateNeverBothSucceed(t *testing.T) {
+	signer := newSigner(t)
+	for range 200 {
+		r := NewRegistry(time.Now, nil, known)
+		s := r.Open()
+		nonce, err := s.Challenge()
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof := signer.proof(nonce)
+		var expired bool
+		var authErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			expired = s.Expire()
+		}()
+		go func() {
+			defer wg.Done()
+			_, authErr = s.Authenticate(signer.identity, signer.device, proof)
+		}()
+		wg.Wait()
+		switch {
+		case expired && errors.Is(authErr, ErrClosed) && s.State() == Closed && r.Len() == 0:
+		case !expired && authErr == nil && s.State() == Authenticated && r.Len() == 1:
+			s.Close()
+		default:
+			t.Fatalf("expired = %v, Authenticate() = %v, State() = %v, Len() = %d", expired, authErr, s.State(), r.Len())
+		}
+	}
+}
