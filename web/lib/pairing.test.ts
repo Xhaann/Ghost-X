@@ -553,3 +553,60 @@ test("open classifies input by session state and never re-keys on its own", asyn
   assert.equal(initiations(c), 0);
   assert.equal(c.pairs.state(address(b)), "none");
 });
+
+test("a prekey publication that cannot read its keys reports failure and publishes nothing", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const b = await device(port);
+  const published = frames(b.sent, "prekeys").length;
+  const get = b.store.get.bind(b.store);
+  b.store.get = async (name, key) => {
+    if (name === "vault") {
+      throw new Error("storage unavailable");
+    }
+    return get(name, key);
+  };
+  try {
+    assert.equal(await b.pairing.publish(), false);
+    assert.equal(frames(b.sent, "prekeys").length, published);
+  } finally {
+    b.store.get = get;
+  }
+  assert.equal(await b.pairing.publish(), true);
+  assert.equal(frames(b.sent, "prekeys").length, published + 1);
+});
+
+test("a prekey replenishment that cannot be stored keeps the accepted publication and adds no keys", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const b = await device(port);
+  for (let i = 0; i < poolSize; i++) {
+    await b.client.request({ type: "bundle", payload: { identity: b.id } });
+  }
+  const inventory = [...b.prekeys.inventory.onetime];
+  const published = frames(b.sent, "prekeys").length;
+  const swap = b.store.swap.bind(b.store);
+  b.store.swap = async (name, key, matches, value) => {
+    if (name === "vault") {
+      throw new Error("storage unavailable");
+    }
+    return swap(name, key, matches, value);
+  };
+  try {
+    assert.equal(await b.pairing.publish(), true);
+    assert.ok(b.pairing.published);
+    assert.deepEqual(b.prekeys.inventory.onetime, inventory);
+    assert.equal(frames(b.sent, "prekeys").length, published + 1);
+  } finally {
+    b.store.swap = swap;
+  }
+  assert.equal(await b.pairing.publish(), true);
+  const refilled = b.prekeys.inventory.onetime;
+  assert.ok((refilled.at(-1) ?? 0) > (inventory.at(-1) ?? 0));
+  assert.equal(new Set(refilled).size, refilled.length);
+  const bundle = await b.client.request({
+    type: "bundle",
+    payload: { identity: b.id },
+  });
+  assert.ok(bundle?.type === "bundle" && bundle.payload.bundles[0].onetime);
+});

@@ -8,6 +8,7 @@ import {
   type SecureDevice,
   freePort,
   linkedDevice,
+  memoryReceiver,
   secureDevice,
   startServer,
   stopServer,
@@ -757,4 +758,175 @@ test("an older pending message is delivered before a newer one to the same devic
   await until(() => bodies(back).length === 2, "both arrive");
   assert.deepEqual(bodies(back), ["older", "newer"]);
   assert.equal(a.outbox.size, 0);
+});
+
+function storedOutbox(d: SecureDevice): number {
+  return [...d.store.data.keys()].filter((k) => k.startsWith("outbox:")).length;
+}
+
+function watchRejections(): { seen: unknown[]; stop(): void } {
+  const seen: unknown[] = [];
+  const record = (reason: unknown) => seen.push(reason);
+  process.on("unhandledRejection", record);
+  return { seen, stop: () => process.off("unhandledRejection", record) };
+}
+
+function nextTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+test("a revocation cleanup that cannot delete keeps the path stored and retries on the next roster update", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const [b1, b2] = await identity(port);
+  await b2.shutdown();
+  const a = await secureDevice(port);
+  assert.deepEqual(await a.messenger.send(b1.id, "not for b2"), {
+    ok: true,
+    devices: 1,
+    pending: 1,
+  });
+  const rejections = watchRejections();
+  const remove = a.store.delete.bind(a.store);
+  let failing = true;
+  let attempts = 0;
+  a.store.delete = async (name, keys) => {
+    if (name === "outbox") {
+      attempts += 1;
+      if (failing) {
+        throw new Error("storage unavailable");
+      }
+    }
+    return remove(name, keys);
+  };
+  try {
+    assert.ok((await b1.devices.revoke(b1.client, b2.deviceId)).ok);
+    assert.equal(await a.messenger.lookup(b1.id), true);
+    await until(() => attempts >= 1, "cleanup attempted");
+    await nextTurn();
+    assert.deepEqual(rejections.seen, []);
+    assert.equal(a.outbox.size, 1);
+    assert.equal(storedOutbox(a), 1);
+
+    failing = false;
+    assert.equal(await a.messenger.lookup(b1.id), true);
+    await until(() => a.outbox.size === 0, "dropped on the next roster update");
+    assert.equal(storedOutbox(a), 0);
+    assert.deepEqual(
+      sends(a).flatMap((p) => (p.envelopes as Json[]).map((e) => e.device)),
+      [b1.deviceId],
+    );
+    assert.deepEqual(rejections.seen, []);
+  } finally {
+    rejections.stop();
+    a.store.delete = remove;
+  }
+});
+
+test("an expiry that cannot be recorded keeps the outbox path until a later retry records it", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const [b1, b2] = await identity(port);
+  await b2.shutdown();
+  let now = Date.now();
+  const a = await secureDevice(port, { now: () => now });
+  const sink = memoryReceiver();
+  let settles = 0;
+  a.messenger.receive({
+    ...sink.receiver,
+    settle: (receipt) => {
+      if (receipt.status === "expired") {
+        settles += 1;
+      }
+      return sink.receiver.settle(receipt);
+    },
+  });
+  assert.deepEqual(await a.messenger.send(b1.id, "never established"), {
+    ok: true,
+    devices: 1,
+    pending: 1,
+  });
+  const id = sends(a)[0].id as string;
+  const rejections = watchRejections();
+  try {
+    now += 72 * 60 * 60 * 1000;
+    sink.fail(true);
+    a.messenger.stop();
+    a.messenger.start();
+    await until(() => settles >= 1, "expiry attempted");
+    await nextTurn();
+    assert.deepEqual(
+      sink.receipts.filter((r) => r.device === b2.deviceId),
+      [],
+    );
+    assert.equal(a.outbox.size, 1);
+    assert.equal(storedOutbox(a), 1);
+
+    sink.fail(false);
+    a.messenger.stop();
+    a.messenger.start();
+    await until(() => a.outbox.size === 0, "expired once recorded");
+    assert.deepEqual(
+      sink.receipts.filter((r) => r.device === b2.deviceId),
+      [{ to: b1.id, device: b2.deviceId, id, status: "expired" }],
+    );
+    assert.equal(storedOutbox(a), 0);
+    assert.deepEqual(rejections.seen, []);
+  } finally {
+    rejections.stop();
+  }
+});
+
+test("an expiry whose outbox deletion fails is recorded and the stored path is removed on a later retry without resending", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const [b1, b2] = await identity(port);
+  await b2.shutdown();
+  let now = Date.now();
+  const a = await secureDevice(port, { now: () => now });
+  assert.deepEqual(await a.messenger.send(b1.id, "never established"), {
+    ok: true,
+    devices: 1,
+    pending: 1,
+  });
+  const id = sends(a)[0].id as string;
+  const sent = sends(a).length;
+  const rejections = watchRejections();
+  const remove = a.store.delete.bind(a.store);
+  let failing = true;
+  let attempts = 0;
+  a.store.delete = async (name, keys) => {
+    if (name === "outbox") {
+      attempts += 1;
+      if (failing) {
+        throw new Error("storage unavailable");
+      }
+    }
+    return remove(name, keys);
+  };
+  try {
+    now += 72 * 60 * 60 * 1000;
+    a.messenger.stop();
+    a.messenger.start();
+    await until(() => attempts >= 1, "deletion attempted");
+    await nextTurn();
+    assert.deepEqual(rejections.seen, []);
+    const expired = { to: b1.id, device: b2.deviceId, id, status: "expired" };
+    const forB2 = () => a.receipts.filter((r) => r.device === b2.deviceId);
+    assert.deepEqual(forB2(), [expired]);
+    assert.equal(a.outbox.size, 1);
+    assert.equal(storedOutbox(a), 1);
+
+    failing = false;
+    a.messenger.stop();
+    a.messenger.start();
+    await until(() => a.outbox.size === 0, "removed on a later retry");
+    assert.equal(storedOutbox(a), 0);
+    assert.ok(forB2().every((r) => JSON.stringify(r) === JSON.stringify(expired)));
+    assert.equal(sends(a).length, sent);
+    assert.deepEqual(rejections.seen, []);
+  } finally {
+    rejections.stop();
+    a.store.delete = remove;
+  }
 });

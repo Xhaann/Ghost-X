@@ -136,7 +136,7 @@ export class Messenger {
         }
       }),
       this.#rosters.onUpdate((roster) => {
-        void this.#outbox.remove(
+        void this.#discard(
           this.#outbox
             .paths()
             .filter(
@@ -317,14 +317,31 @@ export class Messenger {
   }
 
   async #expire(paths: readonly Path[]): Promise<void> {
-    await this.#outbox.remove(paths);
+    const recorded: Path[] = [];
     for (const path of paths) {
-      await this.#receiver?.settle({
-        to: path.peer,
-        device: path.device,
-        id: path.id,
-        status: "expired",
-      });
+      const settled = this.#receiver
+        ? await this.#receiver
+            .settle({
+              to: path.peer,
+              device: path.device,
+              id: path.id,
+              status: "expired",
+            })
+            .catch(() => false)
+        : true;
+      if (settled) {
+        recorded.push(path);
+      }
+    }
+    await this.#discard(recorded);
+  }
+
+  async #discard(paths: readonly Path[]): Promise<boolean> {
+    try {
+      await this.#outbox.remove(paths);
+      return true;
+    } catch {
+      return false;
     }
   }
 

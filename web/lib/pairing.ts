@@ -187,7 +187,9 @@ export class Pairing implements Channel {
   async publish(): Promise<boolean> {
     const generation = this.#generation;
     for (let round = 0; round < 2; round++) {
-      const publication = await this.#prekeys.publication();
+      const publication = await this.#prekeys
+        .publication()
+        .catch(() => null);
       if (!publication || generation !== this.#generation) {
         return false;
       }
@@ -196,7 +198,7 @@ export class Pairing implements Channel {
         return false;
       }
       this.#published = true;
-      if (!(await this.#prekeys.replenish(available))) {
+      if (!(await this.#prekeys.replenish(available).catch(() => false))) {
         return true;
       }
     }
