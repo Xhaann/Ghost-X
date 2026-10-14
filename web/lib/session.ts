@@ -320,6 +320,7 @@ export class Session {
         const conversations = new Conversations(messenger, keys.identity, {
           history,
           restored,
+          relay: this.kind === "websocket",
         });
         this.#conversations = conversations;
         this.#rejected = rejected;

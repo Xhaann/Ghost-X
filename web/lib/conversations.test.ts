@@ -18,6 +18,7 @@ import type {
   SendResult,
 } from "./messenger.ts";
 import type { Messenger } from "./messenger.ts";
+import { outboxLifetime } from "./outbox.ts";
 import { maxBodySize } from "./protocol.ts";
 import {
   type SecureDevice,
@@ -754,4 +755,116 @@ test("real recipient that never published is shown as unavailable", async () => 
   const [message] = conversation(a.store, stranger)?.messages ?? [];
   assert.ok(message.direction === "sent");
   assert.equal(message.delivery, "unavailable");
+});
+
+function deliveryOf(store: Conversations, identity: string, id: string) {
+  const message = conversation(store, identity)?.messages.find(
+    (m) => m.id === id,
+  );
+  assert.ok(message?.direction === "sent");
+  return message.delivery;
+}
+
+test("a relay-accepted message expires exactly at the relay queue lifetime", async () => {
+  const [self, peer] = await identities(2);
+  const source = new Source();
+  let now = 1_000_000;
+  const store = new Conversations(source, self, {
+    relay: true,
+    now: () => now,
+  });
+  store.start();
+  store.open(peer);
+  const attempt = store.send("held by the relay");
+  assert.ok(attempt.accepted);
+  source.sent[0].resolve({ ok: true, devices: 1, pending: 0 });
+  assert.equal(await attempt.delivery, "queued");
+
+  now += outboxLifetime - 1;
+  source.setActive(true);
+  assert.equal(deliveryOf(store, peer, attempt.id), "queued");
+  now += 1;
+  source.setActive(true);
+  assert.equal(deliveryOf(store, peer, attempt.id), "expired");
+});
+
+test("a delivery receipt before the relay lifetime is never replaced by expiry", async () => {
+  const [self, peer] = await identities(2);
+  const source = new Source();
+  let now = 1_000_000;
+  const store = new Conversations(source, self, {
+    relay: true,
+    now: () => now,
+  });
+  store.start();
+  store.open(peer);
+  const attempt = store.send("delivered in time");
+  assert.ok(attempt.accepted);
+  source.sent[0].resolve({ ok: true, devices: 1, pending: 0 });
+  assert.equal(await attempt.delivery, "queued");
+  await source.receipt({
+    to: peer,
+    device: DEVICE,
+    id: attempt.id,
+    status: "delivered",
+  });
+  assert.equal(deliveryOf(store, peer, attempt.id), "delivered");
+
+  now += outboxLifetime * 2;
+  source.setActive(true);
+  assert.equal(deliveryOf(store, peer, attempt.id), "delivered");
+  await source.receipt({
+    to: peer,
+    device: DEVICE,
+    id: attempt.id,
+    status: "expired",
+  });
+  source.setActive(true);
+  assert.equal(deliveryOf(store, peer, attempt.id), "delivered");
+});
+
+test("a queued message without a relay acceptance time never expires", async () => {
+  const [self, peer] = await identities(2);
+  const source = new Source();
+  let now = 1_000_000;
+  const store = new Conversations(source, self, { now: () => now });
+  store.start();
+  store.open(peer);
+  const attempt = store.send("acknowledged by a peer device");
+  assert.ok(attempt.accepted);
+  source.sent[0].resolve({ ok: true, devices: 1, pending: 0 });
+  assert.equal(await attempt.delivery, "queued");
+
+  now += outboxLifetime * 10;
+  source.setActive(true);
+  assert.equal(deliveryOf(store, peer, attempt.id), "queued");
+});
+
+test("a deferred message expires a relay lifetime after the relay accepts it", async () => {
+  const [self, peer] = await identities(2);
+  const source = new Source();
+  const sent = 1_000_000;
+  let now = sent;
+  const store = new Conversations(source, self, {
+    relay: true,
+    now: () => now,
+  });
+  store.start();
+  store.open(peer);
+  const attempt = store.send("waiting for a session");
+  assert.ok(attempt.accepted);
+  source.sent[0].resolve({ ok: true, devices: 0, pending: 1 });
+  assert.equal(await attempt.delivery, "pending");
+
+  now = sent + 60_000;
+  assert.ok(source.receiver?.relayed);
+  assert.ok(await source.receiver.relayed({ to: peer, id: attempt.id }));
+  assert.equal(deliveryOf(store, peer, attempt.id), "queued");
+
+  now = sent + outboxLifetime;
+  source.setActive(true);
+  assert.equal(deliveryOf(store, peer, attempt.id), "queued");
+  now = sent + 60_000 + outboxLifetime;
+  source.setActive(true);
+  assert.equal(deliveryOf(store, peer, attempt.id), "expired");
 });

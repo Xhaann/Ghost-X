@@ -6,6 +6,7 @@ import type {
   Receiver,
   SendResult,
 } from "./messenger.ts";
+import { outboxLifetime } from "./outbox.ts";
 import {
   bodySize,
   createMessageId,
@@ -84,7 +85,10 @@ export function advances(from: DeliveryState, to: DeliveryState): boolean {
   return ranks[to] > ranks[from];
 }
 
-export type Restored = ConversationMessage & { read?: boolean };
+export type Restored = ConversationMessage & {
+  read?: boolean;
+  accepted?: number;
+};
 
 export interface HistoryPort {
   has(peer: string, id: string): boolean;
@@ -101,14 +105,22 @@ export interface HistoryPort {
     sequence: number;
     delivery: SettledDelivery;
     body: string;
+    accepted?: number;
   }): Promise<boolean>;
-  settle(peer: string, id: string, delivery: SettledDelivery): Promise<boolean>;
+  settle(
+    peer: string,
+    id: string,
+    delivery: SettledDelivery,
+    accepted?: number,
+  ): Promise<boolean>;
   read(identity: string): void;
 }
 
 export type ConversationOptions = {
   history?: HistoryPort;
   restored?: readonly Restored[];
+  relay?: boolean;
+  now?: () => number;
 };
 
 export const maxConversations = 100;
@@ -131,8 +143,14 @@ export class Conversations implements Receiver {
   readonly #source: MessageSource;
   readonly #self: string;
   readonly #history: HistoryPort | null;
+  readonly #relay: boolean;
+  readonly #now: () => number;
   readonly #states = new Listeners<ConversationsState>();
   readonly #conversations = new Map<string, Conversation>();
+  readonly #accepted = new Map<
+    string,
+    { identity: string; id: string; accepted: number }
+  >();
   #active: string | null = null;
   #sequence = 0;
   #generation = 0;
@@ -147,6 +165,8 @@ export class Conversations implements Receiver {
     this.#source = source;
     this.#self = self;
     this.#history = options.history ?? null;
+    this.#relay = options.relay ?? false;
+    this.#now = options.now ?? Date.now;
     this.#restore(options.restored ?? []);
   }
 
@@ -164,9 +184,13 @@ export class Conversations implements Receiver {
     }
     const detach = [
       this.#source.receive(this),
-      this.#source.onState(() => this.#publish()),
+      this.#source.onState(() => {
+        this.#expire();
+        this.#publish();
+      }),
     ];
     this.#detach = () => detach.forEach((release) => release());
+    this.#expire();
     this.#publish();
   }
 
@@ -175,6 +199,7 @@ export class Conversations implements Receiver {
     this.#detach = null;
     this.#generation += 1;
     this.#conversations.clear();
+    this.#accepted.clear();
     this.#active = null;
     this.#state = empty;
     this.#states.emit(this.#state);
@@ -285,9 +310,10 @@ export class Conversations implements Receiver {
   }
 
   async relayed(message: { to: string; id: string }): Promise<boolean> {
+    const accepted = this.#accept(message.to, message.id);
     this.#settle(this.#generation, message.to, message.id, "queued");
     return this.#history
-      ? this.#history.settle(message.to, message.id, "queued")
+      ? this.#history.settle(message.to, message.id, "queued", accepted)
       : true;
   }
 
@@ -307,7 +333,15 @@ export class Conversations implements Receiver {
     body: string,
     result: SendResult,
   ): Promise<DeliveryState> {
-    const settled = this.#settle(generation, to, id, deliveryOf(result));
+    const delivery = deliveryOf(result);
+    if (generation === this.#generation && delivery === "queued") {
+      this.#accept(to, id);
+    }
+    const settled = this.#settle(generation, to, id, delivery);
+    const accepted =
+      settled === "queued" || settled === "delivered" || settled === "expired"
+        ? this.#accepted.get(`${to}/${id}`)?.accepted
+        : undefined;
     if (generation === this.#generation && settled !== "sending") {
       await this.#history?.sent({
         id,
@@ -315,9 +349,36 @@ export class Conversations implements Receiver {
         sequence,
         delivery: settled,
         body,
+        ...(accepted === undefined ? {} : { accepted }),
       });
     }
     return settled;
+  }
+
+  #accept(identity: string, id: string): number | undefined {
+    if (!this.#relay) {
+      return undefined;
+    }
+    const key = `${identity}/${id}`;
+    const accepted = this.#accepted.get(key)?.accepted ?? this.#now();
+    this.#accepted.set(key, { identity, id, accepted });
+    return accepted;
+  }
+
+  #expire(): void {
+    const now = this.#now();
+    for (const [key, { identity, id, accepted }] of [...this.#accepted]) {
+      const message = this.#conversations
+        .get(identity)
+        ?.messages.find((m) => m.id === id && m.direction === "sent");
+      if (message?.direction !== "sent" || message.delivery !== "queued") {
+        this.#accepted.delete(key);
+      } else if (now - accepted >= outboxLifetime) {
+        this.#accepted.delete(key);
+        this.#settle(this.#generation, identity, id, "expired");
+        void this.#history?.settle(identity, id, "expired");
+      }
+    }
   }
 
   #settle(
@@ -391,7 +452,18 @@ export class Conversations implements Receiver {
       ) {
         continue;
       }
-      const { read, ...message } = entry;
+      const { read, accepted, ...message } = entry;
+      if (
+        message.direction === "sent" &&
+        message.delivery === "queued" &&
+        accepted !== undefined
+      ) {
+        this.#accepted.set(`${peer}/${message.id}`, {
+          identity: peer,
+          id: message.id,
+          accepted,
+        });
+      }
       this.#sequence = Math.max(this.#sequence, message.sequence);
       const conversation = this.#append(this.#ensure(peer), message);
       if (message.direction === "received" && read === false) {

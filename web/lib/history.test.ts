@@ -24,7 +24,8 @@ import type {
   Receiver,
   SendResult,
 } from "./messenger.ts";
-import { maxBodySize } from "./protocol.ts";
+import { outboxLifetime } from "./outbox.ts";
+import { ivSize, maxBodySize } from "./protocol.ts";
 import {
   type LegacyParty,
   legacyParty,
@@ -1020,5 +1021,184 @@ test("fuzzed persisted records never restore as trusted state", async () => {
       assert.equal(m1.body, "first secret");
     }
     assert.ok(restored.some((m) => m.id === "m2"));
+  }
+});
+
+function delivered(store: Conversations, peer: string, id: string) {
+  const message = store.state.conversations
+    .find((c) => c.identity === peer)
+    ?.messages.find((m) => m.id === id);
+  assert.ok(message?.direction === "sent");
+  return message.delivery;
+}
+
+test("a relay acceptance time is persisted, authenticated, and restored", async () => {
+  const a = await identity();
+  const b = await party();
+  const h = await open(b);
+  assert.ok(
+    await h.sent({
+      id: "q1",
+      peer: a,
+      sequence: 1,
+      delivery: "queued",
+      body: "held by the relay",
+      accepted: 1_000,
+    }),
+  );
+  const key = `messages:${a}/q1`;
+  assert.equal((b.store.data.get(key) as Record<string, unknown>).accepted, 1_000);
+
+  const reopened = await open(b);
+  const { restored } = await reopened.restore();
+  assert.equal(restored.length, 1);
+  const [message] = restored;
+  assert.ok(message.direction === "sent");
+  assert.equal(message.delivery, "queued");
+  assert.equal(message.accepted, 1_000);
+  assert.equal(message.body, "held by the relay");
+
+  assert.ok(await reopened.settle(a, "q1", "delivered", 9_999));
+  await reopened.flush();
+  const settled = b.store.data.get(key) as Record<string, unknown>;
+  assert.equal(settled.delivery, "delivered");
+  assert.equal(settled.accepted, 1_000);
+
+  b.store.data.set(key, { ...settled, accepted: 2_000 });
+  const tampered = await (await open(b)).restore();
+  assert.deepEqual(tampered.restored, []);
+  assert.equal(tampered.rejected, 1);
+});
+
+test("records sealed without a relay acceptance time load unchanged and never expire", async () => {
+  const a = await identity();
+  const b = await party();
+  const iv = crypto.getRandomValues(new Uint8Array(ivSize));
+  const additionalData = new TextEncoder().encode(
+    `ghostx/history/v2\0${JSON.stringify([historyVersion, "q0", a, "sent", "queued", 1])}`,
+  );
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData },
+    b.storage,
+    new TextEncoder().encode("sent before acceptance times"),
+  );
+  const record = {
+    v: historyVersion,
+    id: "q0",
+    peer: a,
+    direction: "sent",
+    delivery: "queued",
+    sequence: 1,
+    iv: encodeBase64Url(iv),
+    ciphertext: encodeBase64Url(new Uint8Array(ciphertext)),
+  };
+  await b.store.put("messages", `${a}/q0`, record);
+
+  const h = await open(b);
+  const { restored, rejected } = await h.restore();
+  assert.equal(rejected, 0);
+  assert.equal(restored.length, 1);
+  const [message] = restored;
+  assert.ok(message.direction === "sent");
+  assert.equal(message.body, "sent before acceptance times");
+  assert.equal(message.delivery, "queued");
+  assert.equal(Object.hasOwn(message, "accepted"), false);
+
+  const source = new Source();
+  const store = new Conversations(source, b.keys.identity, {
+    history: h,
+    restored,
+    relay: true,
+    now: () => Number.MAX_SAFE_INTEGER,
+  });
+  store.start();
+  source.states.emit(source.state);
+  await h.flush();
+  assert.equal(delivered(store, a, "q0"), "queued");
+  assert.deepEqual(b.store.data.get(`messages:${a}/q0`), record);
+});
+
+test("an expired relay-accepted message is persisted and expires after a restart", async () => {
+  const a = await identity();
+  const b = await party();
+  let now = 1_000_000;
+  const h = await open(b);
+  const source = new Source();
+  const store = new Conversations(source, b.keys.identity, {
+    history: h,
+    relay: true,
+    now: () => now,
+  });
+  store.start();
+  store.open(a);
+  const attempt = store.send("lost with the relay");
+  assert.ok(attempt.accepted);
+  source.pending[0].resolve({ ok: true, devices: 1, pending: 0 });
+  assert.equal(await attempt.delivery, "queued");
+  await h.flush();
+  const key = `messages:${a}/${attempt.id}`;
+  assert.equal((b.store.data.get(key) as Record<string, unknown>).accepted, now);
+  store.stop();
+  await h.close();
+
+  const reopened = await open(b);
+  const { restored } = await reopened.restore();
+  const restarted = new Source();
+  const after = new Conversations(restarted, b.keys.identity, {
+    history: reopened,
+    restored,
+    now: () => now,
+  });
+  after.start();
+  assert.equal(delivered(after, a, attempt.id), "queued");
+  now += outboxLifetime;
+  restarted.states.emit(restarted.state);
+  assert.equal(delivered(after, a, attempt.id), "expired");
+  await reopened.flush();
+  const stored = b.store.data.get(key) as Record<string, unknown>;
+  assert.equal(stored.delivery, "expired");
+  assert.equal(stored.accepted, 1_000_000);
+});
+
+test("the record decoder enforces the relay acceptance time", async () => {
+  const a = await identity();
+  const b = await party();
+  const { h } = await history(a, b);
+  assert.ok(
+    await h.sent({
+      id: "q2",
+      peer: a,
+      sequence: 5,
+      delivery: "queued",
+      body: "accepted",
+      accepted: 5,
+    }),
+  );
+  const key = `${a}/q2`;
+  const sent = b.store.data.get(`messages:${key}`) as Record<string, unknown>;
+  const receivedKey = `${a}/m1`;
+  const received = b.store.data.get(`messages:${receivedKey}`) as Record<
+    string,
+    unknown
+  >;
+  assert.deepEqual(parseRecord(key, sent), sent);
+  const cases: [string, string, unknown][] = [
+    ["string", key, { ...sent, accepted: "5" }],
+    ["zero", key, { ...sent, accepted: 0 }],
+    ["negative", key, { ...sent, accepted: -5 }],
+    ["fraction", key, { ...sent, accepted: 1.5 }],
+    ["unsafe", key, { ...sent, accepted: 2 ** 53 }],
+    ["not a number", key, { ...sent, accepted: Number.NaN }],
+    ["null", key, { ...sent, accepted: null }],
+    ["undefined", key, { ...sent, accepted: undefined }],
+    ["while pending", key, { ...sent, delivery: "pending" }],
+    ["while failed", key, { ...sent, delivery: "failed" }],
+    ["while unavailable", key, { ...sent, delivery: "unavailable" }],
+    ["on a received record", receivedKey, { ...received, accepted: 5 }],
+    ["on version 1", key, { ...sent, v: legacyVersion }],
+  ];
+  for (const [name, at, value] of cases) {
+    assert.equal(parseRecord(at, value), null, name);
+    assert.equal(parseLegacyRecord(at, value), null, name);
   }
 });

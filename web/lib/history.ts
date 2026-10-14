@@ -44,6 +44,11 @@ const deliveries: readonly SettledDelivery[] = [
   "failed",
 ];
 const sentFields = ["v", "id", "peer", "direction", "delivery", "sequence"];
+const acceptedDeliveries: readonly SettledDelivery[] = [
+  "queued",
+  "delivered",
+  "expired",
+];
 const receivedFields = ["v", "id", "peer", "direction", "read", "sequence"];
 const legacySealed = ["key", "signature", "salt", "iv", "ciphertext", "mac"];
 
@@ -54,6 +59,7 @@ type Metadata =
       sequence: number;
       direction: "sent";
       delivery: SettledDelivery;
+      accepted?: number;
     }
   | {
       id: string;
@@ -105,6 +111,9 @@ function associatedData(v: number, record: Metadata): Uint8Array<ArrayBuffer> {
         record.direction,
         state(record),
         record.sequence,
+        ...(record.direction === "sent" && record.accepted !== undefined
+          ? [record.accepted]
+          : []),
       ]),
     ),
   );
@@ -126,8 +135,13 @@ function shapeOf(
   if (record.direction !== "sent" && record.direction !== "received") {
     return null;
   }
+  const accepted =
+    record.direction === "sent" &&
+    version === historyVersion &&
+    Object.hasOwn(record, "accepted");
   const expected = [
     ...(record.direction === "sent" ? sentFields : receivedFields),
+    ...(accepted ? ["accepted"] : []),
     ...extra,
   ];
   const names = Object.keys(record);
@@ -143,6 +157,11 @@ function shapeOf(
     (record.direction === "sent"
       ? !deliveries.includes(record.delivery as SettledDelivery)
       : typeof record.read !== "boolean") ||
+    (accepted &&
+      (typeof record.accepted !== "number" ||
+        !Number.isSafeInteger(record.accepted) ||
+        record.accepted < 1 ||
+        !acceptedDeliveries.includes(record.delivery as SettledDelivery))) ||
     JSON.stringify(record).length > maxRecordSize
   ) {
     return null;
@@ -208,6 +227,7 @@ function metadataOf(record: Metadata): Metadata {
         sequence: record.sequence,
         direction: "sent",
         delivery: record.delivery,
+        ...(record.accepted === undefined ? {} : { accepted: record.accepted }),
       }
     : {
         id: record.id,
@@ -296,7 +316,15 @@ export class History implements HistoryPort {
           sequence: record.sequence,
         };
         return record.direction === "sent"
-          ? { ...base, direction: "sent", body, delivery: record.delivery }
+          ? {
+              ...base,
+              direction: "sent",
+              body,
+              delivery: record.delivery,
+              ...(record.accepted === undefined
+                ? {}
+                : { accepted: record.accepted }),
+            }
           : { ...base, direction: "received", body, read: record.read };
       }),
     );
@@ -337,8 +365,10 @@ export class History implements HistoryPort {
     sequence: number;
     delivery: SettledDelivery;
     body: string;
+    accepted?: number;
   }): Promise<boolean> {
-    const { body, ...metadata } = entry;
+    const { body, accepted, ...rest } = entry;
+    const metadata = accepted === undefined ? rest : { ...rest, accepted };
     return this.#enqueue(async () => {
       const current = this.#records.get(storageKey(metadata.peer, metadata.id));
       if (
@@ -355,6 +385,7 @@ export class History implements HistoryPort {
     peer: string,
     id: string,
     delivery: SettledDelivery,
+    accepted?: number,
   ): Promise<boolean> {
     return this.#enqueue(async () => {
       const record = this.#records.get(storageKey(peer, id));
@@ -369,7 +400,13 @@ export class History implements HistoryPort {
         return true;
       }
       return this.#persist(
-        { ...metadataOf(record), delivery } as Metadata,
+        {
+          ...metadataOf(record),
+          delivery,
+          ...(accepted === undefined || record.accepted !== undefined
+            ? {}
+            : { accepted }),
+        } as Metadata,
         body,
       );
     }, false);
