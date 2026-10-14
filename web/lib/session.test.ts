@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { availability, connectionOf, phaseOf } from "./application.ts";
+import type { LocalSession } from "./owner.ts";
 import { encodeBase64Url } from "./base64.ts";
+import { outboxLifetime } from "./outbox.ts";
+import { createMessageId } from "./protocol.ts";
 import { Session, type SessionOptions, type SessionState } from "./session.ts";
 import {
   created,
@@ -422,4 +425,116 @@ test("a message held locally is pending, then queued once relayed, then delivere
       a.state.conversations.conversations[0].messages[0].from,
     ).includes("while the recipient is away"),
   );
+});
+
+async function storedSent(local: LocalSession, id: string) {
+  await local.history.flush();
+  const { restored } = await local.history.restore();
+  const record = restored.find((m) => m.id === id);
+  assert.ok(record?.direction === "sent", `stored record ${id}`);
+  return record;
+}
+
+test("an internet session records when the relay accepted a message and keeps it after delivery", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const url = `ws://127.0.0.1:${port}/ws`;
+  const aLocal = await localSession();
+  const bLocal = await localSession();
+  const a = started({ kind: "websocket", local: aLocal, url });
+  const b = started({ kind: "websocket", local: bLocal, url });
+  await until(ready(a), "a ready");
+  await until(ready(b), "b ready");
+  assert.ok(a.open(bLocal.keys.identity));
+  await until(() => a.state.pairing !== null, "pairing state");
+
+  const before = Date.now();
+  const attempt = a.send("accepted by the relay");
+  assert.ok(attempt.accepted);
+  assert.equal(await attempt.delivery, "queued");
+  const after = Date.now();
+  const queued = await storedSent(aLocal, attempt.id);
+  assert.equal(queued.delivery, "queued");
+  assert.equal(typeof queued.accepted, "number");
+  assert.ok(queued.accepted! >= before && queued.accepted! <= after);
+
+  await until(
+    () =>
+      a.state.conversations.conversations
+        .find((c) => c.identity === bLocal.keys.identity)
+        ?.messages.some(
+          (m) =>
+            m.id === attempt.id &&
+            m.direction === "sent" &&
+            m.delivery === "delivered",
+        ) === true,
+    "delivered",
+  );
+  const delivered = await storedSent(aLocal, attempt.id);
+  assert.equal(delivered.delivery, "delivered");
+  assert.equal(delivered.accepted, queued.accepted);
+});
+
+test("a local peer session never records a relay acceptance time", async () => {
+  const carrier = await peerCarrier();
+  const aLocal = await localSession();
+  const bLocal = await localSession();
+  const b = started({ kind: "local", local: bLocal, link: carrier.listen });
+  const a = started({ kind: "local", local: aLocal, link: carrier.dial });
+  await until(ready(a), "a ready");
+  await until(ready(b), "b ready");
+  assert.ok(a.open(bLocal.keys.identity));
+  const attempt = a.send("acknowledged by the peer device");
+  assert.ok(attempt.accepted);
+  assert.equal(await attempt.delivery, "delivered");
+  const stored = await storedSent(aLocal, attempt.id);
+  assert.equal(stored.delivery, "delivered");
+  assert.equal(Object.hasOwn(stored, "accepted"), false);
+});
+
+test("an internet session expires only overdue relay-accepted messages restored from history", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const url = `ws://127.0.0.1:${port}/ws`;
+  const local = await localSession();
+  const peer = (await localSession()).keys.identity;
+  const now = Date.now();
+  const overdue = createMessageId();
+  const recent = createMessageId();
+  const legacy = createMessageId();
+  const seeded = [
+    { id: overdue, sequence: 1, accepted: now - outboxLifetime - 60_000 },
+    { id: recent, sequence: 2, accepted: now - 60_000 },
+    { id: legacy, sequence: 3 },
+  ];
+  for (const record of seeded) {
+    assert.ok(
+      await local.history.sent({
+        ...record,
+        peer,
+        delivery: "queued",
+        body: `seeded ${record.sequence}`,
+      }),
+    );
+  }
+
+  const session = started({ kind: "websocket", local, url });
+  await until(() => session.state.messaging === "ready", "messaging ready");
+  const delivery = (id: string) => {
+    const message = session.state.conversations.conversations
+      .find((c) => c.identity === peer)
+      ?.messages.find((m) => m.id === id);
+    return message?.direction === "sent" ? message.delivery : null;
+  };
+  assert.equal(delivery(overdue), "expired");
+  assert.equal(delivery(recent), "queued");
+  assert.equal(delivery(legacy), "queued");
+
+  const expired = await storedSent(local, overdue);
+  assert.equal(expired.delivery, "expired");
+  assert.equal(expired.accepted, seeded[0].accepted);
+  assert.equal((await storedSent(local, recent)).delivery, "queued");
+  const old = await storedSent(local, legacy);
+  assert.equal(old.delivery, "queued");
+  assert.equal(Object.hasOwn(old, "accepted"), false);
 });
