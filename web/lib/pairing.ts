@@ -266,29 +266,35 @@ export class Pairing implements Channel {
       }
       return outcome("established");
     }
+    let settle = (_: boolean) => {};
     const established = new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => {
-        release();
-        resolve(false);
-      }, establishTimeout);
-      const release = this.#pairs.onChange((changed) => {
-        const target = splitAddress(changed);
-        if (
-          target?.peer === peer &&
-          this.#pairs.state(changed) === "established"
-        ) {
-          clearTimeout(timer);
-          release();
-          resolve(true);
-        }
-      });
+      const timer = setTimeout(() => settle(false), establishTimeout);
+      const releases = [
+        this.#pairs.onChange((changed) => {
+          const target = splitAddress(changed);
+          if (
+            target?.peer === peer &&
+            this.#pairs.state(changed) === "established"
+          ) {
+            settle(true);
+          }
+        }),
+        this.#source?.onState(() => settle(false)) ?? (() => {}),
+      ];
+      settle = (value) => {
+        settle = () => {};
+        clearTimeout(timer);
+        releases.forEach((release) => release());
+        resolve(value);
+      };
     });
     const result = await this.#initiate(peer, null, true);
-    if (result !== "pending" && result !== "established") {
-      return { result, devices: [], pending: [] };
-    }
     if (result === "pending") {
       await established;
+    }
+    settle(false);
+    if (result !== "pending" && result !== "established") {
+      return { result, devices: [], pending: [] };
     }
     return outcome("pending");
   }

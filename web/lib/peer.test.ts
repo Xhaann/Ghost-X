@@ -5,6 +5,7 @@ import { deriveDeviceId, signRoster } from "./device.ts";
 import { ExchangeKey } from "./encryption.ts";
 import { IdentityKey } from "./identity.ts";
 import { type Link, type LinkConnection, LocalTransport } from "./local.ts";
+import { establishTimeout } from "./pairing.ts";
 import { pairAddress } from "./pairs.ts";
 import {
   type PeerAuthorization,
@@ -179,6 +180,109 @@ function sealed(frame: string): boolean {
 }
 
 const padding = `padding:${"x".repeat(16 * 1024)}`;
+
+function establishTimers(): {
+  created(): number;
+  live(): number;
+  restore(): void;
+} {
+  const set = globalThis.setTimeout;
+  const clear = globalThis.clearTimeout;
+  const live = new Set<unknown>();
+  let created = 0;
+  globalThis.setTimeout = ((
+    callback: (...args: unknown[]) => void,
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    if (delay !== establishTimeout) {
+      return set(callback, delay, ...args);
+    }
+    created += 1;
+    const handle = set(
+      (...values: unknown[]) => {
+        live.delete(handle);
+        callback(...values);
+      },
+      delay,
+      ...args,
+    );
+    live.add(handle);
+    return handle;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((handle?: Parameters<typeof clear>[0]) => {
+    live.delete(handle);
+    clear(handle);
+  }) as typeof clearTimeout;
+  return {
+    created: () => created,
+    live: () => live.size,
+    restore: () => {
+      globalThis.setTimeout = set;
+      globalThis.clearTimeout = clear;
+    },
+  };
+}
+
+function registrations(
+  target: object,
+  method: string,
+): { live(): number; restore(): void } {
+  const original = Reflect.get(target, method) as (
+    listener: unknown,
+  ) => () => void;
+  let live = 0;
+  Object.defineProperty(target, method, {
+    configurable: true,
+    writable: true,
+    value: (listener: unknown) => {
+      const release = original.call(target, listener);
+      live += 1;
+      let released = false;
+      return () => {
+        if (!released) {
+          released = true;
+          live -= 1;
+        }
+        release();
+      };
+    },
+  });
+  return {
+    live: () => live,
+    restore: () => {
+      Reflect.deleteProperty(target, method);
+    },
+  };
+}
+
+function heldFetch(device: PeerDevice): {
+  entered: Promise<void>;
+  release(): void;
+  restore(): void;
+} {
+  const entered = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  const fetch = device.rosters.fetch;
+  let held = false;
+  device.rosters.fetch = async (identity) => {
+    const roster = await fetch.call(device.rosters, identity);
+    if (!held) {
+      held = true;
+      entered.resolve();
+      await gate.promise;
+    }
+    return roster;
+  };
+  return {
+    entered: entered.promise,
+    release: () => gate.resolve(),
+    restore: () => {
+      gate.resolve();
+      Reflect.deleteProperty(device.rosters, "fetch");
+    },
+  };
+}
 
 function unpadded(link: Link): Link {
   return intercept(link, {
@@ -1611,6 +1715,218 @@ test("a disconnect during authentication or ratchet setup leaves no session and 
     () => bodies(b).includes("after a refused write"),
     "delivered after a refused write",
   );
+});
+
+test("a disconnect after initiation settles the send without waiting for the establish timeout", async () => {
+  const { a, b, carrier } = await linked({ requestTimeout: 4000 });
+  let initiated: string | null = null;
+  const initiate = a.endpoint.initiate;
+  a.endpoint.initiate = async (initiation) => {
+    const outcome = await initiate.call(a.endpoint, initiation);
+    if (initiated === null) {
+      initiated = outcome;
+      if (outcome === "initiated") {
+        carrier.drop();
+      }
+    }
+    return outcome;
+  };
+  const timers = establishTimers();
+  const changes = registrations(a.pairs, "onChange");
+  const states = registrations(a.messenger, "onState");
+  try {
+    const started = performance.now();
+    const result = await a.messenger.send(b.id, "during initiation");
+    const elapsed = performance.now() - started;
+    assert.equal(initiated, "initiated", "the peer accepted the initiation");
+    assert.deepEqual(result, { ok: false, reason: "session_pending" });
+    assert.ok(
+      elapsed < establishTimeout / 2,
+      `settled after ${Math.round(elapsed)}ms`,
+    );
+    assert.equal(timers.created(), 1, "one establish wait was armed");
+    assert.equal(timers.live(), 0, "the establish timer was cleared");
+    assert.equal(changes.live(), 0, "no pair listener was left behind");
+    assert.equal(states.live(), 0, "no state listener was left behind");
+    await until(disconnected(a, b), "down");
+    assert.equal(a.pairing.state(b.id, b.deviceId), "pending");
+    assert.ok(!bodies(b).includes("during initiation"));
+  } finally {
+    timers.restore();
+    changes.restore();
+    states.restore();
+    Reflect.deleteProperty(a.endpoint, "initiate");
+  }
+  assert.ok(!Object.hasOwn(a.endpoint, "initiate"));
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered");
+  assert.ok((await a.messenger.send(b.id, "after recovery")).ok);
+  await until(() => bodies(b).includes("after recovery"), "delivered");
+  assert.equal(a.pairing.state(b.id, b.deviceId), "established");
+});
+
+test("a source that goes inactive while the roster is fetched fails at once and releases its wait", async () => {
+  const { a, b, carrier } = await linked({ requestTimeout: 4000 });
+  const held = heldFetch(a);
+  const timers = establishTimers();
+  const changes = registrations(a.pairs, "onChange");
+  const states = registrations(a.messenger, "onState");
+  try {
+    const establishing = a.pairing.establish(b.id);
+    await held.entered;
+    carrier.drop();
+    await until(
+      () => !a.messenger.state.active && disconnected(a, b)(),
+      "inactive while fetching",
+    );
+    const started = performance.now();
+    held.release();
+    const outcome = await establishing;
+    const elapsed = performance.now() - started;
+    assert.deepEqual(outcome, { result: "failed", devices: [], pending: [] });
+    assert.ok(
+      elapsed < establishTimeout / 2,
+      `settled after ${Math.round(elapsed)}ms`,
+    );
+    assert.equal(timers.created(), 1, "one establish wait was armed");
+    assert.equal(timers.live(), 0, "the establish timer was cleared");
+    assert.equal(changes.live(), 0, "no pair listener was left behind");
+    assert.equal(states.live(), 0, "no state listener was left behind");
+  } finally {
+    held.restore();
+    timers.restore();
+    changes.restore();
+    states.restore();
+  }
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered");
+  assert.ok((await a.messenger.send(b.id, "after recovery")).ok);
+  await until(() => bodies(b).includes("after recovery"), "delivered");
+});
+
+test("a reconnect while the roster is fetched still waits for the new acceptance", async () => {
+  const { a, b, carrier } = await linked({ requestTimeout: 4000 });
+  const held = heldFetch(a);
+  const timers = establishTimers();
+  const changes = registrations(a.pairs, "onChange");
+  const states = registrations(a.messenger, "onState");
+  try {
+    const establishing = a.pairing.establish(b.id);
+    await held.entered;
+    carrier.drop();
+    await until(disconnected(a, b), "down");
+    b.endpoint.open();
+    a.endpoint.open();
+    await until(
+      () => authenticated(a, b)() && a.messenger.state.active,
+      "reconnected while fetching",
+    );
+    held.release();
+    const outcome = await establishing;
+    assert.deepEqual(outcome, {
+      result: "established",
+      devices: [b.deviceId],
+      pending: [],
+    });
+    assert.equal(timers.created(), 1, "one establish wait was armed");
+    assert.equal(timers.live(), 0, "the establish timer was cleared");
+    assert.equal(changes.live(), 0, "no pair listener was left behind");
+    assert.equal(states.live(), 0, "no state listener was left behind");
+  } finally {
+    held.restore();
+    timers.restore();
+    changes.restore();
+    states.restore();
+  }
+  assert.ok((await a.messenger.send(b.id, "after reconnect")).ok);
+  await until(() => bodies(b).includes("after reconnect"), "delivered");
+});
+
+test("an establish that fails early releases its timer and listeners", async () => {
+  const { a, b, carrier } = await linked({ requestTimeout: 4000 });
+  const initiate = a.endpoint.initiate;
+  a.endpoint.initiate = (initiation) => {
+    carrier.drop();
+    return initiate.call(a.endpoint, initiation);
+  };
+  const timers = establishTimers();
+  const changes = registrations(a.pairs, "onChange");
+  const states = registrations(a.messenger, "onState");
+  try {
+    const outcome = await a.pairing.establish(b.id);
+    assert.deepEqual(outcome, { result: "failed", devices: [], pending: [] });
+    assert.equal(timers.created(), 1, "one establish wait was armed");
+    assert.equal(timers.live(), 0, "the establish timer was cleared");
+    assert.equal(changes.live(), 0, "no pair listener was left behind");
+    assert.equal(states.live(), 0, "no state listener was left behind");
+  } finally {
+    timers.restore();
+    changes.restore();
+    states.restore();
+    Reflect.deleteProperty(a.endpoint, "initiate");
+  }
+  await until(disconnected(a, b), "down");
+  b.endpoint.open();
+  a.endpoint.open();
+  await until(authenticated(a, b), "recovered");
+  assert.ok((await a.messenger.send(b.id, "after failure")).ok);
+  await until(() => bodies(b).includes("after failure"), "delivered");
+});
+
+test("an obsolete establish that resumes after recovery leaves the new session alone", async () => {
+  const { a, b, carrier } = await linked({ requestTimeout: 4000 });
+  let initiations = 0;
+  const watch = b.endpoint.onEvent((event) => {
+    if (event.type === "initiation") {
+      initiations += 1;
+    }
+  });
+  const held = heldFetch(a);
+  try {
+    const obsolete = a.pairing.establish(b.id);
+    await held.entered;
+    carrier.drop();
+    await until(disconnected(a, b), "down");
+    b.endpoint.open();
+    a.endpoint.open();
+    await until(authenticated(a, b), "recovered");
+
+    const timers = establishTimers();
+    const changes = registrations(a.pairs, "onChange");
+    const states = registrations(a.messenger, "onState");
+    try {
+      assert.ok((await a.messenger.send(b.id, "replacement")).ok);
+      assert.equal(timers.live(), 0, "the replacement timer was cleared");
+      assert.equal(changes.live(), 0, "no pair listener was left behind");
+      assert.equal(states.live(), 0, "no state listener was left behind");
+    } finally {
+      timers.restore();
+      changes.restore();
+      states.restore();
+    }
+    await until(() => bodies(b).includes("replacement"), "delivered");
+    assert.equal(a.pairing.state(b.id, b.deviceId), "established");
+    assert.equal(initiations, 1, "only the replacement initiated");
+
+    held.release();
+    const late = await obsolete;
+    assert.deepEqual(late, {
+      result: "established",
+      devices: [b.deviceId],
+      pending: [],
+    });
+    assert.equal(initiations, 1, "the obsolete attempt sent no initiation");
+    assert.equal(a.pairing.state(b.id, b.deviceId), "established");
+    assert.ok((await a.messenger.send(b.id, "after obsolete")).ok);
+    await until(() => bodies(b).includes("after obsolete"), "delivered");
+    assert.equal(initiations, 1);
+    assert.equal(b.endpoint.failure, null);
+  } finally {
+    held.restore();
+    watch();
+  }
 });
 
 test("the local carrier absorbs backpressure up to its buffer cap and then refuses without closing", async () => {
