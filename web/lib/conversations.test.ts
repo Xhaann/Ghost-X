@@ -1,11 +1,13 @@
 import { encodeBase64Url } from "./base64.ts";
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { type TestContext, test } from "node:test";
 import type { Client } from "./client.ts";
 import {
   type ConversationsState,
   Conversations,
+  type HistoryPort,
   type MessageSource,
+  type SettledDelivery,
   maxConversations,
   maxMessages,
 } from "./conversations.ts";
@@ -19,7 +21,7 @@ import type {
 } from "./messenger.ts";
 import type { Messenger } from "./messenger.ts";
 import { outboxLifetime } from "./outbox.ts";
-import { maxBodySize } from "./protocol.ts";
+import { createMessageId, maxBodySize } from "./protocol.ts";
 import {
   type SecureDevice,
   freePort,
@@ -867,4 +869,230 @@ test("a deferred message expires a relay lifetime after the relay accepts it", a
   now = sent + 60_000 + outboxLifetime;
   source.setActive(true);
   assert.equal(deliveryOf(store, peer, attempt.id), "expired");
+});
+
+class RecordingHistory implements HistoryPort {
+  readonly settled: { id: string; delivery: SettledDelivery; saved: boolean }[] =
+    [];
+  fail = false;
+
+  has(): boolean {
+    return false;
+  }
+
+  async received(): Promise<boolean> {
+    return true;
+  }
+
+  async sent(): Promise<boolean> {
+    return true;
+  }
+
+  async settle(
+    _peer: string,
+    id: string,
+    delivery: SettledDelivery,
+  ): Promise<boolean> {
+    const saved = !(this.fail && delivery === "expired");
+    this.settled.push({ id, delivery, saved });
+    return saved;
+  }
+
+  read(): void {}
+
+  expiries(id: string) {
+    return this.settled.filter((s) => s.id === id && s.delivery === "expired");
+  }
+}
+
+function settledTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function relaySession(
+  t: TestContext,
+  options: { history?: HistoryPort } = {},
+) {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const [self, peer] = await identities(2);
+  const source = new Source();
+  const clock = { now: 1_000_000 };
+  const store = new Conversations(source, self, {
+    relay: true,
+    now: () => clock.now,
+    history: options.history,
+  });
+  store.start();
+  store.open(peer);
+  const advance = (ms: number) => {
+    clock.now += ms;
+    t.mock.timers.tick(ms);
+  };
+  const queue = async (body: string) => {
+    const attempt = store.send(body);
+    assert.ok(attempt.accepted);
+    source.sent.at(-1)?.resolve({ ok: true, devices: 1, pending: 0 });
+    assert.equal(await attempt.delivery, "queued");
+    return attempt.id;
+  };
+  return { self, peer, source, clock, store, advance, queue };
+}
+
+test("an idle connected relay session expires a queued message at its deadline", async (t) => {
+  const { peer, store, advance, queue } = await relaySession(t);
+  const id = await queue("held by the relay");
+  advance(outboxLifetime - 1);
+  assert.equal(deliveryOf(store, peer, id), "queued");
+  advance(1);
+  assert.equal(deliveryOf(store, peer, id), "expired");
+});
+
+test("a receipt before the deadline is never overwritten by the expiry timer", async (t) => {
+  const history = new RecordingHistory();
+  const { peer, source, store, advance, queue } = await relaySession(t, {
+    history,
+  });
+  const id = await queue("acknowledged in time");
+  advance(outboxLifetime - 1);
+  await source.receipt({ to: peer, device: DEVICE, id, status: "delivered" });
+  advance(outboxLifetime * 2);
+  assert.equal(deliveryOf(store, peer, id), "delivered");
+  assert.deepEqual(history.expiries(id), []);
+});
+
+test("messages with different and shared deadlines each expire at their own deadline", async (t) => {
+  const { peer, store, advance, queue } = await relaySession(t);
+  const first = await queue("first");
+  advance(1_000);
+  const second = await queue("second");
+  const shared = await queue("shared");
+  advance(4_000);
+  const last = await queue("last");
+  const states = () =>
+    [first, second, shared, last].map((id) => deliveryOf(store, peer, id));
+
+  advance(outboxLifetime - 5_000);
+  assert.deepEqual(states(), ["expired", "queued", "queued", "queued"]);
+  advance(999);
+  assert.deepEqual(states(), ["expired", "queued", "queued", "queued"]);
+  advance(1);
+  assert.deepEqual(states(), ["expired", "expired", "expired", "queued"]);
+  advance(4_000);
+  assert.deepEqual(states(), ["expired", "expired", "expired", "expired"]);
+});
+
+test("overdue restored messages expire at start and later deadlines still wait without repeated work", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const [self, peer] = await identities(2);
+  const source = new Source();
+  let now = 10_000_000;
+  const sent = (id: string, sequence: number, accepted: number) => ({
+    id,
+    from: self,
+    to: peer,
+    sequence,
+    direction: "sent" as const,
+    body: id,
+    delivery: "queued" as const,
+    accepted,
+  });
+  const history = new RecordingHistory();
+  const store = new Conversations(source, self, {
+    relay: true,
+    now: () => now,
+    history,
+    restored: [
+      sent("overdue", 1, now - outboxLifetime - 5),
+      sent("later", 2, now - outboxLifetime + 60_000),
+    ],
+  });
+  let published = 0;
+  store.onState(() => {
+    published += 1;
+  });
+  store.start();
+  assert.equal(deliveryOf(store, peer, "overdue"), "expired");
+  assert.equal(deliveryOf(store, peer, "later"), "queued");
+  await settledTurn();
+  assert.equal(history.expiries("overdue").length, 1);
+
+  const before = published;
+  t.mock.timers.tick(0);
+  t.mock.timers.tick(59_999);
+  now += 59_999;
+  assert.equal(published, before);
+  assert.equal(deliveryOf(store, peer, "later"), "queued");
+  now += 1;
+  t.mock.timers.tick(1);
+  assert.equal(deliveryOf(store, peer, "later"), "expired");
+  await settledTurn();
+  assert.equal(history.expiries("overdue").length, 1);
+  assert.equal(history.expiries("later").length, 1);
+});
+
+test("a message evicted from the conversation is never expired by a stale timer", async (t) => {
+  const history = new RecordingHistory();
+  const { peer, source, store, advance, queue } = await relaySession(t, {
+    history,
+  });
+  const id = await queue("pushed out of the window");
+  for (let i = 0; i < maxMessages; i++) {
+    assert.ok(
+      await source.deliver({
+        id: createMessageId(),
+        from: peer,
+        body: `incoming ${i}`,
+      }),
+    );
+  }
+  assert.ok(
+    !conversation(store, peer)?.messages.some((m) => m.id === id),
+    "the sent message left the window",
+  );
+  advance(outboxLifetime);
+  await settledTurn();
+  assert.deepEqual(history.expiries(id), []);
+});
+
+test("stopping the conversation store cancels its expiry timer", async (t) => {
+  const history = new RecordingHistory();
+  const { peer, store, advance, queue } = await relaySession(t, { history });
+  const id = await queue("stopped before the deadline");
+  store.stop();
+  advance(outboxLifetime * 2);
+  await settledTurn();
+  assert.deepEqual(store.state.conversations, []);
+  assert.deepEqual(history.expiries(id), []);
+  assert.equal(conversation(store, peer), undefined);
+});
+
+test("an expiry that cannot be saved is retried on the next pass and not treated as saved", async (t) => {
+  const history = new RecordingHistory();
+  const { peer, source, store, advance, queue } = await relaySession(t, {
+    history,
+  });
+  const id = await queue("expired while storage fails");
+  history.fail = true;
+  advance(outboxLifetime);
+  await settledTurn();
+  assert.equal(deliveryOf(store, peer, id), "expired");
+  assert.deepEqual(history.expiries(id), [
+    { id, delivery: "expired", saved: false },
+  ]);
+
+  advance(outboxLifetime * 10);
+  await settledTurn();
+  assert.equal(history.expiries(id).length, 1, "no timer retries a past deadline");
+
+  history.fail = false;
+  source.setActive(true);
+  await settledTurn();
+  assert.deepEqual(history.expiries(id).at(-1), {
+    id,
+    delivery: "expired",
+    saved: true,
+  });
+  source.setActive(true);
+  await settledTurn();
+  assert.equal(history.expiries(id).length, 2, "a saved expiry is not rewritten");
 });

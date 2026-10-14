@@ -124,6 +124,7 @@ export type ConversationOptions = {
 };
 
 export const maxConversations = 100;
+const maxTimerDelay = 2 ** 31 - 1;
 export const maxMessages = 200;
 
 const empty: ConversationsState = {
@@ -149,8 +150,9 @@ export class Conversations implements Receiver {
   readonly #conversations = new Map<string, Conversation>();
   readonly #accepted = new Map<
     string,
-    { identity: string; id: string; accepted: number }
+    { identity: string; id: string; accepted: number; saving: boolean }
   >();
+  #timer: ReturnType<typeof setTimeout> | null = null;
   #active: string | null = null;
   #sequence = 0;
   #generation = 0;
@@ -200,6 +202,7 @@ export class Conversations implements Receiver {
     this.#generation += 1;
     this.#conversations.clear();
     this.#accepted.clear();
+    this.#schedule();
     this.#active = null;
     this.#state = empty;
     this.#states.emit(this.#state);
@@ -312,6 +315,7 @@ export class Conversations implements Receiver {
   async relayed(message: { to: string; id: string }): Promise<boolean> {
     const accepted = this.#accept(message.to, message.id);
     this.#settle(this.#generation, message.to, message.id, "queued");
+    this.#schedule();
     return this.#history
       ? this.#history.settle(message.to, message.id, "queued", accepted)
       : true;
@@ -320,6 +324,7 @@ export class Conversations implements Receiver {
   async settle(receipt: Receipt): Promise<boolean> {
     const delivery: SettledDelivery = receipt.status;
     this.#settle(this.#generation, receipt.to, receipt.id, delivery);
+    this.#schedule();
     return this.#history
       ? this.#history.settle(receipt.to, receipt.id, delivery)
       : true;
@@ -338,6 +343,7 @@ export class Conversations implements Receiver {
       this.#accept(to, id);
     }
     const settled = this.#settle(generation, to, id, delivery);
+    this.#schedule();
     const accepted =
       settled === "queued" || settled === "delivered" || settled === "expired"
         ? this.#accepted.get(`${to}/${id}`)?.accepted
@@ -361,24 +367,88 @@ export class Conversations implements Receiver {
     }
     const key = `${identity}/${id}`;
     const accepted = this.#accepted.get(key)?.accepted ?? this.#now();
-    this.#accepted.set(key, { identity, id, accepted });
+    this.#accepted.set(key, { identity, id, accepted, saving: false });
     return accepted;
   }
 
+  #delivery(identity: string, id: string): DeliveryState | null {
+    const message = this.#conversations
+      .get(identity)
+      ?.messages.find((m) => m.id === id && m.direction === "sent");
+    return message?.direction === "sent" ? message.delivery : null;
+  }
+
   #expire(): void {
+    if (!this.#detach) {
+      return;
+    }
     const now = this.#now();
-    for (const [key, { identity, id, accepted }] of [...this.#accepted]) {
-      const message = this.#conversations
-        .get(identity)
-        ?.messages.find((m) => m.id === id && m.direction === "sent");
-      if (message?.direction !== "sent" || message.delivery !== "queued") {
+    for (const [key, entry] of [...this.#accepted]) {
+      let delivery = this.#delivery(entry.identity, entry.id);
+      if (delivery === "queued" && now - entry.accepted >= outboxLifetime) {
+        delivery = this.#settle(
+          this.#generation,
+          entry.identity,
+          entry.id,
+          "expired",
+        );
+      }
+      if (delivery === "expired") {
+        this.#save(key, entry);
+      } else if (delivery !== "queued") {
         this.#accepted.delete(key);
-      } else if (now - accepted >= outboxLifetime) {
-        this.#accepted.delete(key);
-        this.#settle(this.#generation, identity, id, "expired");
-        void this.#history?.settle(identity, id, "expired");
       }
     }
+    this.#schedule();
+  }
+
+  #save(
+    key: string,
+    entry: { identity: string; id: string; saving: boolean },
+  ): void {
+    if (!this.#history) {
+      this.#accepted.delete(key);
+      return;
+    }
+    if (entry.saving) {
+      return;
+    }
+    entry.saving = true;
+    this.#history.settle(entry.identity, entry.id, "expired").then(
+      (saved) => {
+        entry.saving = false;
+        if (saved && this.#accepted.get(key) === entry) {
+          this.#accepted.delete(key);
+        }
+      },
+      () => {
+        entry.saving = false;
+      },
+    );
+  }
+
+  #schedule(): void {
+    if (this.#timer !== null) {
+      clearTimeout(this.#timer);
+      this.#timer = null;
+    }
+    if (!this.#detach) {
+      return;
+    }
+    let next = Number.POSITIVE_INFINITY;
+    for (const entry of this.#accepted.values()) {
+      if (this.#delivery(entry.identity, entry.id) === "queued") {
+        next = Math.min(next, entry.accepted + outboxLifetime);
+      }
+    }
+    if (next === Number.POSITIVE_INFINITY) {
+      return;
+    }
+    const delay = Math.min(Math.max(next - this.#now(), 0), maxTimerDelay);
+    this.#timer = setTimeout(() => {
+      this.#timer = null;
+      this.#expire();
+    }, delay);
   }
 
   #settle(
@@ -462,6 +532,7 @@ export class Conversations implements Receiver {
           identity: peer,
           id: message.id,
           accepted,
+          saving: false,
         });
       }
       this.#sequence = Math.max(this.#sequence, message.sequence);
