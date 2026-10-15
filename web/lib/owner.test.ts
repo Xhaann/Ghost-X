@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { phaseOf } from "./application.ts";
+import { ExchangeKey } from "./encryption.ts";
+import { History } from "./history.ts";
 import { IdentityKey } from "./identity.ts";
 import { deviceLockName, requestDeviceLock } from "./lock.ts";
 import { type LoadedDevice, type LocalSession, loadDevice } from "./owner.ts";
-import { pairAddress } from "./pairs.ts";
+import { Pairs, pairAddress } from "./pairs.ts";
 import { createMessageId } from "./protocol.ts";
 import { Session, type SessionState } from "./session.ts";
+import { Trust } from "./trust.ts";
 import {
   freePort,
   memoryStore,
@@ -670,4 +673,129 @@ test("invalid prekeys still fail closed, and tabs creating prekeys together conv
   }
   const record = shared.store.data.get("vault:prekeys");
   assert.deepEqual(await messagingKeys(shared.store), record);
+});
+
+function watched(store: ReturnType<typeof memoryStore>) {
+  const usage = { closes: 0, late: [] as string[] };
+  const methods = ["get", "getAll", "put", "add", "swap", "delete", "clear"];
+  const target = store as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  for (const name of methods) {
+    const original = target[name];
+    target[name] = (...args: unknown[]) => {
+      if (usage.closes > 0) {
+        usage.late.push(`${name} ${args.slice(0, 2).join(":")}`);
+      }
+      return original.apply(store, args);
+    };
+  }
+  const close = store.close;
+  store.close = () => {
+    usage.closes += 1;
+    close.call(store);
+  };
+  return usage;
+}
+
+async function releasing<T>(
+  run: () => Promise<T>,
+): Promise<{ result: T; released: number; closed: number }> {
+  const identity = IdentityKey.prototype.release;
+  const exchange = ExchangeKey.prototype.release;
+  const closes = [History, Trust, Pairs].map((type) => ({
+    proto: type.prototype as { close(): Promise<void> },
+    close: type.prototype.close,
+  }));
+  let released = 0;
+  let closed = 0;
+  IdentityKey.prototype.release = function () {
+    released += 1;
+    identity.call(this);
+  };
+  ExchangeKey.prototype.release = function () {
+    released += 1;
+    exchange.call(this);
+  };
+  for (const { proto, close } of closes) {
+    proto.close = function () {
+      closed += 1;
+      return close.call(this);
+    };
+  }
+  try {
+    return { result: await run(), released, closed };
+  } finally {
+    IdentityKey.prototype.release = identity;
+    ExchangeKey.prototype.release = exchange;
+    for (const { proto, close } of closes) {
+      proto.close = close;
+    }
+  }
+}
+
+test("a failed store open waits for the other stores, then releases the keys and closes the store once", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  store.data.delete("vault:prekeys");
+  store.data.delete("vault:roster");
+  const usage = watched(store);
+  let signal!: () => void;
+  const prekeysFailed = new Promise<void>((resolve) => {
+    signal = resolve;
+  });
+  const restore = creatingPrekeysWith(store, async () => {
+    signal();
+    return false;
+  });
+  let unblock!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    unblock = resolve;
+  });
+  const get = store.get;
+  store.get = async (name, key) => {
+    if (name === "vault" && key === "roster") {
+      await gate;
+    }
+    return get(name, key);
+  };
+  const { result, released, closed } = await releasing(async () => {
+    const loading = loadDevice(store);
+    await prekeysFailed;
+    await new Promise((resolve) => setImmediate(resolve));
+    unblock();
+    return loading;
+  });
+  store.get = get;
+  restore();
+  assert.equal(result.local.status, "unavailable");
+  assert.deepEqual(usage.late, [], "no store operation after the store closed");
+  assert.equal(usage.closes, 1);
+  assert.equal(released, 3, "the root, device and exchange keys are released");
+  assert.equal(closed, 3, "the opened history, trust and pairs stores are closed");
+  await result.close();
+  assert.equal(usage.closes, 1, "closing the failed result closes nothing again");
+  await recovered(store, identity, deviceId);
+  await messagingKeys(store);
+});
+
+test("several failing store opens release the keys once and close the store once", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  store.data.delete("vault:prekeys");
+  store.data.delete("vault:roster");
+  const usage = watched(store);
+  const undoPrekeys = creatingPrekeysWith(store, async () => false);
+  const undoRoster = rebuildingWith(store, async () => false);
+  const { result, released, closed } = await releasing(() =>
+    loadDevice(store),
+  );
+  undoRoster();
+  undoPrekeys();
+  assert.equal(result.local.status, "unavailable");
+  assert.deepEqual(usage.late, [], "no store operation after the store closed");
+  assert.equal(usage.closes, 1);
+  assert.equal(released, 3, "each key is released exactly once");
+  assert.equal(closed, 3, "each opened store is closed exactly once");
+  await recovered(store, identity, deviceId);
+  assert.ok(store.data.has("vault:roster") && store.data.has("vault:prekeys"));
 });

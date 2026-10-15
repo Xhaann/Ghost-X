@@ -41,15 +41,19 @@ export type LoadedDevice = {
   close: () => Promise<void>;
 };
 
+function release(keys: Keys): void {
+  keys.root?.release();
+  keys.device.release();
+  keys.exchange.release();
+}
+
 export async function closeLocal(session: LocalSession): Promise<void> {
   await Promise.all([
     session.history.close(),
     session.trust.close(),
     session.pairs.close(),
   ]);
-  session.keys.root?.release();
-  session.keys.device.release();
-  session.keys.exchange.release();
+  release(session.keys);
 }
 
 export async function loadDevice(
@@ -72,27 +76,42 @@ export async function loadDevice(
     if (vault.status !== "ready") {
       return { local: vault, close: closeStore };
     }
-    const [history, trust, prekeys, pairs, devices, outbox] = await Promise.all(
-      [
+    const [history, trust, prekeys, pairs, devices, outbox] =
+      await Promise.allSettled([
         History.open(store, vault.keys, vault.integrity, vault.storage),
         Trust.open(store, vault.integrity),
         PrekeyStore.open(store, vault.keys, vault.integrity),
         Pairs.open(store, vault.integrity, vault.storage, vault.keys.identity),
         Devices.open(store, vault.keys),
         Outbox.open(store, vault.storage),
-      ],
-    );
+      ]);
+    if (
+      history.status === "rejected" ||
+      trust.status === "rejected" ||
+      prekeys.status === "rejected" ||
+      pairs.status === "rejected" ||
+      devices.status === "rejected" ||
+      outbox.status === "rejected"
+    ) {
+      await Promise.allSettled(
+        [history, trust, pairs].map((opened) =>
+          opened.status === "fulfilled" ? opened.value.close() : undefined,
+        ),
+      );
+      release(vault.keys);
+      throw new Error("local stores could not be opened");
+    }
     const session = {
       keys: vault.keys,
-      devices: devices as Devices,
-      history,
-      trust,
-      prekeys,
-      pairs,
-      outbox,
+      devices: devices.value as Devices,
+      history: history.value,
+      trust: trust.value,
+      prekeys: prekeys.value,
+      pairs: pairs.value,
+      outbox: outbox.value,
       created: vault.created,
     };
-    if (!devices) {
+    if (!devices.value) {
       await closeLocal(session);
       return { local: { status: "corrupted" }, close: closeStore };
     }
