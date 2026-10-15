@@ -15,6 +15,7 @@ WebSocket endpoint: `/ws`
 | --- | --- |
 | `SERVER_ADDR` | `:8080` |
 | `SHUTDOWN_TIMEOUT` | `10s` |
+| `AUTH_TIMEOUT` | `60s`; a positive duration such as `30s`, after which a connection that has not authenticated is closed |
 | `ALLOWED_ORIGINS` | same host only |
 | `DEVICE_STORE` | `ghostx/devices.json` in the user config directory |
 | `LOCAL_SOCKET` | unset; an absolute path enables the local stream carrier on a Unix socket |
