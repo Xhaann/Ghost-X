@@ -712,6 +712,137 @@ func TestRosterChangesAreRateLimitedGloballyAndPerIdentity(t *testing.T) {
 	}
 }
 
+func withExhaustedGlobalLimit(t *testing.T, devices int) (*device.Registry, *devicetest.Identity, []*devicetest.Device) {
+	t.Helper()
+	r, _ := open(t)
+	now := time.Unix(1_700_000_000, 0)
+	r.SetLimits(device.Limits{Rate: 1, Burst: 10, IdentityRate: 0.1, IdentityBurst: 3, Now: func() time.Time { return now }})
+	victim := devicetest.NewIdentity()
+	listed := make([]*devicetest.Device, devices)
+	for i := range listed {
+		listed[i] = victim.NewDevice()
+	}
+	if err := r.Publish(victim.Add(listed...)); err != nil {
+		t.Fatal(err)
+	}
+	for accepted := range 10 {
+		other := devicetest.NewIdentity()
+		err := r.Publish(other.Add(other.NewDevice()))
+		if errors.Is(err, device.ErrRate) {
+			if accepted != 9 {
+				t.Fatalf("global budget exhausted after %d other identities, want 9", accepted)
+			}
+			return r, victim, listed
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Fatal("global budget not exhausted")
+	return nil, nil, nil
+}
+
+func rosterIDs(t *testing.T, r *device.Registry, id *devicetest.Identity) (uint32, []string) {
+	t.Helper()
+	roster, ok := r.Roster(id.Identity)
+	if !ok {
+		t.Fatal("roster missing")
+	}
+	ids := make([]string, 0, len(roster.Devices))
+	for _, d := range roster.Devices {
+		ids = append(ids, d.ID)
+	}
+	slices.Sort(ids)
+	return roster.Version, ids
+}
+
+func sortedIDs(devices ...*devicetest.Device) []string {
+	ids := make([]string, 0, len(devices))
+	for _, d := range devices {
+		ids = append(ids, d.ID)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func TestRevocationIsAcceptedWhenTheGlobalLimitIsExhausted(t *testing.T) {
+	r, victim, listed := withExhaustedGlobalLimit(t, 3)
+	before := r.Len()
+	revoked := listed[2]
+	if err := r.Publish(victim.Remove(revoked)); err != nil {
+		t.Fatalf("revocation under an exhausted global limit = %v", err)
+	}
+	version, ids := rosterIDs(t, r, victim)
+	if version != victim.Version || !slices.Equal(ids, sortedIDs(listed[0], listed[1])) {
+		t.Fatalf("roster = v%d %v", version, ids)
+	}
+	if r.Authorized(victim.Identity, revoked.ID) || !r.Authorized(victim.Identity, listed[0].ID) {
+		t.Fatal("revocation not applied")
+	}
+	if err := r.Publish(victim.Sign(victim.Version+1, append(slices.Clone(victim.Devices), revoked))); !errors.Is(err, device.ErrReused) {
+		t.Fatalf("revoked device authorized again: %v", err)
+	}
+	if r.Len() != before {
+		t.Fatalf("Len() = %d, want %d", r.Len(), before)
+	}
+}
+
+func TestChangesOtherThanRemovalsStayGloballyRateLimited(t *testing.T) {
+	r, victim, listed := withExhaustedGlobalLimit(t, 2)
+	version, ids := rosterIDs(t, r, victim)
+	added := victim.NewDevice()
+	rekeyed := *listed[0]
+	rekeyed.Exchange = devicetest.NewExchange()
+	rekeyed.ExchangeRaw = rekeyed.Exchange.PublicKey().Bytes()
+	for name, devices := range map[string][]*devicetest.Device{
+		"addition":              {listed[0], listed[1], added},
+		"replacement":           {listed[0], added},
+		"unchanged list":        {listed[0], listed[1]},
+		"removal with a re-key": {&rekeyed},
+	} {
+		if err := r.Publish(victim.Sign(version+1, devices)); !errors.Is(err, device.ErrRate) {
+			t.Fatalf("%s = %v, want ErrRate", name, err)
+		}
+		if v, now := rosterIDs(t, r, victim); v != version || !slices.Equal(now, ids) {
+			t.Fatalf("%s changed the roster to v%d %v", name, v, now)
+		}
+		if r.Authorized(victim.Identity, added.ID) || !r.Authorized(victim.Identity, listed[1].ID) {
+			t.Fatalf("%s changed authorization", name)
+		}
+	}
+}
+
+func TestNewIdentitiesStayGloballyRateLimited(t *testing.T) {
+	r, _, _ := withExhaustedGlobalLimit(t, 1)
+	before := r.Len()
+	other := devicetest.NewIdentity()
+	if err := r.Publish(other.Add(other.NewDevice())); !errors.Is(err, device.ErrRate) {
+		t.Fatalf("new identity = %v, want ErrRate", err)
+	}
+	if _, ok := r.Roster(other.Identity); ok || r.Len() != before {
+		t.Fatalf("rejected identity stored: Len() = %d, want %d", r.Len(), before)
+	}
+}
+
+func TestRepeatedRevocationsStayLimitedPerIdentity(t *testing.T) {
+	r, victim, listed := withExhaustedGlobalLimit(t, 4)
+	for _, d := range []*devicetest.Device{listed[3], listed[2]} {
+		if err := r.Publish(victim.Remove(d)); err != nil {
+			t.Fatalf("revocation within the identity limit = %v", err)
+		}
+	}
+	version, ids := rosterIDs(t, r, victim)
+	if err := r.Publish(victim.Sign(version+1, []*devicetest.Device{listed[0]})); !errors.Is(err, device.ErrRate) {
+		t.Fatalf("revocation beyond the identity limit = %v, want ErrRate", err)
+	}
+	if v, now := rosterIDs(t, r, victim); v != version || !slices.Equal(now, ids) || !slices.Equal(now, sortedIDs(listed[0], listed[1])) {
+		t.Fatalf("rejected revocation changed the roster to v%d %v", v, now)
+	}
+	if !r.Authorized(victim.Identity, listed[1].ID) || r.Authorized(victim.Identity, listed[2].ID) || r.Authorized(victim.Identity, listed[3].ID) {
+		t.Fatal("authorization does not match the accepted revocations")
+	}
+}
+
 func TestTheRegistryRefusesNewIdentitiesAtCapacity(t *testing.T) {
 	r, err := device.Open("")
 	if err != nil {

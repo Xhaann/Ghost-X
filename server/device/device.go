@@ -276,7 +276,7 @@ func (r *Registry) SetLimits(l Limits) {
 	r.limits = l
 }
 
-func (r *Registry) allow(owner string) bool {
+func (r *Registry) allow(owner string, global bool) bool {
 	l := r.limits
 	if l.Now == nil {
 		return true
@@ -290,7 +290,7 @@ func (r *Registry) allow(owner string) bool {
 	if !probe.take(l.IdentityRate, l.IdentityBurst, now) {
 		return false
 	}
-	if !r.global.take(l.Rate, l.Burst, now) {
+	if global && !r.global.take(l.Rate, l.Burst, now) {
 		return false
 	}
 	*b = probe
@@ -448,7 +448,7 @@ func (r *Registry) publish(roster Roster) ([]string, []func(), []func(owner, dev
 			revoked = revoked[len(revoked)-MaxRevoked:]
 		}
 	}
-	if !r.allow(roster.Identity) {
+	if !r.allow(roster.Identity, current == nil || !removesOnly(current.roster.Devices, roster.Devices)) {
 		return nil, nil, nil, ErrRate
 	}
 	if err := r.append(stored{Roster: roster, Revoked: nonNil(revoked)}); err != nil {
@@ -601,6 +601,18 @@ func syncDir(dir string) error {
 func cloneRoster(r Roster) Roster {
 	r.Devices = slices.Clone(r.Devices)
 	return r
+}
+
+func removesOnly(current, next []Device) bool {
+	if len(next) >= len(current) {
+		return false
+	}
+	for _, d := range next {
+		if !slices.Contains(current, d) {
+			return false
+		}
+	}
+	return true
 }
 
 func sameRoster(a, b Roster) bool {
