@@ -1,6 +1,6 @@
 # Ghost X
 
-Requires Go 1.26 and Node.js 20.9+.
+Requires Go 1.26 and Node.js 24.5+.
 
 ## Server
 
