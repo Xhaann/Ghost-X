@@ -218,7 +218,7 @@ export class PrekeyStore {
       existing !== null &&
       (existing as { v?: unknown }).v === 1;
     if (existing !== undefined && !stale) {
-      const state = await PrekeyStore.#verify(existing, integrity);
+      const state = await PrekeyStore.#verify(existing, integrity, true);
       if (!state || state.device !== keys.deviceId) {
         return null;
       }
@@ -259,16 +259,18 @@ export class PrekeyStore {
     ) {
       return new PrekeyStore(store, keys, integrity, fresh);
     }
-    const winner = await PrekeyStore.#verify(
-      await store.get("vault", recordKey),
-      integrity,
-    );
+    const current = await store.get("vault", recordKey);
+    if (current === undefined) {
+      throw new Error("the prekey inventory could not be stored");
+    }
+    const winner = await PrekeyStore.#verify(current, integrity, true);
     return winner ? new PrekeyStore(store, keys, integrity, winner) : null;
   }
 
   static async #verify(
     value: unknown,
     integrity: CryptoKey,
+    strict = false,
   ): Promise<Stored | null> {
     const state = parsePrekeys(value);
     const mac = state && decodeBase64Url(state.mac, macSize);
@@ -284,7 +286,10 @@ export class PrekeyStore {
       ))
         ? state
         : null;
-    } catch {
+    } catch (error) {
+      if (strict) {
+        throw error;
+      }
       return null;
     }
   }

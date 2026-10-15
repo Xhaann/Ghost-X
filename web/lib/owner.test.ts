@@ -530,3 +530,144 @@ test("genuine integrity failures stay corrupted and are distinct from a missing 
   assert.deepEqual(tampered.local, { status: "corrupted" });
   await tampered.close();
 });
+
+const prekeyPrefix = new TextEncoder().encode("ghostx/prekeys/v2\0");
+
+const prekeyCheck = (args: unknown[]) => {
+  const data = new Uint8Array(args.at(-1) as Uint8Array);
+  return prekeyPrefix.every((byte, i) => data[i] === byte);
+};
+
+function creatingPrekeysWith(
+  store: ReturnType<typeof memoryStore>,
+  attempt: () => Promise<boolean>,
+): () => void {
+  const add = store.add;
+  store.add = (name, key, value) =>
+    name === "vault" && key === "prekeys" ? attempt() : add(name, key, value);
+  return () => {
+    store.add = add;
+  };
+}
+
+async function messagingKeys(
+  store: ReturnType<typeof memoryStore>,
+): Promise<unknown> {
+  const loaded = await loadDevice(store);
+  const local = ready(loaded.local);
+  assert.notEqual(local.prekeys, null, "the prekeys are restored");
+  await loaded.close();
+  return store.data.get("vault:prekeys");
+}
+
+function flippedMac(record: unknown): unknown {
+  const stored = record as { mac: string };
+  return {
+    ...stored,
+    mac: (stored.mac[0] === "A" ? "B" : "A") + stored.mac.slice(1),
+  };
+}
+
+test("a temporary browser error while checking stored prekeys is unavailable and changes nothing", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  const prekeys = store.data.get("vault:prekeys");
+  const before = contents(store);
+  const { result, failed } = await failing(
+    "verify",
+    () => loadDevice(store),
+    prekeyCheck,
+  );
+  assert.equal(failed, 1);
+  assert.equal(result.local.status, "unavailable");
+  await result.close();
+  assert.deepEqual(contents(store), before);
+  await recovered(store, identity, deviceId);
+  assert.deepEqual(await messagingKeys(store), prekeys);
+});
+
+test("a failed write while creating missing prekeys is unavailable and the prekeys are created later", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  store.data.delete("vault:prekeys");
+  const before = contents(store);
+  const restore = creatingPrekeysWith(store, async () => false);
+  const failed = await loadDevice(store);
+  restore();
+  assert.equal(failed.local.status, "unavailable");
+  await failed.close();
+  assert.deepEqual(contents(store), before, "nothing was written");
+  await recovered(store, identity, deviceId);
+  assert.ok(store.data.has("vault:prekeys"), "the prekeys are created later");
+  await messagingKeys(store);
+});
+
+test("a temporary browser error while checking prekeys written by another tab is unavailable", async () => {
+  const { store, identity, deviceId } = await withHistory();
+  const theirs = store.data.get("vault:prekeys");
+  store.data.delete("vault:prekeys");
+  const restore = creatingPrekeysWith(store, async () => {
+    store.data.set("vault:prekeys", structuredClone(theirs));
+    return false;
+  });
+  const { result, failed } = await failing(
+    "verify",
+    () => loadDevice(store),
+    prekeyCheck,
+  );
+  restore();
+  assert.equal(failed, 1);
+  assert.equal(result.local.status, "unavailable");
+  await result.close();
+  await recovered(store, identity, deviceId);
+  assert.deepEqual(await messagingKeys(store), theirs);
+});
+
+test("invalid prekeys still fail closed, and tabs creating prekeys together converge on one valid record", async () => {
+  const tampered = await withHistory();
+  tampered.store.data.set(
+    "vault:prekeys",
+    flippedMac(tampered.store.data.get("vault:prekeys")),
+  );
+  const before = contents(tampered.store);
+  const closed = await loadDevice(tampered.store);
+  assert.equal(ready(closed.local).prekeys, null);
+  await closed.close();
+  assert.deepEqual(contents(tampered.store), before);
+
+  const raced = await withHistory();
+  const theirs = raced.store.data.get("vault:prekeys");
+  raced.store.data.delete("vault:prekeys");
+  const restore = creatingPrekeysWith(raced.store, async () => {
+    raced.store.data.set("vault:prekeys", structuredClone(theirs));
+    return false;
+  });
+  const won = await loadDevice(raced.store);
+  restore();
+  assert.notEqual(ready(won.local).prekeys, null);
+  await won.close();
+  assert.deepEqual(raced.store.data.get("vault:prekeys"), theirs);
+
+  const forged = await withHistory();
+  const forgedRecord = flippedMac(forged.store.data.get("vault:prekeys"));
+  forged.store.data.delete("vault:prekeys");
+  const undo = creatingPrekeysWith(forged.store, async () => {
+    forged.store.data.set("vault:prekeys", structuredClone(forgedRecord));
+    return false;
+  });
+  const rejected = await loadDevice(forged.store);
+  undo();
+  assert.equal(ready(rejected.local).prekeys, null);
+  await rejected.close();
+
+  const shared = await withHistory();
+  shared.store.data.delete("vault:prekeys");
+  const tabs = await Promise.all([
+    loadDevice(shared.store),
+    loadDevice(shared.store),
+  ]);
+  for (const tab of tabs) {
+    assert.notEqual(ready(tab.local).prekeys, null);
+    await tab.close();
+  }
+  const record = shared.store.data.get("vault:prekeys");
+  assert.deepEqual(await messagingKeys(shared.store), record);
+});
