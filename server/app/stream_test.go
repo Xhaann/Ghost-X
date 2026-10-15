@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Xhaann/ghost-x/server/auth"
 	"github.com/Xhaann/ghost-x/server/stream"
 )
 
@@ -295,6 +296,55 @@ func TestMalformedLocalFramesCloseOnlyThatConnection(t *testing.T) {
 	healthy := dialLocal(t, path)
 	healthy.write(t, pingRequest("p1", 1))
 	healthy.expect(t, "pong", "p1")
+}
+
+func TestUnauthenticatedLocalConnectionClosedAtDeadline(t *testing.T) {
+	srv, _ := serveWithDeadline(t, 200*time.Millisecond)
+	path := serveLocal(t, srv)
+	p := dialLocal(t, path)
+	p.challenge(t)
+	if srv.sessions.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", srv.sessions.Len())
+	}
+
+	p.closed(t)
+	waitUntil(t, "expired session removed", func() bool { return srv.sessions.Len() == 0 })
+	waitUntil(t, "local connection released", func() bool { return srv.stream.Len() == 0 })
+}
+
+func TestAuthenticatedLocalConnectionOutlivesDeadline(t *testing.T) {
+	srv, _ := serveWithDeadline(t, 500*time.Millisecond)
+	path := serveLocal(t, srv)
+	p := dialLocal(t, path)
+	p.authenticate(t, newKey(t))
+
+	idle := dialLocal(t, path)
+	idle.closed(t)
+	p.write(t, pingRequest("p1", 1))
+	p.expect(t, "pong", "p1")
+	waitUntil(t, "only the authenticated session", func() bool { return srv.sessions.Len() == 1 })
+	waitUntil(t, "only the authenticated local connection", func() bool { return srv.stream.Len() == 1 })
+	if srv.sessions.Authenticated() != 1 {
+		t.Fatalf("Authenticated() = %d, want 1", srv.sessions.Authenticated())
+	}
+}
+
+func TestFailedLocalAuthenticationClosesConnection(t *testing.T) {
+	srv, _ := startServer(t)
+	path := serveLocal(t, srv)
+	p := dialLocal(t, path)
+	k := newKey(t)
+
+	for range auth.MaxFailures - 1 {
+		p.write(t, authenticateRequest(k, p.challenge(t)))
+		if msg := p.next(t); msg.Type != "error" {
+			t.Fatalf("unregistered authentication = %+v %s", msg, msg.Payload)
+		}
+	}
+	p.write(t, authenticateRequest(k, p.challenge(t)))
+	p.closed(t)
+	waitUntil(t, "failed session removed", func() bool { return srv.sessions.Len() == 0 })
+	waitUntil(t, "local connection released", func() bool { return srv.stream.Len() == 0 })
 }
 
 func TestShutdownClosesLocalConnections(t *testing.T) {
