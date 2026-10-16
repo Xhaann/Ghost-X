@@ -405,7 +405,7 @@ const deliveryViews: Record<DeliveryState, View> = {
   },
   expired: {
     label: "Not delivered",
-    detail: "It expired before the recipient's device came online.",
+    detail: "Delivery stopped before the recipient's device confirmed it.",
     tone: "danger",
     symbol: "!",
   },

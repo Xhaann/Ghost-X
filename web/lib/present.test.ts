@@ -509,3 +509,11 @@ test("restoration failures say nothing was deleted and only a confirmed integrit
       corrupted.detail.indexOf("permanently deletes"),
   );
 });
+
+test("a message that stopped being delivered never claims why the recipient missed it", () => {
+  const view = deliveryView("expired");
+  assert.equal(view.label, "Not delivered");
+  assert.equal(view.tone, "danger");
+  assert.match(view.detail, /confirm/i);
+  assert.doesNotMatch(view.detail, /online|offline|never|received/i);
+});
