@@ -543,3 +543,149 @@ test("fuzzed prekey records and consumption inputs never corrupt or bypass the s
     "rejected input never changes state",
   );
 });
+
+const prekeyContext = new TextEncoder().encode("ghostx/prekeys/v2\0");
+
+function failPrekeyHmac(method: "sign" | "verify", times: number) {
+  const subtle = crypto.subtle as unknown as Record<
+    "sign" | "verify",
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const original = subtle[method];
+  let failed = 0;
+  subtle[method] = (...args: unknown[]) => {
+    const data = args.at(-1);
+    const bytes = ArrayBuffer.isView(data)
+      ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+      : new Uint8Array(data as ArrayBuffer);
+    if (
+      failed < times &&
+      args[0] === "HMAC" &&
+      prekeyContext.every((byte, i) => bytes[i] === byte)
+    ) {
+      failed += 1;
+      return Promise.reject(new DOMException("temporary", "OperationError"));
+    }
+    return original.apply(crypto.subtle, args);
+  };
+  return {
+    failed: () => failed,
+    restore: () => {
+      subtle[method] = original;
+    },
+  };
+}
+
+function inventoryOf(value: Record<string, unknown>) {
+  const { signed, previous, onetime, nextSigned, nextOnetime, consumed } =
+    value;
+  return { signed, previous, onetime, nextSigned, nextOnetime, consumed };
+}
+
+async function migrating() {
+  const b = await owner();
+  const before = record(b.store);
+  const legacy = await legacyRecord(b);
+  b.store.data.set("vault:prekeys", legacy);
+  return { b, before, legacy: structuredClone(legacy) };
+}
+
+async function migrated(
+  b: Awaited<ReturnType<typeof owner>>,
+  before: Record<string, unknown>,
+) {
+  assert.ok(await PrekeyStore.open(b.store, b.keys, b.integrity));
+  const after = record(b.store);
+  assert.equal(after.v, prekeysVersion);
+  assert.deepEqual(after.direct, []);
+  assert.deepEqual(inventoryOf(after), inventoryOf(before));
+  return after;
+}
+
+test("concurrent loads of a version 2 prekey record converge on one version 3 record that keeps every key", async () => {
+  const { b, before } = await migrating();
+  const [first, second] = await Promise.all([
+    PrekeyStore.open(b.store, b.keys, b.integrity),
+    PrekeyStore.open(b.store, b.keys, b.integrity),
+  ]);
+  assert.ok(first && second);
+  assert.deepEqual(first.inventory, second.inventory);
+  const after = await migrated(b, before);
+  const writes = b.store.writes;
+  assert.ok(await PrekeyStore.open(b.store, b.keys, b.integrity));
+  assert.equal(b.store.writes, writes, "a version 3 record is not rewritten");
+  assert.deepEqual(record(b.store), after);
+});
+
+test("a temporary signing failure during prekey migration keeps version 2 intact and the next load migrates it", async () => {
+  const { b, before, legacy } = await migrating();
+  const fault = failPrekeyHmac("sign", 1);
+  try {
+    await assert.rejects(PrekeyStore.open(b.store, b.keys, b.integrity));
+  } finally {
+    fault.restore();
+  }
+  assert.equal(fault.failed(), 1);
+  assert.deepEqual(record(b.store), legacy, "nothing is written");
+  await migrated(b, before);
+});
+
+test("a storage failure during prekey migration keeps version 2 intact and the next load migrates it", async () => {
+  const { b, before, legacy } = await migrating();
+  const swap = b.store.swap;
+  let thrown = 0;
+  b.store.swap = async (name, key, matches, value) => {
+    if (key === "prekeys" && thrown === 0) {
+      thrown += 1;
+      throw new DOMException("temporary", "UnknownError");
+    }
+    return swap(name, key, matches, value);
+  };
+  try {
+    await assert.rejects(PrekeyStore.open(b.store, b.keys, b.integrity));
+  } finally {
+    b.store.swap = swap;
+  }
+  assert.equal(thrown, 1);
+  assert.deepEqual(record(b.store), legacy, "nothing is written");
+  await migrated(b, before);
+});
+
+test("prekey migration adopts a version 3 record another tab wrote, and a load that gives up still recovers next time", async () => {
+  for (const failures of [3, 4]) {
+    const { b, before } = await migrating();
+    const other = memoryStore();
+    for (const [key, value] of b.store.data) {
+      other.data.set(key, structuredClone(value));
+    }
+    assert.ok(await PrekeyStore.open(other, b.keys, b.integrity));
+    const theirs = record(other);
+    const swap = b.store.swap;
+    let fault: ReturnType<typeof failPrekeyHmac> | null = null;
+    b.store.swap = async (name, key, matches, value) => {
+      if (key === "prekeys" && !fault) {
+        b.store.data.set("vault:prekeys", structuredClone(theirs));
+        fault = failPrekeyHmac("verify", failures);
+      }
+      return swap(name, key, matches, value);
+    };
+    let opened: PrekeyStore | null;
+    try {
+      opened = await PrekeyStore.open(b.store, b.keys, b.integrity);
+    } finally {
+      b.store.swap = swap;
+      (fault as ReturnType<typeof failPrekeyHmac> | null)?.restore();
+    }
+    assert.equal(
+      (fault as ReturnType<typeof failPrekeyHmac> | null)?.failed(),
+      failures,
+    );
+    if (failures < 4) {
+      assert.ok(opened, `adopted after ${failures} failed verifications`);
+    } else {
+      assert.equal(opened, null, "the load gives up after its bounded attempts");
+    }
+    assert.deepEqual(record(b.store), theirs, "the other tab's record is kept");
+    await migrated(b, before);
+  }
+});
