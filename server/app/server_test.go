@@ -126,6 +126,7 @@ func TestServeClosesWebSockets(t *testing.T) {
 	resp.Body.Close()
 	defer conn.Close()
 
+	waitUntil(t, "the WebSocket to be registered", func() bool { return srv.hub.Len() == 1 })
 	cancel()
 
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
