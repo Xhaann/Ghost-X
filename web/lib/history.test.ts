@@ -28,6 +28,7 @@ import { outboxLifetime } from "./outbox.ts";
 import { ivSize, maxBodySize } from "./protocol.ts";
 import {
   type LegacyParty,
+  failHistoryDecrypt,
   legacyParty,
   legacySeal,
   memoryStore,
@@ -1201,4 +1202,54 @@ test("the record decoder enforces the relay acceptance time", async () => {
     assert.equal(parseRecord(at, value), null, name);
     assert.equal(parseLegacyRecord(at, value), null, name);
   }
+});
+
+test("a delivery update that cannot be decrypted is reported unsaved and saved on a later attempt", async () => {
+  const a = await identity();
+  const b = await party();
+  assert.ok(
+    await (
+      await open(b)
+    ).sent({
+      id: "r1",
+      peer: a,
+      sequence: 1,
+      delivery: "queued",
+      body: "awaiting a receipt",
+      accepted: 1_000,
+    }),
+  );
+  const key = `messages:${a}/r1`;
+  const before = structuredClone(b.store.data.get(key));
+  const h = await open(b);
+  assert.equal((await h.restore()).restored.length, 1);
+
+  const fault = failHistoryDecrypt("r1");
+  let saved: boolean;
+  try {
+    saved = await h.settle(a, "r1", "delivered");
+  } finally {
+    fault.restore();
+  }
+  assert.equal(fault.failures(), 1);
+  assert.equal(saved, false, "an unsaved delivery update is not settled");
+  await h.flush();
+  assert.deepEqual(b.store.data.get(key), before, "the stored record is unchanged");
+
+  assert.equal(await h.settle(a, "r1", "delivered"), true);
+  await h.flush();
+  const settled = b.store.data.get(key) as Record<string, unknown>;
+  assert.equal(settled.delivery, "delivered");
+  assert.equal(settled.accepted, 1_000);
+  assert.equal(await h.settle(a, "r1", "delivered"), true, "a duplicate receipt");
+  assert.equal(await h.settle(a, "absent", "delivered"), true, "a missing record");
+
+  b.store.data.set(key, { ...settled, delivery: "queued" });
+  const unreadable = await open(b);
+  assert.equal((await unreadable.restore()).rejected, 1);
+  assert.equal(
+    await unreadable.settle(a, "r1", "delivered"),
+    true,
+    "a record rejected as unreadable never holds its receipt",
+  );
 });

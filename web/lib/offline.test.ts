@@ -8,6 +8,7 @@ import { createMessageId } from "./protocol.ts";
 import {
   type MemoryStore,
   type SecureDevice,
+  failHistoryDecrypt,
   freePort,
   memoryStore,
   secureDevice,
@@ -664,4 +665,46 @@ test("a receipt is cleared only after the sender durably stored the delivery sta
     restored.flatMap((m) => (m.direction === "sent" ? [m.delivery] : [])),
     ["delivered"],
   );
+});
+
+test("a receipt is cleared only after a delivery state that failed to decrypt is stored", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const { a, b } = await pair(port);
+  a.conversations.open(b.id);
+  const message = await send(a, "decrypt before settling");
+  assert.equal(message.result, "queued");
+  await a.history.flush();
+  const results: boolean[] = [];
+  const settle = a.conversations.settle.bind(a.conversations);
+  a.conversations.settle = async (receipt) => {
+    const saved = await settle(receipt);
+    results.push(saved);
+    return saved;
+  };
+  const sentDeliveries = async () => {
+    await a.history.flush();
+    const { restored } = await a.history.restore();
+    return restored.flatMap((m) => (m.direction === "sent" ? [m.delivery] : []));
+  };
+
+  const fault = failHistoryDecrypt(message.id);
+  try {
+    await until(() => received(b, a.id).length === 1, "recipient got it");
+    await until(() => results.length === 1, "receipt handled");
+  } finally {
+    fault.restore();
+  }
+  assert.ok(fault.failures() >= 1);
+  assert.deepEqual(results, [false]);
+  assert.equal(frames(a.sent, "clear").length, 0, "the receipt stays on the relay");
+  assert.deepEqual(await sentDeliveries(), ["queued"]);
+
+  await a.client.request({ type: "fetch", payload: {} });
+  await until(
+    () => frames(a.sent, "clear").length === 1,
+    "cleared after storing",
+  );
+  assert.equal(results.at(-1), true);
+  assert.deepEqual(await sentDeliveries(), ["delivered"]);
 });

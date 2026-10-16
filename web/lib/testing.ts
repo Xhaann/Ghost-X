@@ -304,6 +304,46 @@ export async function stopServer(server: ChildProcess): Promise<void> {
   await exited;
 }
 
+const historyContext = new TextEncoder().encode("ghostx/history/v2\0");
+
+export function failHistoryDecrypt(id: string): {
+  failures(): number;
+  restore(): void;
+} {
+  const decrypt = crypto.subtle.decrypt;
+  let failures = 0;
+  crypto.subtle.decrypt = function (
+    algorithm: AlgorithmIdentifier | AesGcmParams,
+    key: CryptoKey,
+    data: BufferSource,
+  ) {
+    const extra =
+      typeof algorithm === "object" && "additionalData" in algorithm
+        ? algorithm.additionalData
+        : undefined;
+    const bytes = !extra
+      ? null
+      : ArrayBuffer.isView(extra)
+        ? new Uint8Array(extra.buffer, extra.byteOffset, extra.byteLength)
+        : new Uint8Array(extra);
+    if (
+      bytes &&
+      historyContext.every((byte, i) => bytes[i] === byte) &&
+      new TextDecoder().decode(bytes).includes(JSON.stringify(id))
+    ) {
+      failures += 1;
+      return Promise.reject(new DOMException("temporary", "OperationError"));
+    }
+    return decrypt.call(crypto.subtle, algorithm, key, data);
+  } as typeof crypto.subtle.decrypt;
+  return {
+    failures: () => failures,
+    restore: () => {
+      crypto.subtle.decrypt = decrypt;
+    },
+  };
+}
+
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

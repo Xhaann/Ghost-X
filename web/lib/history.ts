@@ -397,7 +397,7 @@ export class History implements HistoryPort {
       }
       const body = await this.#decrypt(record);
       if (body === null) {
-        return true;
+        return false;
       }
       return this.#persist(
         {
