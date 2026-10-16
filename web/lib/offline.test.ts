@@ -708,3 +708,102 @@ test("a receipt is cleared only after a delivery state that failed to decrypt is
   assert.equal(results.at(-1), true);
   assert.deepEqual(await sentDeliveries(), ["delivered"]);
 });
+
+const ratchetContext = new TextEncoder().encode("ghostx/ratchet/v1\0");
+
+function failRatchetDecrypt(times: number) {
+  const decrypt = crypto.subtle.decrypt;
+  let calls = 0;
+  crypto.subtle.decrypt = function (
+    algorithm: AlgorithmIdentifier | AesGcmParams,
+    key: CryptoKey,
+    data: BufferSource,
+  ) {
+    const extra =
+      typeof algorithm === "object" && "additionalData" in algorithm
+        ? algorithm.additionalData
+        : undefined;
+    const bytes = !extra
+      ? null
+      : ArrayBuffer.isView(extra)
+        ? new Uint8Array(extra.buffer, extra.byteOffset, extra.byteLength)
+        : new Uint8Array(extra);
+    if (bytes && ratchetContext.every((byte, i) => bytes[i] === byte)) {
+      calls += 1;
+      if (calls <= times) {
+        return Promise.reject(new DOMException("temporary", "OperationError"));
+      }
+    }
+    return decrypt.call(crypto.subtle, algorithm, key, data);
+  } as typeof crypto.subtle.decrypt;
+  return {
+    calls: () => calls,
+    restore: () => {
+      crypto.subtle.decrypt = decrypt;
+    },
+  };
+}
+
+async function ratchetOf(device: Device, peer: Device): Promise<string | null> {
+  return device.pairs.transact(address(peer), async (s) => ({
+    state: s,
+    value: JSON.stringify([s.receiving?.n ?? null, s.skipped.length]),
+  }));
+}
+
+test("a message whose decryption fails once is retried and delivered exactly once", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const { a, b } = await pair(port);
+  a.conversations.open(b.id);
+  const fault = failRatchetDecrypt(1);
+  let message: Awaited<ReturnType<typeof send>>;
+  try {
+    message = await send(a, "survives a transient failure");
+    await until(() => received(b, a.id).length === 1, "b handles it");
+    await until(() => frames(b.sent, "ack").length === 1, "acknowledged");
+  } finally {
+    fault.restore();
+  }
+  assert.equal(fault.calls(), 2, "one failed attempt and exactly one retry");
+  assert.deepEqual(received(b, a.id), ["survives a transient failure"]);
+  assert.deepEqual(await stored(b, a.id), ["survives a transient failure"]);
+  assert.equal(await ratchetOf(b, a), JSON.stringify([1, 0]));
+  await until(
+    () => deliveryOf(a, b.id, message.id) === "delivered",
+    "genuine receipt",
+  );
+
+  const next = failRatchetDecrypt(0);
+  try {
+    await send(a, "and the next one");
+    await until(() => received(b, a.id).length === 2, "next message");
+  } finally {
+    next.restore();
+  }
+  assert.equal(next.calls(), 1, "the ratchet advanced exactly once");
+  assert.deepEqual(received(b, a.id), [
+    "survives a transient failure",
+    "and the next one",
+  ]);
+});
+
+test("a message whose decryption fails twice is rejected as before without moving the ratchet", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const { a, b } = await pair(port);
+  a.conversations.open(b.id);
+  const before = await ratchetOf(b, a);
+  const fault = failRatchetDecrypt(2);
+  try {
+    await send(a, "never shown");
+    await until(() => received(b, a.id).length === 1, "b handles it");
+    await until(() => frames(b.sent, "ack").length === 1, "acknowledged");
+  } finally {
+    fault.restore();
+  }
+  assert.equal(fault.calls(), 2, "exactly two attempts");
+  assert.deepEqual(received(b, a.id), [null], "a placeholder, no plaintext");
+  assert.deepEqual(await stored(b, a.id), [], "nothing is saved");
+  assert.equal(await ratchetOf(b, a), before, "the ratchet did not move");
+});

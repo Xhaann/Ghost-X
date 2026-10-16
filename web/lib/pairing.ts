@@ -346,7 +346,9 @@ export class Pairing implements Channel {
     let recorded = false;
     let failed = false;
     const opened = await this.#pairs.transact(address, async (state) => {
-      const result = await ratchetDecrypt(state, data, this.#generate);
+      const result =
+        (await ratchetDecrypt(state, data, this.#generate)) ??
+        (await ratchetDecrypt(state, data, this.#generate));
       const body = result && unframe(result.plaintext, id);
       if (!result || body === null) {
         return null;
