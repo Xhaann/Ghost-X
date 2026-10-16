@@ -322,18 +322,28 @@ test("crash after decryption but before recording keeps the message and the ratc
     }));
   const before = await ratchet(b);
   a.conversations.open(b.id);
-  assert.equal((await send(a, "decrypted but not stored")).result, "queued");
+  const message = await send(a, "decrypted but not stored");
+  assert.equal(message.result, "queued");
   await until(() => frames(b.received, "message").length === 1, "transmitted");
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.deepEqual(received(b, a.id), []);
   assert.equal(frames(b.sent, "ack").length, 0);
   assert.equal(await ratchet(b), before);
+  assert.equal(
+    deliveryOf(a, b.id, message.id),
+    "queued",
+    "an unsaved message is not reported delivered",
+  );
   await b.shutdown();
   failMessages = false;
   storeB.put = realPut;
   const again = await boot(port, storeB);
   await until(() => received(again, a.id).length === 1, "redelivered");
   assert.deepEqual(await stored(again, a.id), ["decrypted but not stored"]);
+  await until(
+    () => deliveryOf(a, b.id, message.id) === "delivered",
+    "delivered once saved",
+  );
   assert.equal((await send(a, "next")).result, "queued");
   await until(() => received(again, a.id).length === 2, "ratchet continues");
 });
@@ -788,15 +798,16 @@ test("a message whose decryption fails once is retried and delivered exactly onc
   ]);
 });
 
-test("a message whose decryption fails twice is rejected as before without moving the ratchet", async () => {
+test("a message whose decryption fails twice is rejected without moving the ratchet, yet acknowledged as delivered", async () => {
   const port = await freePort();
   await startServer(port);
   const { a, b } = await pair(port);
   a.conversations.open(b.id);
   const before = await ratchetOf(b, a);
   const fault = failRatchetDecrypt(2);
+  let message: Awaited<ReturnType<typeof send>>;
   try {
-    await send(a, "never shown");
+    message = await send(a, "never shown");
     await until(() => received(b, a.id).length === 1, "b handles it");
     await until(() => frames(b.sent, "ack").length === 1, "acknowledged");
   } finally {
@@ -806,4 +817,40 @@ test("a message whose decryption fails twice is rejected as before without movin
   assert.deepEqual(received(b, a.id), [null], "a placeholder, no plaintext");
   assert.deepEqual(await stored(b, a.id), [], "nothing is saved");
   assert.equal(await ratchetOf(b, a), before, "the ratchet did not move");
+  await until(
+    () => deliveryOf(a, b.id, message.id) === "delivered",
+    "delivered means acknowledged, not readable",
+  );
+});
+
+test("a message the recipient has no session for is shown as unreadable, acknowledged as delivered, and followed by a new session", async () => {
+  const port = await freePort();
+  await startServer(port);
+  const { a, b } = await pair(port);
+  a.conversations.open(b.id);
+  assert.ok(await b.pairs.remove(address(a)));
+  const lost = await send(a, "no session on the recipient");
+  assert.equal(lost.result, "queued");
+  await until(() => received(b, a.id).length === 1, "placeholder");
+  assert.deepEqual(received(b, a.id), [null], "no plaintext");
+  await until(() => frames(b.sent, "ack").length === 1, "acknowledged");
+  await until(
+    () => deliveryOf(a, b.id, lost.id) === "delivered",
+    "delivered means acknowledged, not readable",
+  );
+  assert.deepEqual(await stored(b, a.id), [], "nothing is saved");
+  await until(
+    () => b.pairs.state(address(a)) === "established",
+    "the recipient re-establishes a session",
+  );
+  await until(
+    () => a.pairs.state(address(b)) === "established",
+    "the sender adopts it",
+  );
+  const next = await send(a, "after the new session");
+  assert.equal(next.result, "queued");
+  await until(() => received(b, a.id).length === 2, "next message");
+  assert.deepEqual(received(b, a.id), [null, "after the new session"]);
+  assert.deepEqual(await stored(b, a.id), ["after the new session"]);
+  await until(() => deliveryOf(a, b.id, next.id) === "delivered", "delivered");
 });

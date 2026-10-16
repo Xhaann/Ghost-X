@@ -1253,3 +1253,47 @@ test("a delivery update that cannot be decrypted is reported unsaved and saved o
     "a record rejected as unreadable never holds its receipt",
   );
 });
+
+test("late and duplicate receipts never move a delivery status backwards", async () => {
+  const a = await identity();
+  const b = await party();
+  const h = await open(b);
+  const source = new Source();
+  const store = new Conversations(source, b.keys.identity, {
+    history: h,
+    relay: true,
+  });
+  store.start();
+  store.open(a);
+  const receipt = (id: string, status: Receipt["status"]) =>
+    source.receipt({ to: a, device: "device", id, status });
+  const saved = async (id: string) => {
+    await h.flush();
+    return (b.store.data.get(`messages:${a}/${id}`) as Record<string, unknown>)
+      .delivery;
+  };
+  const queued = async (body: string) => {
+    const attempt = store.send(body);
+    assert.ok(attempt.accepted);
+    source.pending.at(-1)?.resolve({ ok: true, devices: 1, pending: 0 });
+    assert.equal(await attempt.delivery, "queued");
+    return attempt.id;
+  };
+
+  const first = await queued("delivered first");
+  assert.ok(await receipt(first, "delivered"));
+  assert.ok(await receipt(first, "expired"));
+  assert.ok(await receipt(first, "delivered"));
+  assert.equal(delivered(store, a, first), "delivered");
+  assert.equal(await saved(first), "delivered");
+
+  const second = await queued("expired first");
+  assert.ok(await receipt(second, "expired"));
+  assert.equal(delivered(store, a, second), "expired");
+  assert.ok(await receipt(second, "delivered"));
+  assert.ok(await receipt(second, "expired"));
+  assert.equal(delivered(store, a, second), "delivered");
+  assert.equal(await saved(second), "delivered");
+  store.stop();
+  await h.close();
+});
