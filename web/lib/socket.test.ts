@@ -15,6 +15,7 @@ import {
   track,
   useServer,
   waitFor,
+  waitForCount,
 } from "./testing.ts";
 import {
   type TransportError,
@@ -320,7 +321,7 @@ test("reports each failed attempt as a failed connection", async () => {
   socket.onError((error) => errors.push(error));
 
   socket.open();
-  await sleep(300);
+  await waitForCount(errors, 2);
 
   assert.ok(errors.length >= 2, `errors = ${errors.length}`);
   assert.ok(errors.every((error) => error === "failed"));
