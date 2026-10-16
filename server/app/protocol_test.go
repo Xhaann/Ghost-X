@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -122,20 +124,42 @@ func TestProtocolErrorKeepsConnection(t *testing.T) {
 	}
 }
 
+func expectOversizedRejected(t *testing.T, srv *Server, conn *websocket.Conn, frame []byte) {
+	t.Helper()
+	if n := srv.hub.Len(); n != 1 {
+		t.Fatalf("hub clients before the oversized frame = %d, want 1", n)
+	}
+	reset := func(err error) bool {
+		return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil && !reset(err) {
+		t.Fatalf("write error = %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, data, err := conn.ReadMessage()
+	var closed *websocket.CloseError
+	switch {
+	case err == nil:
+		t.Fatalf("oversized frame was processed: %s", data)
+	case errors.As(err, &closed):
+		if closed.Code != websocket.CloseMessageTooBig {
+			t.Fatalf("read error = %v, want close code %d", err, websocket.CloseMessageTooBig)
+		}
+	case !errors.Is(err, syscall.ECONNRESET):
+		t.Fatalf("read error = %v, want close code %d or a connection reset", err, websocket.CloseMessageTooBig)
+	}
+	waitUntil(t, "the server to drop the connection", func() bool { return srv.hub.Len() == 0 })
+}
+
 func TestProtocolOversizedMessage(t *testing.T) {
-	conn := dialApp(t, startApp(t))
+	srv, url := startServer(t)
+	conn := dialApp(t, url)
+	if msg := roundTrip(t, conn, pingRequest("p0", 1)); msg.Type != "pong" {
+		t.Fatalf("ping = %+v", msg)
+	}
 
 	padding := bytes.Repeat([]byte(" "), 33<<10)
-	request := append([]byte(pingRequest("p1", 1)), padding...)
-	if err := conn.WriteMessage(websocket.TextMessage, request); err != nil {
-		t.Fatal(err)
-	}
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, _, err := conn.ReadMessage()
-	if !websocket.IsCloseError(err, websocket.CloseMessageTooBig) {
-		t.Fatalf("read error = %v, want close code %d", err, websocket.CloseMessageTooBig)
-	}
+	expectOversizedRejected(t, srv, conn, append([]byte(pingRequest("p1", 1)), padding...))
 }
 
 func TestProtocolConcurrentClients(t *testing.T) {

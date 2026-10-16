@@ -409,19 +409,11 @@ func TestSendValidationOverWebSocket(t *testing.T) {
 }
 
 func TestOversizedFrameClosesConnection(t *testing.T) {
-	_, url := startServer(t)
+	srv, url := startServer(t)
 	k := newKey(t)
 	conn := dialApp(t, url)
 	authenticateConn(t, conn, k)
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(sendFrame("m1", k.identity, randomText(16), envelope(k, strings.Repeat("A", 40<<10))))); err != nil {
-		t.Fatal(err)
-	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, data, err := conn.ReadMessage(); err == nil {
-		t.Fatalf("oversized frame was processed: %s", data)
-	} else if !websocket.IsCloseError(err, websocket.CloseMessageTooBig) {
-		t.Fatalf("read error = %v, want close code %d", err, websocket.CloseMessageTooBig)
-	}
+	expectOversizedRejected(t, srv, conn, []byte(sendFrame("m1", k.identity, randomText(16), envelope(k, strings.Repeat("A", 40<<10)))))
 }
 
 func TestReconnectStormDeliversEveryMessage(t *testing.T) {
