@@ -76,7 +76,7 @@ function Verification({
         <div className="row">
           <button
             type="button"
-            className="button"
+            className="button button-small"
             onClick={() => {
               setFailed(false);
               setConfirming(current.value);
@@ -408,6 +408,7 @@ function Composer({
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const field = useRef<HTMLTextAreaElement | null>(null);
+  const hint = useId();
   const composer = composerState(body);
 
   useEffect(() => {
@@ -459,11 +460,6 @@ function Composer({
       )}
       <Field
         label="Message"
-        hint={
-          connected
-            ? "Enter sends, Shift+Enter adds a new line."
-            : "Messages can be sent once connected."
-        }
         error={
           composer.tooLarge
             ? `Too long: ${composer.bytes} of ${composer.max} bytes.`
@@ -473,9 +469,12 @@ function Composer({
         {(props) => (
           <textarea
             {...props}
+            aria-describedby={[hint, props["aria-describedby"]]
+              .filter(Boolean)
+              .join(" ")}
             ref={field}
             className="textarea"
-            rows={3}
+            rows={2}
             value={body}
             onChange={(event) => setBody(event.target.value)}
             onKeyDown={keys}
@@ -483,10 +482,17 @@ function Composer({
         )}
       </Field>
       <div className="row between composer-actions">
-        <span className="small muted" aria-live="polite">
-          {composer.nearLimit && !composer.tooLarge
-            ? `${composer.bytes} of ${composer.max} bytes`
-            : ""}
+        <span className="composer-meta small muted">
+          <span id={hint}>
+            {connected
+              ? "Enter sends, Shift+Enter adds a new line."
+              : "Messages can be sent once connected."}
+          </span>
+          <span aria-live="polite">
+            {composer.nearLimit && !composer.tooLarge
+              ? `${composer.bytes} of ${composer.max} bytes`
+              : ""}
+          </span>
         </span>
         <button
           type="submit"
